@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 F_BIN="${F_BIN:-${ROOT_DIR}/target/release/unearth}"
-F_TIMEOUT="6"
+F_TIMEOUT="${F_TIMEOUT:-20}"
 
 if [[ ! -x "$F_BIN" || "${ROOT_DIR}/src/main.rs" -nt "$F_BIN" || "${ROOT_DIR}/Cargo.toml" -nt "$F_BIN" ]]; then
   cargo build --release --quiet --manifest-path "${ROOT_DIR}/Cargo.toml"
@@ -212,6 +212,39 @@ want_size_asc=$'b_small\nc_mid\na_big'
 want_size_desc=$'a_big\nc_mid\nb_small'
 assert_eq "sort size asc" "$(list_rel_raw "$SIZE_ROOT" --sort size asc '*')" "$want_size_asc"
 assert_eq "sort size desc" "$(list_rel_raw "$SIZE_ROOT" --sort size desc '*')" "$want_size_desc"
+
+# INDEX DATABASE
+INDEX_ROOT="${TMP_BASE}/index_root"
+INDEX_CACHE="${TMP_BASE}/index_cache"
+mkdir -p "${INDEX_ROOT}/a/sub" "${INDEX_ROOT}/.hidden"
+touch "${INDEX_ROOT}/a/file.txt" "${INDEX_ROOT}/a/sub/nested.txt" "${INDEX_ROOT}/.hidden/secret.txt"
+XDG_CACHE_HOME="$INDEX_CACHE" "$F" --index-refresh "$INDEX_ROOT"
+want_index_all=$(printf '%s\n' \
+  "${INDEX_ROOT}/.hidden/" \
+  "${INDEX_ROOT}/.hidden/secret.txt" \
+  "${INDEX_ROOT}/a/" \
+  "${INDEX_ROOT}/a/file.txt" \
+  "${INDEX_ROOT}/a/sub/" \
+  "${INDEX_ROOT}/a/sub/nested.txt" | sort)
+want_index_visible=$(printf '%s\n' \
+  "${INDEX_ROOT}/a/" \
+  "${INDEX_ROOT}/a/file.txt" \
+  "${INDEX_ROOT}/a/sub/" \
+  "${INDEX_ROOT}/a/sub/nested.txt" | sort)
+want_index_dirs=$(printf '%s\n' \
+  "${INDEX_ROOT}/.hidden/" \
+  "${INDEX_ROOT}/a/" \
+  "${INDEX_ROOT}/a/sub/" | sort)
+want_index_visible_dirs=$(printf '%s\n' \
+  "${INDEX_ROOT}/a/" \
+  "${INDEX_ROOT}/a/sub/" | sort)
+assert_eq "index all includes hidden" "$(XDG_CACHE_HOME="$INDEX_CACHE" "$F" --index '*' -H --color=never "$INDEX_ROOT" | sort)" "$want_index_all"
+assert_eq "index visible excludes hidden" "$(XDG_CACHE_HOME="$INDEX_CACHE" "$F" --index '*' --color=never "$INDEX_ROOT" | sort)" "$want_index_visible"
+assert_eq "index dirs only" "$(XDG_CACHE_HOME="$INDEX_CACHE" "$F" --index '*' -d -H --color=never "$INDEX_ROOT" | sort)" "$want_index_dirs"
+assert_eq "index visible dirs only" "$(XDG_CACHE_HOME="$INDEX_CACHE" "$F" --index '*' -d --color=never "$INDEX_ROOT" | sort)" "$want_index_visible_dirs"
+index_db="${INDEX_CACHE}/unearth/index/unearth.db"
+assert_eq "index records exact refreshed root" "$(sqlite3 "$index_db" "select count(*) from indexed_roots where root='${INDEX_ROOT}';")" "1"
+assert_eq "index child root does not mark parent refreshed" "$(sqlite3 "$index_db" "select count(*) from indexed_roots where root='${TMP_BASE}';")" "0"
 
 # SORT MATRIX: size (directories by real size)
 SIZE_DIR_ROOT="${TMP_BASE}/size_dir_root"

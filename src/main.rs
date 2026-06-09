@@ -1,20 +1,24 @@
 use chrono::{DateTime, Local};
 use jwalk::{Parallelism, WalkDir};
 use regex::{Regex, RegexBuilder};
+use rusqlite::{params, Connection};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
+use std::hash::{Hash, Hasher};
 use std::io::{self, BufWriter, IsTerminal, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crossbeam_channel::{unbounded, Sender};
 use rayon::prelude::*;
+use rayon::ThreadPoolBuilder;
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
@@ -23,6 +27,10 @@ static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 const VERSION: &str = "0.8.6";
 const NTFS_FS_TYPES: [&str; 3] = ["ntfs", "ntfs3", "fuseblk"];
 const ROOT_SIZE_SKIP_TREES: [&str; 6] = ["/mnt", "/media", "/dev", "/proc", "/sys", "/run"];
+const SNAPSHOT_REFRESH_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+const SNAPSHOT_REFRESH_MIN_AGE: Duration = Duration::from_secs(30);
+const INDEX_REFRESH_MIN_AGE: Duration = Duration::from_secs(30);
+const INDEX_STREAM_FLUSH_LINES: usize = 1_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TypeFlag {
@@ -72,6 +80,7 @@ struct MountInfo {
 #[derive(Clone, Debug)]
 struct Options {
     timeout_dur: Duration,
+    timeout_explicit: bool,
     force_pattern_mode: bool,
     long_format: bool,
     long_extended: bool,
@@ -85,7 +94,13 @@ struct Options {
     respect_ignore: bool,
     visible_only: bool,
     threads_override: usize,
+    threads_explicit: bool,
     cache_output: bool,
+    snapshot_cache: bool,
+    snapshot_refresh: bool,
+    index_mode: bool,
+    index_binary: bool,
+    index_refresh: Option<String>,
     absolute_paths: bool,
     force_dir: bool,
     force_file: bool,
@@ -104,6 +119,11 @@ struct SearchResult {
     is_dir: bool,
     is_symlink: bool,
     metadata: Option<fs::Metadata>,
+}
+
+struct SearchRun {
+    lines: Vec<String>,
+    timed_out: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -164,7 +184,9 @@ Usage:
                        [--path DIR]
                        [--timeout N] [--sort date|size|name asc|desc]
                        [--no-recurse|-R] [--follow-links]
-                       [--ignore] [--hidden|-H] [--threads N] [--cache-raw]
+                       [--ignore] [--hidden|-H] [--threads N]
+                       [--cache-raw] [--snapshot-cache]
+                       [--index] [--index-binary] [--index-refresh DIR]
                        [--color=auto|always|never] [--hyperlink]
                        [--highlight-match|--match-red]
   unearth (--version|-V)
@@ -226,6 +248,19 @@ Arguments:
     output paths.
   - --counts prints match counts grouped by parent folder.
     This mode outputs summary rows instead of full match paths.
+  - --snapshot-cache prints the last complete snapshot for this exact command
+    immediately, then refreshes that snapshot in the background. Timed-out
+    scans do not replace an existing snapshot. Background refreshes use a long
+    timeout by default unless --timeout is passed explicitly.
+  - --index queries the global pooled path database in
+    ~/.cache/unearth/index/unearth.db instead of walking the filesystem. It
+    returns current DB rows immediately and starts one background refresh when
+    the root is missing or stale.
+  - --index-binary writes --index results as repeated little-endian
+    u32-length-prefixed path bytes instead of newline-delimited text.
+  - --index-refresh DIR rebuilds the indexed rows for DIR in that global
+    database. Directory paths and repeated entry names are stored once and
+    entries link to them by integer IDs.
   - --sizes prints compact sizes as SIZE<TAB>PATH (max 6 chars including
     unit, e.g., 1.111M, 111.1M),
     using recursive directory totals for directory matches.
@@ -264,6 +299,7 @@ fn parse_duration(t: &str) -> Result<Duration, String> {
 fn parse_args() -> Result<Options, String> {
     let mut opts = Options {
         timeout_dur: Duration::from_secs(6),
+        timeout_explicit: false,
         force_pattern_mode: false,
         long_format: false,
         long_extended: false,
@@ -277,7 +313,13 @@ fn parse_args() -> Result<Options, String> {
         respect_ignore: false,
         visible_only: true,
         threads_override: 8,
+        threads_explicit: false,
         cache_output: false,
+        snapshot_cache: false,
+        snapshot_refresh: false,
+        index_mode: false,
+        index_binary: false,
+        index_refresh: None,
         absolute_paths: false,
         force_dir: false,
         force_file: false,
@@ -373,10 +415,12 @@ fn parse_args() -> Result<Options, String> {
                 i += 1;
                 if i < args.len() {
                     opts.timeout_dur = parse_duration(&args[i])?;
+                    opts.timeout_explicit = true;
                 }
             }
             _ if arg.starts_with("--timeout=") => {
                 opts.timeout_dur = parse_duration(arg.trim_start_matches("--timeout="))?;
+                opts.timeout_explicit = true;
             }
             "--threads" => {
                 i += 1;
@@ -387,6 +431,7 @@ fn parse_args() -> Result<Options, String> {
                     if opts.threads_override == 0 {
                         return Err("--threads requires a positive integer".to_string());
                     }
+                    opts.threads_explicit = true;
                 }
             }
             _ if arg.starts_with("--threads=") => {
@@ -397,6 +442,7 @@ fn parse_args() -> Result<Options, String> {
                 if opts.threads_override == 0 {
                     return Err("--threads requires a positive integer".to_string());
                 }
+                opts.threads_explicit = true;
             }
             "--color" => {
                 i += 1;
@@ -455,6 +501,28 @@ fn parse_args() -> Result<Options, String> {
             "--ignore" => opts.respect_ignore = true,
             "--hidden" | "-H" => opts.visible_only = false,
             "--cache-raw" => opts.cache_output = true,
+            "--snapshot-cache" => opts.snapshot_cache = true,
+            "--snapshot-refresh" => opts.snapshot_refresh = true,
+            "--index" => opts.index_mode = true,
+            "--index-binary" => {
+                opts.index_mode = true;
+                opts.index_binary = true;
+            }
+            "--index-refresh" => {
+                i += 1;
+                if i < args.len() {
+                    opts.index_refresh = Some(args[i].clone());
+                } else {
+                    return Err("--index-refresh requires a root path".to_string());
+                }
+            }
+            _ if arg.starts_with("--index-refresh=") => {
+                let v = arg.trim_start_matches("--index-refresh=").to_string();
+                if v.is_empty() {
+                    return Err("--index-refresh requires a non-empty root path".to_string());
+                }
+                opts.index_refresh = Some(v);
+            }
             "--cache" => return Err("--cache was renamed to --cache-raw".to_string()),
             "--bypass" | "-b" => opts.force_pattern_mode = true,
             "--long" | "-l" => opts.long_format = true,
@@ -483,7 +551,7 @@ fn parse_args() -> Result<Options, String> {
         i += 1;
     }
 
-    if opts.positional.is_empty() {
+    if opts.positional.is_empty() && opts.index_refresh.is_none() {
         return Err(usage());
     }
     Ok(opts)
@@ -515,7 +583,16 @@ fn can_stream_direct(opts: &Options, use_style: bool) -> bool {
         && opts.sort_field.is_none()
         && !opts.long_format
         && !opts.sizes
+        && !opts.snapshot_cache
+        && !opts.snapshot_refresh
         && !opts.absolute_paths
+}
+
+fn write_binary_path_record<W: Write>(writer: &mut W, path: &str) -> io::Result<()> {
+    let len = u32::try_from(path.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "path too long"))?;
+    writer.write_all(&len.to_le_bytes())?;
+    writer.write_all(path.as_bytes())
 }
 
 fn escape_regex_keep_star(s: &str) -> String {
@@ -755,7 +832,9 @@ fn expand_home_path(raw: &str) -> String {
 }
 
 fn is_implicit_content_path_token(raw: &str) -> bool {
-    raw.starts_with('/')
+    raw == "."
+        || raw == ".."
+        || raw.starts_with('/')
         || raw.starts_with("./")
         || raw.starts_with("../")
         || raw.starts_with("~/")
@@ -763,6 +842,9 @@ fn is_implicit_content_path_token(raw: &str) -> bool {
 }
 
 fn is_explicit_search_dir_selector(raw: &str) -> bool {
+    if raw == "." || raw == ".." {
+        return true;
+    }
     if is_wrapped_quote(raw) {
         return true;
     }
@@ -784,7 +866,10 @@ fn resolve_literal_search_root(raw: &str) -> Result<PathBuf, String> {
     if path.is_dir() {
         Ok(path)
     } else {
-        Err(format!("--path target '{}' is not an existing directory", raw))
+        Err(format!(
+            "--path target '{}' is not an existing directory",
+            raw
+        ))
     }
 }
 
@@ -892,6 +977,7 @@ fn walk_fast(
     follow_links: bool,
     type_flag: Option<TypeFlag>,
     full_path_match: bool,
+    serial_subtree: bool,
     timeout_flag: &Arc<AtomicBool>,
 ) {
     if timeout_flag.load(Ordering::Relaxed) {
@@ -983,23 +1069,44 @@ fn walk_fast(
             return;
         }
     }
-    subdirs
-        .into_par_iter()
-        .for_each_with(tx.clone(), |tx_clone, subdir| {
+    if serial_subtree {
+        for subdir in subdirs {
             walk_fast(
                 subdir,
                 re,
                 is_catch_all,
-                tx_clone,
+                tx,
                 visible_only,
                 respect_ignore,
                 no_recurse,
                 follow_links,
                 type_flag,
                 full_path_match,
+                true,
                 timeout_flag,
             );
-        });
+        }
+    } else {
+        subdirs
+            .into_par_iter()
+            .for_each_with(tx.clone(), |tx_clone, subdir| {
+                let next_serial = root_prefers_single_thread(&subdir);
+                walk_fast(
+                    subdir,
+                    re,
+                    is_catch_all,
+                    tx_clone,
+                    visible_only,
+                    respect_ignore,
+                    no_recurse,
+                    follow_links,
+                    type_flag,
+                    full_path_match,
+                    next_serial,
+                    timeout_flag,
+                );
+            });
+    }
 }
 
 fn walk_rayon_worker(
@@ -1012,6 +1119,7 @@ fn walk_rayon_worker(
     full_path_match: bool,
     prune_matched_dir_subtrees: bool,
     needs_metadata: bool,
+    serial_subtree: bool,
     timeout_flag: &Arc<AtomicBool>,
 ) {
     if timeout_flag.load(Ordering::Relaxed) {
@@ -1126,22 +1234,42 @@ fn walk_rayon_worker(
             return;
         }
     }
-    subdirs
-        .into_par_iter()
-        .for_each_with(tx.clone(), |tx_clone, subdir| {
+    if serial_subtree {
+        for subdir in subdirs {
             walk_rayon_worker(
                 subdir,
                 re,
                 is_catch_all,
-                tx_clone,
+                tx,
                 opts,
                 type_flag,
                 full_path_match,
                 prune_matched_dir_subtrees,
                 needs_metadata,
+                true,
                 timeout_flag,
             );
-        });
+        }
+    } else {
+        subdirs
+            .into_par_iter()
+            .for_each_with(tx.clone(), |tx_clone, subdir| {
+                let next_serial = root_prefers_single_thread(&subdir);
+                walk_rayon_worker(
+                    subdir,
+                    re,
+                    is_catch_all,
+                    tx_clone,
+                    opts,
+                    type_flag,
+                    full_path_match,
+                    prune_matched_dir_subtrees,
+                    needs_metadata,
+                    next_serial,
+                    timeout_flag,
+                );
+            });
+    }
 }
 
 fn unescape_proc_mount_field(field: &str) -> String {
@@ -1415,7 +1543,10 @@ fn get_dir_stats_native(path: &str, count_files: bool) -> (u64, u64) {
                     .map(|m| NTFS_FS_TYPES.iter().any(|t| m.fs_type == *t))
                     .unwrap_or(false)
             {
-                eprintln!("unearth: NTFS MFT fast path unavailable for {}: {}", path, err);
+                eprintln!(
+                    "unearth: NTFS MFT fast path unavailable for {}: {}",
+                    path, err
+                );
             }
             get_dir_stats_walk(path, count_files)
         }
@@ -1455,6 +1586,64 @@ fn should_skip_root_size_tree(path: &str) -> bool {
     ROOT_SIZE_SKIP_TREES
         .iter()
         .any(|prefix| normalized == *prefix || normalized.starts_with(&format!("{}/", prefix)))
+}
+
+fn root_prefers_single_thread(path: &Path) -> bool {
+    path == Path::new("/media") || path.starts_with("/media/")
+}
+
+fn effective_search_root(
+    opts: &Options,
+    content_spec: Option<&ContainsAllSpec>,
+) -> Option<PathBuf> {
+    if let Some(spec) = content_spec {
+        return fs::canonicalize(&spec.root)
+            .ok()
+            .or_else(|| Some(spec.root.clone()));
+    }
+    if opts.force_full {
+        if opts.positional.len() > 1 {
+            if let Some(last) = opts.positional.last() {
+                if Path::new(last).is_dir() {
+                    return fs::canonicalize(last)
+                        .ok()
+                        .or_else(|| Some(PathBuf::from(last)));
+                }
+            }
+        }
+        return env::current_dir()
+            .ok()
+            .and_then(|p| fs::canonicalize(p).ok().or(Some(PathBuf::from("."))));
+    }
+    if opts.positional.len() > 1 {
+        match parse_search_dir(
+            &opts.positional[1],
+            opts.regex_mode,
+            opts.force_pattern_mode,
+        ) {
+            SearchDirMode::Path(p) => {
+                return fs::canonicalize(&p).ok().or_else(|| Some(PathBuf::from(p)));
+            }
+            SearchDirMode::Pattern(_) => return None,
+        }
+    }
+    env::current_dir()
+        .ok()
+        .and_then(|p| fs::canonicalize(p).ok().or(Some(PathBuf::from("."))))
+}
+
+fn effective_threads_override(opts: &Options, content_spec: Option<&ContainsAllSpec>) -> usize {
+    if opts.threads_explicit {
+        return opts.threads_override;
+    }
+    let Some(root) = effective_search_root(opts, content_spec) else {
+        return opts.threads_override;
+    };
+    if root_prefers_single_thread(&root) {
+        1
+    } else {
+        opts.threads_override
+    }
 }
 
 fn format_size_iec(bytes: u64) -> String {
@@ -1696,6 +1885,655 @@ fn cache_raw_record_path(path: &str, is_dir: bool, state: &mut RawCacheState) {
     }
 }
 
+fn snapshot_cache_dir() -> Option<PathBuf> {
+    if let Ok(dir) = env::var("XDG_CACHE_HOME") {
+        return Some(PathBuf::from(dir).join("unearth").join("snapshots"));
+    }
+    env::var("HOME").ok().map(|home| {
+        PathBuf::from(home)
+            .join(".cache")
+            .join("unearth")
+            .join("snapshots")
+    })
+}
+
+fn unearth_cache_dir() -> Option<PathBuf> {
+    if let Ok(dir) = env::var("XDG_CACHE_HOME") {
+        return Some(PathBuf::from(dir).join("unearth"));
+    }
+    env::var("HOME")
+        .ok()
+        .map(|home| PathBuf::from(home).join(".cache").join("unearth"))
+}
+
+fn index_db_path() -> Option<PathBuf> {
+    Some(unearth_cache_dir()?.join("index").join("unearth.db"))
+}
+
+fn hash_string(value: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn index_state_path(root_key: &str, suffix: &str) -> Option<PathBuf> {
+    Some(unearth_cache_dir()?.join("index").join(format!(
+        "{:016x}.{}",
+        hash_string(root_key),
+        suffix
+    )))
+}
+
+fn path_age_at_least(path: &Path, min_age: Duration) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return true;
+    };
+    let Ok(modified) = metadata.modified() else {
+        return true;
+    };
+    modified.elapsed().map(|age| age >= min_age).unwrap_or(true)
+}
+
+fn write_stamp(path: &Path) {
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = File::create(path);
+}
+
+fn open_index_db() -> Result<Connection, String> {
+    let path =
+        index_db_path().ok_or_else(|| "Could not determine unearth cache dir".to_string())?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let conn = Connection::open(path).map_err(|e| e.to_string())?;
+    conn.execute_batch(
+        "
+        PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = NORMAL;
+        CREATE TABLE IF NOT EXISTS strings (
+            id INTEGER PRIMARY KEY,
+            value TEXT NOT NULL UNIQUE
+        );
+        CREATE TABLE IF NOT EXISTS dirs (
+            id INTEGER PRIMARY KEY,
+            path TEXT NOT NULL UNIQUE
+        );
+        CREATE TABLE IF NOT EXISTS entries (
+            id INTEGER PRIMARY KEY,
+            dir_id INTEGER NOT NULL,
+            name_id INTEGER NOT NULL,
+            kind INTEGER NOT NULL,
+            mtime INTEGER,
+            size INTEGER,
+            UNIQUE(dir_id, name_id, kind)
+        );
+        CREATE TABLE IF NOT EXISTS indexed_roots (
+            root TEXT PRIMARY KEY,
+            refreshed_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_strings_value ON strings(value);
+        CREATE INDEX IF NOT EXISTS idx_dirs_path ON dirs(path);
+        CREATE INDEX IF NOT EXISTS idx_entries_dir ON entries(dir_id);
+        CREATE INDEX IF NOT EXISTS idx_entries_name ON entries(name_id);
+        ",
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(conn)
+}
+
+fn db_get_or_insert_string(tx: &rusqlite::Transaction<'_>, value: &str) -> Result<i64, String> {
+    tx.prepare_cached("INSERT OR IGNORE INTO strings(value) VALUES (?)")
+        .map_err(|e| e.to_string())?
+        .execute([value])
+        .map_err(|e| e.to_string())?;
+    tx.prepare_cached("SELECT id FROM strings WHERE value = ?")
+        .map_err(|e| e.to_string())?
+        .query_row([value], |row| row.get(0))
+        .map_err(|e| e.to_string())
+}
+
+fn db_get_or_insert_dir(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<i64, String> {
+    tx.prepare_cached("INSERT OR IGNORE INTO dirs(path) VALUES (?)")
+        .map_err(|e| e.to_string())?
+        .execute([path])
+        .map_err(|e| e.to_string())?;
+    tx.prepare_cached("SELECT id FROM dirs WHERE path = ?")
+        .map_err(|e| e.to_string())?
+        .query_row([path], |row| row.get(0))
+        .map_err(|e| e.to_string())
+}
+
+fn db_get_or_insert_string_cached(
+    tx: &rusqlite::Transaction<'_>,
+    cache: &mut HashMap<String, i64>,
+    value: &str,
+) -> Result<i64, String> {
+    if let Some(id) = cache.get(value) {
+        return Ok(*id);
+    }
+    let id = db_get_or_insert_string(tx, value)?;
+    cache.insert(value.to_string(), id);
+    Ok(id)
+}
+
+fn db_get_or_insert_dir_cached(
+    tx: &rusqlite::Transaction<'_>,
+    cache: &mut HashMap<String, i64>,
+    path: &str,
+) -> Result<i64, String> {
+    if let Some(id) = cache.get(path) {
+        return Ok(*id);
+    }
+    let id = db_get_or_insert_dir(tx, path)?;
+    cache.insert(path.to_string(), id);
+    Ok(id)
+}
+
+fn normalize_index_dir(path: &Path) -> String {
+    let mut out = path.to_string_lossy().to_string();
+    while out.len() > 1 && out.ends_with('/') {
+        out.pop();
+    }
+    out
+}
+
+fn index_path_prefix(path: &str) -> String {
+    if path == "/" {
+        "/".to_string()
+    } else {
+        format!("{}/", path.trim_end_matches('/'))
+    }
+}
+
+fn is_root_index_prune_child(root_key: &str, path: &Path) -> bool {
+    root_key == "/" && matches!(path.to_str(), Some("/proc" | "/sys" | "/dev" | "/run"))
+}
+
+fn is_root_index_excluded_path(root_key: &str, path: &str) -> bool {
+    root_key == "/"
+        && ["/proc", "/sys", "/dev", "/run"]
+            .iter()
+            .any(|prefix| path == *prefix || path.starts_with(&format!("{}/", prefix)))
+}
+
+fn refresh_index_root(root_raw: &str, opts: &Options) -> Result<(), String> {
+    let root = fs::canonicalize(expand_home_path(root_raw)).map_err(|e| e.to_string())?;
+    if !root.is_dir() {
+        return Err(format!(
+            "--index-refresh target '{}' is not a directory",
+            root_raw
+        ));
+    }
+    let root_key = normalize_index_dir(&root);
+    let root_prefix = index_path_prefix(&root_key);
+    let mut conn = open_index_db()?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM entries WHERE dir_id IN (
+            SELECT id FROM dirs WHERE path = ?1 OR path LIKE ?2
+        )",
+        params![root_key, format!("{}%", root_prefix)],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM dirs WHERE path = ?1 OR path LIKE ?2",
+        params![root_key, format!("{}%", root_prefix)],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM indexed_roots WHERE root = ?1 OR root LIKE ?2",
+        params![root_key, format!("{}%", root_prefix)],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute_batch(
+        "
+        DROP INDEX IF EXISTS idx_entries_dir;
+        DROP INDEX IF EXISTS idx_entries_name;
+        ",
+    )
+    .map_err(|e| e.to_string())?;
+    let mut dir_ids = HashMap::<String, i64>::new();
+    let mut string_ids = HashMap::<String, i64>::new();
+    db_get_or_insert_dir_cached(&tx, &mut dir_ids, &root_key)?;
+
+    for entry in WalkDir::new(&root)
+        .skip_hidden(false)
+        .parallelism(Parallelism::RayonNewPool(opts.threads_override))
+        .process_read_dir({
+            let root_key = root_key.clone();
+            move |_depth, _path, _state, children| {
+                for child in children.iter_mut() {
+                    if let Ok(entry) = child {
+                        if let Some(child_path) = entry.read_children_path.as_ref() {
+                            if is_root_index_prune_child(&root_key, child_path.as_ref()) {
+                                entry.read_children_path = None;
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if path == root {
+            continue;
+        }
+        let path_key = normalize_index_dir(&path);
+        if is_root_index_excluded_path(&root_key, &path_key) {
+            continue;
+        }
+        let file_type = entry.file_type();
+        let Some(name) = path.file_name().map(|n| n.to_string_lossy().to_string()) else {
+            continue;
+        };
+        let Some(parent) = path.parent() else {
+            continue;
+        };
+        let parent_key = normalize_index_dir(parent);
+        let parent_id = db_get_or_insert_dir_cached(&tx, &mut dir_ids, &parent_key)?;
+        let name_id = db_get_or_insert_string_cached(&tx, &mut string_ids, &name)?;
+        let kind = if file_type.is_dir() {
+            1i64
+        } else if file_type.is_symlink() {
+            2i64
+        } else {
+            0i64
+        };
+        tx.prepare_cached(
+            "INSERT OR REPLACE INTO entries(dir_id, name_id, kind, mtime, size)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .map_err(|e| e.to_string())?
+        .execute(params![
+            parent_id,
+            name_id,
+            kind,
+            Option::<i64>::None,
+            Option::<i64>::None
+        ])
+        .map_err(|e| e.to_string())?;
+        if kind == 1 {
+            db_get_or_insert_dir_cached(&tx, &mut dir_ids, &path_key)?;
+        }
+    }
+    let refreshed_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    tx.execute(
+        "INSERT OR REPLACE INTO indexed_roots(root, refreshed_at) VALUES (?1, ?2)",
+        params![root_key, refreshed_at],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute_batch(
+        "
+        CREATE INDEX IF NOT EXISTS idx_entries_dir ON entries(dir_id);
+        CREATE INDEX IF NOT EXISTS idx_entries_name ON entries(name_id);
+        ",
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    if let Some(stamp) = index_state_path(&root_key, "stamp") {
+        write_stamp(&stamp);
+    }
+    Ok(())
+}
+
+fn index_root_is_known(conn: &Connection, root_key: &str) -> Result<bool, String> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*)
+             FROM indexed_roots
+             WHERE root = ?1
+             LIMIT 1",
+            params![root_key],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(count > 0)
+}
+
+fn spawn_index_refresh(root_key: &str, opts: &Options, force: bool) {
+    let Some(stamp_path) = index_state_path(root_key, "stamp") else {
+        return;
+    };
+    if !force && stamp_path.is_file() && !path_age_at_least(&stamp_path, INDEX_REFRESH_MIN_AGE) {
+        return;
+    }
+    let Some(lock_path) = index_state_path(root_key, "lock") else {
+        return;
+    };
+    if let Some(parent) = lock_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let lock = File::options()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path);
+    if lock.is_err() {
+        return;
+    }
+    let Ok(exe) = env::current_exe() else {
+        let _ = fs::remove_file(lock_path);
+        return;
+    };
+    let mut command = Command::new(exe);
+    command
+        .arg("--index-refresh")
+        .arg(root_key)
+        .arg("--threads")
+        .arg(opts.threads_override.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if command.spawn().is_err() {
+        let _ = fs::remove_file(lock_path);
+    }
+}
+
+fn remove_index_refresh_lock(root_raw: &str) {
+    let Ok(root) = fs::canonicalize(expand_home_path(root_raw)) else {
+        return;
+    };
+    let root_key = normalize_index_dir(&root);
+    if let Some(lock_path) = index_state_path(&root_key, "lock") {
+        let _ = fs::remove_file(lock_path);
+    }
+}
+
+fn path_has_hidden_component(path: &str) -> bool {
+    path.split('/')
+        .any(|part| part.len() > 1 && part.starts_with('.'))
+}
+
+fn indexed_root_from_opts(
+    opts: &Options,
+    content_spec: Option<&ContainsAllSpec>,
+) -> Result<(PathBuf, Vec<String>), String> {
+    if let Some(spec) = content_spec {
+        return Ok((spec.root.clone(), spec.terms.clone()));
+    }
+    let mut terms = opts.positional.clone();
+    let root = if terms.len() > 1 {
+        let last = terms.last().cloned().unwrap();
+        if is_implicit_content_path_token(&last) || Path::new(&expand_home_path(&last)).is_dir() {
+            terms.pop();
+            PathBuf::from(expand_home_path(&last))
+        } else {
+            PathBuf::from(".")
+        }
+    } else {
+        PathBuf::from(".")
+    };
+    if terms.is_empty() {
+        return Err("--index requires at least one search term".to_string());
+    }
+    Ok((root, terms))
+}
+
+fn run_indexed(
+    opts: &Options,
+    content_spec: Option<&ContainsAllSpec>,
+    cache: &mut DirStatsCache,
+    colors: &ColorSpec,
+) -> Result<SearchRun, String> {
+    let (root_raw, terms) = indexed_root_from_opts(opts, content_spec)?;
+    let root = fs::canonicalize(&root_raw).map_err(|e| e.to_string())?;
+    let root_key = normalize_index_dir(&root);
+    let root_prefix = index_path_prefix(&root_key);
+    let mut type_flag = if opts.force_dir {
+        Some(TypeFlag::Dir)
+    } else if opts.force_file {
+        Some(TypeFlag::File)
+    } else {
+        None
+    };
+    let mut regexes = Vec::new();
+    for term in &terms {
+        let parsed = parse_name_pattern(term, opts.regex_mode);
+        if parsed.type_flag == Some(TypeFlag::Dir) && !opts.force_file {
+            type_flag = Some(TypeFlag::Dir);
+        }
+        regexes.push(
+            RegexBuilder::new(&parsed.regex)
+                .case_insensitive(true)
+                .build()
+                .map_err(|e| format!("Invalid regex: {}", e))?,
+        );
+    }
+    let conn = open_index_db()?;
+    let root_known = index_root_is_known(&conn, &root_key)?;
+    spawn_index_refresh(&root_key, opts, !root_known);
+    let stdout_is_tty = io::stdout().is_terminal();
+    let use_style = style_enabled(opts, stdout_is_tty);
+    let mut stmt = conn
+        .prepare(
+            "SELECT d.path, s.value, e.kind, e.mtime, e.size
+             FROM entries e
+             JOIN dirs d ON e.dir_id = d.id
+             JOIN strings s ON e.name_id = s.id
+             WHERE d.path = ?1 OR d.path LIKE ?2",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![root_key, format!("{}%", root_prefix)], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+
+    if can_stream_direct(opts, use_style) {
+        let stdout = io::stdout();
+        let mut lock = BufWriter::with_capacity(64 * 1024, stdout.lock());
+        let mut cache_state = if opts.cache_output {
+            init_raw_cache_state()
+        } else {
+            None
+        };
+        let mut written_since_flush = 0usize;
+
+        for row in rows {
+            let (dir_path, name, kind) = row.map_err(|e| e.to_string())?;
+            let is_dir = kind == 1;
+            if matches!(type_flag, Some(TypeFlag::Dir)) && !is_dir {
+                continue;
+            }
+            if matches!(type_flag, Some(TypeFlag::File)) && is_dir {
+                continue;
+            }
+            let mut path = if dir_path == "/" {
+                format!("/{}", name)
+            } else {
+                format!("{}/{}", dir_path, name)
+            };
+            if is_dir {
+                path.push('/');
+            }
+            if is_root_index_excluded_path(&root_key, &path) {
+                continue;
+            }
+            if opts.visible_only && path_has_hidden_component(&path) {
+                continue;
+            }
+            let base = path.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+            let matched = if opts.force_full {
+                regexes.iter().all(|re| re.is_match(&path))
+            } else {
+                regexes.iter().all(|re| re.is_match(base))
+            };
+            if !matched {
+                continue;
+            }
+            if opts.force_full && regexes.len() > 1 && !regexes.iter().any(|re| re.is_match(base)) {
+                continue;
+            }
+            if let Some(state) = cache_state.as_mut() {
+                cache_raw_record_path(&path, is_dir, state);
+            }
+            if opts.index_binary {
+                let _ = write_binary_path_record(&mut lock, &path);
+            } else {
+                let _ = lock.write_all(path.as_bytes());
+                let _ = lock.write_all(b"\n");
+            }
+            written_since_flush += 1;
+            if written_since_flush >= INDEX_STREAM_FLUSH_LINES {
+                let _ = lock.flush();
+                written_since_flush = 0;
+            }
+        }
+        let _ = lock.flush();
+        if let Some(mut state) = cache_state {
+            let _ = state.dirs.flush();
+            let _ = state.files.flush();
+        }
+        return Ok(SearchRun {
+            lines: Vec::new(),
+            timed_out: false,
+        });
+    }
+
+    let mut results = Vec::new();
+    for row in rows {
+        let (dir_path, name, kind) = row.map_err(|e| e.to_string())?;
+        let is_dir = kind == 1;
+        let is_symlink = kind == 2;
+        if matches!(type_flag, Some(TypeFlag::Dir)) && !is_dir {
+            continue;
+        }
+        if matches!(type_flag, Some(TypeFlag::File)) && is_dir {
+            continue;
+        }
+        let mut path = if dir_path == "/" {
+            format!("/{}", name)
+        } else {
+            format!("{}/{}", dir_path, name)
+        };
+        if is_dir {
+            path.push('/');
+        }
+        if is_root_index_excluded_path(&root_key, &path) {
+            continue;
+        }
+        if opts.visible_only && path_has_hidden_component(&path) {
+            continue;
+        }
+        let base = path.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+        let matched = if opts.force_full {
+            regexes.iter().all(|re| re.is_match(&path))
+        } else {
+            regexes.iter().all(|re| re.is_match(base))
+        };
+        if !matched {
+            continue;
+        }
+        if opts.force_full && regexes.len() > 1 && !regexes.iter().any(|re| re.is_match(base)) {
+            continue;
+        }
+        results.push(SearchResult {
+            path,
+            is_dir,
+            is_symlink,
+            metadata: None,
+        });
+    }
+    results.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(SearchRun {
+        lines: final_transform(results, opts, use_style, stdout_is_tty, colors, cache, None),
+        timed_out: false,
+    })
+}
+
+fn snapshot_args_key_parts() -> Vec<String> {
+    env::args()
+        .skip(1)
+        .filter(|arg| arg != "--snapshot-cache" && arg != "--snapshot-refresh")
+        .collect()
+}
+
+fn snapshot_cache_path() -> Option<PathBuf> {
+    let cwd = env::current_dir().ok()?;
+    let mut hasher = DefaultHasher::new();
+    cwd.hash(&mut hasher);
+    for arg in snapshot_args_key_parts() {
+        arg.hash(&mut hasher);
+    }
+    Some(snapshot_cache_dir()?.join(format!("{:016x}.paths", hasher.finish())))
+}
+
+fn snapshot_lock_path(path: &Path) -> PathBuf {
+    path.with_extension("lock")
+}
+
+fn snapshot_is_stale(path: &Path) -> bool {
+    path_age_at_least(path, SNAPSHOT_REFRESH_MIN_AGE)
+}
+
+fn stream_snapshot_cache(path: &Path) -> io::Result<()> {
+    let mut input = File::open(path)?;
+    let stdout = io::stdout();
+    let mut output = BufWriter::with_capacity(128 * 1024, stdout.lock());
+    io::copy(&mut input, &mut output)?;
+    output.flush()
+}
+
+fn write_snapshot_cache(path: &Path, lines: &[String]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    {
+        let file = File::create(&tmp)?;
+        let mut writer = BufWriter::with_capacity(128 * 1024, file);
+        for line in lines {
+            writeln!(writer, "{}", line)?;
+        }
+        writer.flush()?;
+    }
+    fs::rename(tmp, path)
+}
+
+fn spawn_snapshot_refresh() {
+    let Ok(exe) = env::current_exe() else {
+        return;
+    };
+    let Some(cache_path) = snapshot_cache_path() else {
+        return;
+    };
+    if cache_path.is_file() && !snapshot_is_stale(&cache_path) {
+        return;
+    }
+    let lock_path = snapshot_lock_path(&cache_path);
+    if let Some(parent) = lock_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let lock = File::options()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path);
+    if lock.is_err() {
+        return;
+    }
+    let mut args = snapshot_args_key_parts();
+    args.push("--snapshot-refresh".to_string());
+    if Command::new(exe)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .is_err()
+    {
+        let _ = fs::remove_file(lock_path);
+    }
+}
+
 fn cache_transform(items: &Vec<SearchResult>, opts: &Options) {
     if !opts.cache_output {
         return;
@@ -1778,14 +2616,8 @@ fn add_info_transform(
                     }
                 }
             }
-            let path_display = render_styled_path(
-                &item,
-                use_style,
-                add_decorator,
-                colors,
-                opts,
-                highlight,
-            );
+            let path_display =
+                render_styled_path(&item, use_style, add_decorator, colors, opts, highlight);
             out.push(format!(
                 "{} {}{} {}",
                 dt_str, human_size, extra, path_display
@@ -1814,14 +2646,8 @@ fn sizes_transform(
             let bytes = size_bytes_for_result(&item, opts, cache);
             format_size_compact_3(bytes)
         };
-        let path_display = render_styled_path(
-            &item,
-            use_style,
-            add_decorator,
-            colors,
-            opts,
-            highlight,
-        );
+        let path_display =
+            render_styled_path(&item, use_style, add_decorator, colors, opts, highlight);
         out.push(format!("{}\t{}", compact, path_display));
     }
     out
@@ -1863,14 +2689,8 @@ fn counts_summary_transform(
             is_symlink: false,
             metadata: None,
         };
-        let folder_display = render_styled_path(
-            &folder_item,
-            use_style,
-            false,
-            colors,
-            opts,
-            highlight,
-        );
+        let folder_display =
+            render_styled_path(&folder_item, use_style, false, colors, opts, highlight);
         out.push(format!("{:>7}  {}", n, folder_display));
     }
     out
@@ -2126,7 +2946,11 @@ fn render_styled_path(
                     &spec.prefix_rules,
                 ));
             }
-            plain.push_str(&colorize_segment_with_highlights(&leaf, None, &spec.leaf_rules));
+            plain.push_str(&colorize_segment_with_highlights(
+                &leaf,
+                None,
+                &spec.leaf_rules,
+            ));
             return plain;
         }
         return display_path;
@@ -2204,19 +3028,20 @@ fn final_transform(
     cache_transform(&items, opts);
     let add_decorators = stdout_is_tty || opts.classify;
     if opts.counts {
-        return counts_summary_transform(
-            items,
-            stdout_is_tty,
-            use_style,
-            colors,
-            opts,
-            highlight,
-        );
+        return counts_summary_transform(items, stdout_is_tty, use_style, colors, opts, highlight);
     }
     precompute_dirsize_cache(&items, opts, cache);
     let items = sort_results(items, opts, cache);
     if opts.sizes {
-        return sizes_transform(items, opts, cache, use_style, add_decorators, colors, highlight);
+        return sizes_transform(
+            items,
+            opts,
+            cache,
+            use_style,
+            add_decorators,
+            colors,
+            highlight,
+        );
     }
     let mut out = Vec::new();
     if opts.long_format {
@@ -2250,7 +3075,7 @@ fn run_standard(
     opts: &Options,
     cache: &mut DirStatsCache,
     colors: &ColorSpec,
-) -> Result<Vec<String>, String> {
+) -> Result<SearchRun, String> {
     let stdout_is_tty = io::stdout().is_terminal();
     let use_style = style_enabled(opts, stdout_is_tty);
     let name = parse_name_pattern(&opts.positional[0], opts.regex_mode);
@@ -2292,6 +3117,7 @@ fn run_standard(
                     opts_clone.follow_links,
                     type_flag,
                     false,
+                    false,
                     &timeout_fast,
                 )
             });
@@ -2299,19 +3125,23 @@ fn run_standard(
             let p_raw = &opts.positional[1];
             let sd = parse_search_dir(p_raw, opts.regex_mode, opts.force_pattern_mode);
             rayon::spawn(move || match sd {
-                SearchDirMode::Path(p) => walk_fast(
-                    PathBuf::from(p),
-                    &re,
-                    is_catch_all,
-                    &tx,
-                    opts_clone.visible_only,
-                    opts_clone.respect_ignore,
-                    opts_clone.no_recurse,
-                    opts_clone.follow_links,
-                    type_flag,
-                    false,
-                    &timeout_fast,
-                ),
+                SearchDirMode::Path(p) => {
+                    let root_serial = root_prefers_single_thread(Path::new(&p));
+                    walk_fast(
+                        PathBuf::from(p),
+                        &re,
+                        is_catch_all,
+                        &tx,
+                        opts_clone.visible_only,
+                        opts_clone.respect_ignore,
+                        opts_clone.no_recurse,
+                        opts_clone.follow_links,
+                        type_flag,
+                        false,
+                        root_serial,
+                        &timeout_fast,
+                    )
+                }
                 SearchDirMode::Pattern(sd_rx) => {
                     let mut roots = Vec::new();
                     let (rtx, rrx) = unbounded::<Vec<PathInfo>>();
@@ -2330,6 +3160,7 @@ fn run_standard(
                         opts_clone.follow_links,
                         Some(TypeFlag::Dir),
                         false,
+                        false,
                         &timeout_fast,
                     );
                     drop(rtx);
@@ -2339,6 +3170,7 @@ fn run_standard(
                         }
                     }
                     roots.into_par_iter().for_each_with(tx.clone(), |tx_c, d| {
+                        let next_serial = root_prefers_single_thread(&d);
                         walk_fast(
                             d,
                             &re,
@@ -2350,6 +3182,7 @@ fn run_standard(
                             opts_clone.follow_links,
                             type_flag,
                             false,
+                            next_serial,
                             &timeout_fast,
                         );
                     });
@@ -2383,7 +3216,10 @@ fn run_standard(
             let _ = state.files.flush();
         }
         let _ = lock.flush();
-        return Ok(Vec::new());
+        return Ok(SearchRun {
+            lines: Vec::new(),
+            timed_out: timeout_triggered.load(Ordering::Relaxed),
+        });
     }
 
     let mut results = Vec::new();
@@ -2391,6 +3227,7 @@ fn run_standard(
     let (tx, rx) = unbounded::<Vec<SearchResult>>();
     let opts_clone = opts.clone();
     if opts.positional.len() == 1 {
+        let timeout_walk = timeout_triggered.clone();
         rayon::spawn(move || {
             walk_rayon_worker(
                 PathBuf::from("."),
@@ -2402,27 +3239,34 @@ fn run_standard(
                 false,
                 false,
                 needs_metadata,
-                &timeout_triggered,
+                false,
+                &timeout_walk,
             )
         });
     } else {
         let p_raw = &opts.positional[1];
         match parse_search_dir(p_raw, opts.regex_mode, opts.force_pattern_mode) {
-            SearchDirMode::Path(p) => rayon::spawn(move || {
-                walk_rayon_worker(
-                    PathBuf::from(p),
-                    &re,
-                    is_catch_all,
-                    &tx,
-                    &opts_clone,
-                    type_flag,
-                    false,
-                    false,
-                    needs_metadata,
-                    &timeout_triggered,
-                )
-            }),
+            SearchDirMode::Path(p) => {
+                let timeout_walk = timeout_triggered.clone();
+                rayon::spawn(move || {
+                    let root_serial = root_prefers_single_thread(Path::new(&p));
+                    walk_rayon_worker(
+                        PathBuf::from(p),
+                        &re,
+                        is_catch_all,
+                        &tx,
+                        &opts_clone,
+                        type_flag,
+                        false,
+                        false,
+                        needs_metadata,
+                        root_serial,
+                        &timeout_walk,
+                    )
+                })
+            }
             SearchDirMode::Pattern(sd_rx) => {
+                let timeout_walk = timeout_triggered.clone();
                 rayon::spawn(move || {
                     let mut roots = Vec::new();
                     let (rtx, rrx) = unbounded::<Vec<SearchResult>>();
@@ -2440,7 +3284,8 @@ fn run_standard(
                         false,
                         false,
                         false,
-                        &timeout_triggered,
+                        false,
+                        &timeout_walk,
                     );
                     drop(rtx);
                     for chunk in rrx {
@@ -2449,6 +3294,7 @@ fn run_standard(
                         }
                     }
                     roots.into_par_iter().for_each_with(tx.clone(), |tx_c, d| {
+                        let next_serial = root_prefers_single_thread(&d);
                         walk_rayon_worker(
                             d,
                             &re,
@@ -2459,7 +3305,8 @@ fn run_standard(
                             false,
                             false,
                             needs_metadata,
-                            &timeout_triggered,
+                            next_serial,
+                            &timeout_walk,
                         );
                     });
                 });
@@ -2474,15 +3321,18 @@ fn run_standard(
     } else {
         None
     };
-    Ok(final_transform(
-        results,
-        opts,
-        use_style,
-        stdout_is_tty,
-        colors,
-        cache,
-        highlight_spec.as_ref(),
-    ))
+    Ok(SearchRun {
+        lines: final_transform(
+            results,
+            opts,
+            use_style,
+            stdout_is_tty,
+            colors,
+            cache,
+            highlight_spec.as_ref(),
+        ),
+        timed_out: timeout_triggered.load(Ordering::Relaxed),
+    })
 }
 
 fn run_contains_all(
@@ -2490,7 +3340,7 @@ fn run_contains_all(
     spec: ContainsAllSpec,
     cache: &mut DirStatsCache,
     colors: &ColorSpec,
-) -> Result<Vec<String>, String> {
+) -> Result<SearchRun, String> {
     let stdout_is_tty = io::stdout().is_terminal();
     let use_style = style_enabled(opts, stdout_is_tty);
     let timeout_dur = opts.timeout_dur;
@@ -2517,15 +3367,15 @@ fn run_contains_all(
         term_specs.push((parsed.regex, term_selectivity_score(p, opts.regex_mode)));
     }
     term_specs.sort_by(|a, b| {
-        b.1.cmp(&a.1).then_with(|| {
-            b.0.len()
-                .cmp(&a.0.len())
-                .then_with(|| a.0.cmp(&b.0))
-        })
+        b.1.cmp(&a.1)
+            .then_with(|| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)))
     });
     let regexes: Vec<String> = term_specs.into_iter().map(|(rx, _)| rx).collect();
     if regexes.is_empty() {
-        return Ok(Vec::new());
+        return Ok(SearchRun {
+            lines: Vec::new(),
+            timed_out: false,
+        });
     }
     let first_re = RegexBuilder::new(&regexes[0])
         .case_insensitive(true)
@@ -2536,6 +3386,8 @@ fn run_contains_all(
     let (tx, rx) = unbounded::<Vec<SearchResult>>();
     let opts_clone = opts.clone();
     let root = spec.root.clone();
+    let root_serial = root_prefers_single_thread(&root);
+    let timeout_walk = timeout_triggered.clone();
     rayon::spawn(move || {
         walk_rayon_worker(
             root,
@@ -2547,7 +3399,8 @@ fn run_contains_all(
             opts_clone.force_full,
             false,
             needs_metadata,
-            &timeout_triggered,
+            root_serial,
+            &timeout_walk,
         )
     });
 
@@ -2566,7 +3419,12 @@ fn run_contains_all(
                 if opts.force_full {
                     re_extra.is_match(&r.path)
                 } else {
-                    let base = r.path.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+                    let base = r
+                        .path
+                        .trim_end_matches('/')
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or("");
                     re_extra.is_match(base)
                 }
             })
@@ -2585,7 +3443,12 @@ fn run_contains_all(
         rows = rows
             .into_iter()
             .filter(|r| {
-                let base = r.path.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+                let base = r
+                    .path
+                    .trim_end_matches('/')
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("");
                 basename_res.iter().any(|re| re.is_match(base))
             })
             .collect();
@@ -2602,22 +3465,25 @@ fn run_contains_all(
         None
     };
 
-    Ok(final_transform(
-        rows,
-        opts,
-        use_style,
-        stdout_is_tty,
-        colors,
-        cache,
-        highlight_spec.as_ref(),
-    ))
+    Ok(SearchRun {
+        lines: final_transform(
+            rows,
+            opts,
+            use_style,
+            stdout_is_tty,
+            colors,
+            cache,
+            highlight_spec.as_ref(),
+        ),
+        timed_out: timeout_triggered.load(Ordering::Relaxed),
+    })
 }
 
 fn run_full(
     opts: &Options,
     cache: &mut DirStatsCache,
     colors: &ColorSpec,
-) -> Result<Vec<String>, String> {
+) -> Result<SearchRun, String> {
     let stdout_is_tty = io::stdout().is_terminal();
     let use_style = style_enabled(opts, stdout_is_tty);
     let mut search_root = ".".to_string();
@@ -2643,13 +3509,13 @@ fn run_full(
         if parsed.type_flag == Some(TypeFlag::Dir) && !opts.force_file {
             type_flag = Some(TypeFlag::Dir);
         }
-        pattern_specs.push((
-            parsed.regex,
-            pattern_prefers_full_path(p, opts.regex_mode),
-        ));
+        pattern_specs.push((parsed.regex, pattern_prefers_full_path(p, opts.regex_mode)));
     }
     if pattern_specs.is_empty() {
-        return Ok(Vec::new());
+        return Ok(SearchRun {
+            lines: Vec::new(),
+            timed_out: false,
+        });
     }
     let re = RegexBuilder::new(&pattern_specs[0].0)
         .case_insensitive(true)
@@ -2667,6 +3533,8 @@ fn run_full(
     let is_catch_all = pattern_specs[0].0 == ".*" || pattern_specs[0].0 == "^.*$";
     let first_full_path_match = pattern_specs[0].1;
     let prune_matched_dir_subtrees = false;
+    let root_serial = root_prefers_single_thread(Path::new(&search_root));
+    let timeout_walk = timeout_triggered.clone();
     rayon::spawn(move || {
         walk_rayon_worker(
             PathBuf::from(search_root),
@@ -2678,7 +3546,8 @@ fn run_full(
             first_full_path_match,
             prune_matched_dir_subtrees,
             opts_clone.long_format || opts_clone.sort_field.is_some() || opts_clone.sizes,
-            &timeout_triggered,
+            root_serial,
+            &timeout_walk,
         );
     });
     let mut rows = Vec::new();
@@ -2696,7 +3565,12 @@ fn run_full(
                 if *full_path_match {
                     re_extra.is_match(&r.path)
                 } else {
-                    let base = r.path.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+                    let base = r
+                        .path
+                        .trim_end_matches('/')
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or("");
                     re_extra.is_match(base)
                 }
             })
@@ -2708,19 +3582,22 @@ fn run_full(
     } else {
         None
     };
-    Ok(final_transform(
-        rows,
-        opts,
-        use_style,
-        stdout_is_tty,
-        colors,
-        cache,
-        highlight_spec.as_ref(),
-    ))
+    Ok(SearchRun {
+        lines: final_transform(
+            rows,
+            opts,
+            use_style,
+            stdout_is_tty,
+            colors,
+            cache,
+            highlight_spec.as_ref(),
+        ),
+        timed_out: timeout_triggered.load(Ordering::Relaxed),
+    })
 }
 
 fn main() -> ExitCode {
-    let opts = match parse_args() {
+    let mut opts = match parse_args() {
         Ok(v) => v,
         Err(e) => {
             if !e.is_empty() {
@@ -2729,15 +3606,55 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if opts.snapshot_refresh && !opts.timeout_explicit {
+        opts.timeout_dur = SNAPSHOT_REFRESH_TIMEOUT;
+    }
+    if let Some(root) = opts.index_refresh.as_deref() {
+        let result = refresh_index_root(root, &opts);
+        remove_index_refresh_lock(root);
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{}", e);
+                ExitCode::from(1)
+            }
+        };
+    }
+    let snapshot_path = if opts.snapshot_cache || opts.snapshot_refresh {
+        snapshot_cache_path()
+    } else {
+        None
+    };
     let content_spec = match contains_all_spec_from_opts(&opts) {
         Ok(v) => v,
         Err(e) => {
+            if opts.snapshot_refresh {
+                if let Some(path) = snapshot_path.as_deref() {
+                    let _ = fs::remove_file(snapshot_lock_path(path));
+                }
+            }
             if !e.trim().is_empty() {
                 eprintln!("{}", e.trim());
             }
             return ExitCode::from(2);
         }
     };
+    if opts.snapshot_cache {
+        if let Some(path) = snapshot_path.as_deref() {
+            if path.is_file() {
+                if let Err(e) = stream_snapshot_cache(path) {
+                    eprintln!("unearth: failed to read snapshot cache: {}", e);
+                    return ExitCode::from(1);
+                }
+                spawn_snapshot_refresh();
+                return ExitCode::SUCCESS;
+            }
+        }
+    }
+    let effective_threads = effective_threads_override(&opts, content_spec.as_ref());
+    let _ = ThreadPoolBuilder::new()
+        .num_threads(effective_threads)
+        .build_global();
     let mut cache = DirStatsCache {
         map: HashMap::new(),
         bytes_map: HashMap::new(),
@@ -2747,7 +3664,9 @@ fn main() -> ExitCode {
     } else {
         parse_ls_colors()
     };
-    let result = if let Some(spec) = content_spec {
+    let result = if opts.index_mode {
+        run_indexed(&opts, content_spec.as_ref(), &mut cache, &colors)
+    } else if let Some(spec) = content_spec {
         run_contains_all(&opts, spec, &mut cache, &colors)
     } else if opts.force_full {
         run_full(&opts, &mut cache, &colors)
@@ -2755,11 +3674,28 @@ fn main() -> ExitCode {
         run_standard(&opts, &mut cache, &colors)
     };
     match result {
-        Ok(lines) => {
-            if !lines.is_empty() {
+        Ok(run) => {
+            if (opts.snapshot_cache || opts.snapshot_refresh) && !run.timed_out {
+                if let Some(path) = snapshot_path.as_deref() {
+                    if let Err(e) = write_snapshot_cache(path, &run.lines) {
+                        eprintln!("unearth: failed to write snapshot cache: {}", e);
+                    }
+                }
+            }
+            if opts.snapshot_refresh {
+                if let Some(path) = snapshot_path.as_deref() {
+                    let _ = fs::remove_file(snapshot_lock_path(path));
+                }
+                return if run.timed_out {
+                    ExitCode::from(1)
+                } else {
+                    ExitCode::SUCCESS
+                };
+            }
+            if !run.lines.is_empty() {
                 let stdout = io::stdout();
                 let mut lock = BufWriter::with_capacity(128 * 1024, stdout.lock());
-                for line in lines {
+                for line in run.lines {
                     let _ = writeln!(lock, "{}", line);
                 }
                 let _ = lock.flush();
@@ -2772,5 +3708,80 @@ fn main() -> ExitCode {
             }
             ExitCode::from(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_opts() -> Options {
+        Options {
+            timeout_dur: Duration::from_secs(6),
+            timeout_explicit: false,
+            force_pattern_mode: false,
+            long_format: false,
+            long_extended: false,
+            sizes: false,
+            counts: false,
+            regex_mode: false,
+            sort_field: None,
+            sort_order: None,
+            no_recurse: false,
+            follow_links: false,
+            respect_ignore: false,
+            visible_only: true,
+            threads_override: 8,
+            threads_explicit: false,
+            cache_output: false,
+            snapshot_cache: false,
+            snapshot_refresh: false,
+            index_mode: false,
+            index_binary: false,
+            index_refresh: None,
+            absolute_paths: false,
+            force_dir: false,
+            force_file: false,
+            force_full: false,
+            classify: false,
+            color_when: ColorWhen::Auto,
+            hyperlinks: false,
+            highlight_match: false,
+            contains_all: false,
+            path_override: None,
+            positional: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn media_root_prefers_single_thread() {
+        assert!(root_prefers_single_thread(Path::new("/media")));
+        assert!(root_prefers_single_thread(Path::new("/media/disk")));
+        assert!(!root_prefers_single_thread(Path::new("/mnt")));
+        assert!(!root_prefers_single_thread(Path::new("/home/lewis")));
+    }
+
+    #[test]
+    fn explicit_threads_override_media_default() {
+        let mut opts = base_opts();
+        opts.threads_override = 32;
+        opts.threads_explicit = true;
+        let spec = ContainsAllSpec {
+            terms: vec!["x".to_string()],
+            root: PathBuf::from("/media/disk"),
+        };
+        assert_eq!(effective_threads_override(&opts, Some(&spec)), 32);
+    }
+
+    #[test]
+    fn root_index_excludes_volatile_system_trees() {
+        assert!(is_root_index_excluded_path("/", "/dev"));
+        assert!(is_root_index_excluded_path("/", "/dev/null"));
+        assert!(is_root_index_excluded_path("/", "/proc/1/status"));
+        assert!(is_root_index_excluded_path("/", "/sys/class"));
+        assert!(is_root_index_excluded_path("/", "/run/user"));
+        assert!(!is_root_index_excluded_path("/", "/media"));
+        assert!(!is_root_index_excluded_path("/", "/home/lewis"));
+        assert!(!is_root_index_excluded_path("/dev", "/dev/null"));
     }
 }

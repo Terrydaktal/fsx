@@ -1,6 +1,6 @@
 [package]
 name = "unearth"
-version = "0.8.7"
+version = "0.8.9"
 edition = "2021"
 
 [[bin]]
@@ -15,3 +15,4 @@ crossbeam-channel = "0.5"
 jemallocator = "0.5"
 jwalk = "0.8"
 ntfs = "0.4.0"
+rusqlite = { version = "0.32", features = ["bundled"] }

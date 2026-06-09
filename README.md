@@ -37,7 +37,9 @@ Usage:
                        [--path DIR]
                        [--timeout N] [--sort date|size|name asc|desc]
                        [--no-recurse|-R] [--follow-links]
-                       [--ignore] [--hidden|-H] [--threads N] [--cache-raw]
+                       [--ignore] [--hidden|-H] [--threads N]
+                       [--cache-raw] [--snapshot-cache]
+                       [--index] [--index-refresh DIR]
                        [--color=auto|always|never] [--hyperlink]
   unearth (--version|-V)
 
@@ -181,6 +183,21 @@ Options:
       and files to:
       /tmp/fzf-history-$USER/universal-last-files-<fish pid>
       For every match, also save its parent directory to the dirs file.
+  --snapshot-cache
+      Print the last complete cached snapshot for this exact command
+      immediately, then refresh that snapshot in the background.
+      Timed-out scans do not replace an existing snapshot. Background
+      refreshes use a long timeout by default unless --timeout is passed
+      explicitly.
+  --index
+      Query the global pooled path database instead of walking the filesystem.
+      The database is stored at ~/.cache/unearth/index/unearth.db unless
+      XDG_CACHE_HOME is set. Current DB rows are returned immediately; if the
+      root is missing or stale, one background refresh is started.
+  --index-refresh DIR
+      Rebuild indexed rows for DIR in the global database. Directory paths and
+      repeated entry names are stored once and entries link to them by integer
+      IDs.
   --timeout N
       Per-invocation timeout for each unearth call. Default: 6s
       Examples: --timeout 10, --timeout 10s, --timeout 2m
