@@ -242,9 +242,14 @@ assert_eq "index all includes hidden" "$(XDG_CACHE_HOME="$INDEX_CACHE" "$F" --in
 assert_eq "index visible excludes hidden" "$(XDG_CACHE_HOME="$INDEX_CACHE" "$F" --index '*' --color=never "$INDEX_ROOT" | sort)" "$want_index_visible"
 assert_eq "index dirs only" "$(XDG_CACHE_HOME="$INDEX_CACHE" "$F" --index '*' -d -H --color=never "$INDEX_ROOT" | sort)" "$want_index_dirs"
 assert_eq "index visible dirs only" "$(XDG_CACHE_HOME="$INDEX_CACHE" "$F" --index '*' -d --color=never "$INDEX_ROOT" | sort)" "$want_index_visible_dirs"
+assert_eq "index trigram substring lookup" "$(XDG_CACHE_HOME="$INDEX_CACHE" "$F" --index nested -H --color=never "$INDEX_ROOT")" "${INDEX_ROOT}/a/sub/nested.txt"
 index_db="${INDEX_CACHE}/unearth/index/unearth.db"
 assert_eq "index records exact refreshed root" "$(sqlite3 "$index_db" "select count(*) from indexed_roots where root='${INDEX_ROOT}';")" "1"
 assert_eq "index child root does not mark parent refreshed" "$(sqlite3 "$index_db" "select count(*) from indexed_roots where root='${TMP_BASE}';")" "0"
+XDG_CACHE_HOME="$INDEX_CACHE" "$F" --index-purge "${INDEX_ROOT}/a/sub"
+assert_eq "index purge removes child dirs" "$(sqlite3 "$index_db" "select count(*) from dirs where path='${INDEX_ROOT}/a/sub';")" "0"
+assert_eq "index purge keeps sibling entries" "$(sqlite3 "$index_db" "select count(*) from entries e join dirs d on e.dir_id=d.id join strings s on e.name_id=s.id where d.path='${INDEX_ROOT}/a' and s.value='file.txt';")" "1"
+assert_eq "index purge invalidates containing root" "$(sqlite3 "$index_db" "select count(*) from indexed_roots where root='${INDEX_ROOT}';")" "0"
 
 # SORT MATRIX: size (directories by real size)
 SIZE_DIR_ROOT="${TMP_BASE}/size_dir_root"

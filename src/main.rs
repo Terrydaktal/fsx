@@ -1,7 +1,7 @@
 use chrono::{DateTime, Local};
 use jwalk::{Parallelism, WalkDir};
 use regex::{Regex, RegexBuilder};
-use rusqlite::{params, Connection};
+use rusqlite::{params, params_from_iter, Connection};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -101,6 +101,7 @@ struct Options {
     index_mode: bool,
     index_binary: bool,
     index_refresh: Option<String>,
+    index_purge: Option<String>,
     absolute_paths: bool,
     force_dir: bool,
     force_file: bool,
@@ -186,7 +187,8 @@ Usage:
                        [--no-recurse|-R] [--follow-links]
                        [--ignore] [--hidden|-H] [--threads N]
                        [--cache-raw] [--snapshot-cache]
-                       [--index] [--index-binary] [--index-refresh DIR]
+                       [--index] [--index-binary]
+                       [--index-refresh DIR] [--index-purge DIR]
                        [--color=auto|always|never] [--hyperlink]
                        [--highlight-match|--match-red]
   unearth (--version|-V)
@@ -261,6 +263,8 @@ Arguments:
   - --index-refresh DIR rebuilds the indexed rows for DIR in that global
     database. Directory paths and repeated entry names are stored once and
     entries link to them by integer IDs.
+  - --index-purge DIR removes indexed rows for DIR and all indexed children.
+    Existing roots are canonicalized; missing roots are normalized lexically.
   - --sizes prints compact sizes as SIZE<TAB>PATH (max 6 chars including
     unit, e.g., 1.111M, 111.1M),
     using recursive directory totals for directory matches.
@@ -320,6 +324,7 @@ fn parse_args() -> Result<Options, String> {
         index_mode: false,
         index_binary: false,
         index_refresh: None,
+        index_purge: None,
         absolute_paths: false,
         force_dir: false,
         force_file: false,
@@ -523,6 +528,21 @@ fn parse_args() -> Result<Options, String> {
                 }
                 opts.index_refresh = Some(v);
             }
+            "--index-purge" => {
+                i += 1;
+                if i < args.len() {
+                    opts.index_purge = Some(args[i].clone());
+                } else {
+                    return Err("--index-purge requires a root path".to_string());
+                }
+            }
+            _ if arg.starts_with("--index-purge=") => {
+                let v = arg.trim_start_matches("--index-purge=").to_string();
+                if v.is_empty() {
+                    return Err("--index-purge requires a non-empty root path".to_string());
+                }
+                opts.index_purge = Some(v);
+            }
             "--cache" => return Err("--cache was renamed to --cache-raw".to_string()),
             "--bypass" | "-b" => opts.force_pattern_mode = true,
             "--long" | "-l" => opts.long_format = true,
@@ -551,7 +571,7 @@ fn parse_args() -> Result<Options, String> {
         i += 1;
     }
 
-    if opts.positional.is_empty() && opts.index_refresh.is_none() {
+    if opts.positional.is_empty() && opts.index_refresh.is_none() && opts.index_purge.is_none() {
         return Err(usage());
     }
     Ok(opts)
@@ -1973,6 +1993,46 @@ fn open_index_db() -> Result<Connection, String> {
             root TEXT PRIMARY KEY,
             refreshed_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS index_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE VIRTUAL TABLE IF NOT EXISTS strings_fts USING fts5(
+            value,
+            content='strings',
+            content_rowid='id',
+            tokenize='trigram'
+        );
+        CREATE VIRTUAL TABLE IF NOT EXISTS dirs_fts USING fts5(
+            path,
+            content='dirs',
+            content_rowid='id',
+            tokenize='trigram'
+        );
+        CREATE TRIGGER IF NOT EXISTS strings_fts_ai AFTER INSERT ON strings BEGIN
+            INSERT INTO strings_fts(rowid, value) VALUES (new.id, new.value);
+        END;
+        CREATE TRIGGER IF NOT EXISTS strings_fts_ad AFTER DELETE ON strings BEGIN
+            INSERT INTO strings_fts(strings_fts, rowid, value)
+            VALUES ('delete', old.id, old.value);
+        END;
+        CREATE TRIGGER IF NOT EXISTS strings_fts_au AFTER UPDATE ON strings BEGIN
+            INSERT INTO strings_fts(strings_fts, rowid, value)
+            VALUES ('delete', old.id, old.value);
+            INSERT INTO strings_fts(rowid, value) VALUES (new.id, new.value);
+        END;
+        CREATE TRIGGER IF NOT EXISTS dirs_fts_ai AFTER INSERT ON dirs BEGIN
+            INSERT INTO dirs_fts(rowid, path) VALUES (new.id, new.path);
+        END;
+        CREATE TRIGGER IF NOT EXISTS dirs_fts_ad AFTER DELETE ON dirs BEGIN
+            INSERT INTO dirs_fts(dirs_fts, rowid, path)
+            VALUES ('delete', old.id, old.path);
+        END;
+        CREATE TRIGGER IF NOT EXISTS dirs_fts_au AFTER UPDATE ON dirs BEGIN
+            INSERT INTO dirs_fts(dirs_fts, rowid, path)
+            VALUES ('delete', old.id, old.path);
+            INSERT INTO dirs_fts(rowid, path) VALUES (new.id, new.path);
+        END;
         CREATE INDEX IF NOT EXISTS idx_strings_value ON strings(value);
         CREATE INDEX IF NOT EXISTS idx_dirs_path ON dirs(path);
         CREATE INDEX IF NOT EXISTS idx_entries_dir ON entries(dir_id);
@@ -1981,6 +2041,29 @@ fn open_index_db() -> Result<Connection, String> {
     )
     .map_err(|e| e.to_string())?;
     Ok(conn)
+}
+
+fn ensure_index_search_ready(conn: &Connection) -> Result<bool, String> {
+    let ready: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM index_meta WHERE key = 'fts_trigram_v1'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if ready > 0 {
+        return Ok(true);
+    }
+    conn.execute_batch(
+        "
+        INSERT INTO strings_fts(strings_fts) VALUES ('rebuild');
+        INSERT INTO dirs_fts(dirs_fts) VALUES ('rebuild');
+        INSERT OR REPLACE INTO index_meta(key, value)
+        VALUES ('fts_trigram_v1', 'ready');
+        ",
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(true)
 }
 
 fn db_get_or_insert_string(tx: &rusqlite::Transaction<'_>, value: &str) -> Result<i64, String> {
@@ -2039,6 +2122,232 @@ fn normalize_index_dir(path: &Path) -> String {
     out
 }
 
+fn normalize_lexical_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
+            Component::RootDir => out.push("/"),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            Component::Normal(part) => out.push(part),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
+    }
+}
+
+fn normalize_index_root_arg(root_raw: &str) -> Result<String, String> {
+    let expanded = PathBuf::from(expand_home_path(root_raw));
+    if let Ok(canonical) = fs::canonicalize(&expanded) {
+        return Ok(normalize_index_dir(&canonical));
+    }
+    let absolute = if expanded.is_absolute() {
+        expanded
+    } else {
+        env::current_dir()
+            .map_err(|e| e.to_string())?
+            .join(expanded)
+    };
+    Ok(normalize_index_dir(&normalize_lexical_path(&absolute)))
+}
+
+fn sql_like_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '%' | '_' | '\\' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn sql_like_from_wildcard(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            if let Some(next) = chars.next() {
+                match next {
+                    '%' | '_' | '\\' => {
+                        out.push('\\');
+                        out.push(next);
+                    }
+                    '*' => out.push('*'),
+                    _ => {
+                        out.push('\\');
+                        out.push(next);
+                    }
+                }
+            } else {
+                out.push('\\');
+            }
+            continue;
+        }
+        match ch {
+            '*' => out.push('%'),
+            '%' | '_' | '\\' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn fts_trigram_query(raw: &str) -> Option<String> {
+    if raw.contains('*') || raw.contains('/') || is_wrapped_quote(raw) || raw.chars().count() < 3 {
+        return None;
+    }
+    Some(format!("\"{}\"", raw.replace('"', "\"\"")))
+}
+
+fn sql_prefilter_for_term(
+    raw: &str,
+    regex_mode: bool,
+    force_full: bool,
+    field_expr: &str,
+    fts_ready: bool,
+) -> Option<(String, Vec<String>)> {
+    if regex_mode {
+        return None;
+    }
+
+    let mut params = Vec::new();
+    if is_wrapped_quote(raw) {
+        let mut inner = raw[1..raw.len() - 1].to_string();
+        inner = inner.trim_start_matches('/').to_string();
+        if inner != "/" {
+            inner = inner.trim_end_matches('/').to_string();
+        }
+        if inner.contains('*') {
+            params.push(sql_like_from_wildcard(&inner.to_lowercase()));
+            return Some((format!("{} LIKE ? ESCAPE '\\'", field_expr), params));
+        }
+        params.push(inner.to_lowercase());
+        return Some((format!("{} = ?", field_expr), params));
+    }
+
+    if force_full {
+        if !raw.contains('/') {
+            if fts_ready {
+                if let Some(query) = fts_trigram_query(raw) {
+                    params.push(query.clone());
+                    params.push(query);
+                    return Some((
+                        "(e.name_id IN (SELECT rowid FROM strings_fts WHERE strings_fts MATCH ?) OR e.dir_id IN (SELECT rowid FROM dirs_fts WHERE dirs_fts MATCH ?))".to_string(),
+                        params,
+                    ));
+                }
+            }
+            let lowered = raw.to_lowercase();
+            if raw.contains('*') {
+                let like = sql_like_from_wildcard(&lowered);
+                params.push(like.clone());
+                params.push(like);
+                return Some((
+                    "(e.name_id IN (SELECT id FROM strings WHERE lower(value) LIKE ? ESCAPE '\\') OR e.dir_id IN (SELECT id FROM dirs WHERE lower(path) LIKE ? ESCAPE '\\'))".to_string(),
+                    params,
+                ));
+            }
+            let narrowed = if raw.starts_with('/') && raw.ends_with('/') && raw.len() > 1 {
+                lowered[1..lowered.len() - 1].to_string()
+            } else if raw.starts_with('/') && raw.len() > 1 {
+                lowered.trim_start_matches('/').to_string()
+            } else if raw != "/" && raw.ends_with('/') {
+                lowered.trim_end_matches('/').to_string()
+            } else {
+                lowered
+            };
+            params.push(narrowed.clone());
+            params.push(narrowed);
+            return Some((
+                "(e.name_id IN (SELECT id FROM strings WHERE instr(lower(value), ?) > 0) OR e.dir_id IN (SELECT id FROM dirs WHERE instr(lower(path), ?) > 0))".to_string(),
+                params,
+            ));
+        }
+
+        if raw.contains('*') {
+            params.push(sql_like_from_wildcard(&raw.to_lowercase()));
+            return Some((format!("{} LIKE ? ESCAPE '\\'", field_expr), params));
+        }
+        let lowered = raw.to_lowercase();
+        if raw.starts_with('/') && raw.ends_with('/') && raw.len() > 1 {
+            params.push(lowered[1..lowered.len() - 1].to_string());
+        } else if raw.starts_with('/') && raw.len() > 1 {
+            params.push(lowered.trim_start_matches('/').to_string());
+        } else if raw != "/" && raw.ends_with('/') {
+            params.push(lowered.trim_end_matches('/').to_string());
+        } else {
+            params.push(lowered);
+        }
+        return Some((format!("instr({}, ?) > 0", field_expr), params));
+    }
+
+    if raw.starts_with('/') && raw.ends_with('/') {
+        params.push(raw[1..raw.len() - 1].to_lowercase());
+        return Some((
+            "e.name_id IN (SELECT id FROM strings WHERE lower(value) = ?)".to_string(),
+            params,
+        ));
+    }
+    if raw.starts_with('/') {
+        params.push(format!("{}%", sql_like_escape(&raw[1..].to_lowercase())));
+        return Some((
+            "e.name_id IN (SELECT id FROM strings WHERE lower(value) LIKE ? ESCAPE '\\')"
+                .to_string(),
+            params,
+        ));
+    }
+    if raw != "/" && raw.ends_with('/') {
+        params.push(format!(
+            "%{}",
+            sql_like_escape(&raw[..raw.len() - 1].to_lowercase())
+        ));
+        return Some((
+            "e.name_id IN (SELECT id FROM strings WHERE lower(value) LIKE ? ESCAPE '\\')"
+                .to_string(),
+            params,
+        ));
+    }
+    if raw.contains('*') {
+        params.push(sql_like_from_wildcard(&raw.to_lowercase()));
+        return Some((
+            "e.name_id IN (SELECT id FROM strings WHERE lower(value) LIKE ? ESCAPE '\\')"
+                .to_string(),
+            params,
+        ));
+    }
+
+    if fts_ready {
+        if let Some(query) = fts_trigram_query(raw) {
+            params.push(query);
+            return Some((
+                "e.name_id IN (SELECT rowid FROM strings_fts WHERE strings_fts MATCH ?)"
+                    .to_string(),
+                params,
+            ));
+        }
+    }
+    params.push(raw.to_lowercase());
+    Some((
+        "e.name_id IN (SELECT id FROM strings WHERE instr(lower(value), ?) > 0)".to_string(),
+        params,
+    ))
+}
+
 fn index_path_prefix(path: &str) -> String {
     if path == "/" {
         "/".to_string()
@@ -2056,6 +2365,74 @@ fn is_root_index_excluded_path(root_key: &str, path: &str) -> bool {
         && ["/proc", "/sys", "/dev", "/run"]
             .iter()
             .any(|prefix| path == *prefix || path.starts_with(&format!("{}/", prefix)))
+}
+
+fn purge_index_root(root_raw: &str) -> Result<(), String> {
+    let root_key = normalize_index_root_arg(root_raw)?;
+    let root_prefix = index_path_prefix(&root_key);
+    let mut conn = open_index_db()?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let mut impacted_roots = Vec::<String>::new();
+    {
+        let mut stmt = tx
+            .prepare("SELECT root FROM indexed_roots")
+            .map_err(|e| e.to_string())?;
+        let roots = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        for root in roots {
+            let root = root.map_err(|e| e.to_string())?;
+            let indexed_prefix = index_path_prefix(&root);
+            if root == root_key
+                || root.starts_with(&root_prefix)
+                || root_key.starts_with(&indexed_prefix)
+            {
+                impacted_roots.push(root);
+            }
+        }
+    }
+    tx.execute(
+        "DELETE FROM entries WHERE dir_id IN (
+            SELECT id FROM dirs WHERE path = ?1 OR path LIKE ?2
+        )",
+        params![root_key, format!("{}%", root_prefix)],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM dirs WHERE path = ?1 OR path LIKE ?2",
+        params![root_key, format!("{}%", root_prefix)],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM indexed_roots WHERE root = ?1 OR root LIKE ?2",
+        params![root_key, format!("{}%", root_prefix)],
+    )
+    .map_err(|e| e.to_string())?;
+    for impacted_root in &impacted_roots {
+        tx.execute("DELETE FROM indexed_roots WHERE root = ?1", [impacted_root])
+            .map_err(|e| e.to_string())?;
+    }
+    tx.execute(
+        "DELETE FROM strings WHERE id NOT IN (
+            SELECT DISTINCT name_id FROM entries
+        )",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    let mut state_roots = impacted_roots;
+    state_roots.push(root_key);
+    state_roots.sort();
+    state_roots.dedup();
+    for state_root in state_roots {
+        if let Some(stamp_path) = index_state_path(&state_root, "stamp") {
+            let _ = fs::remove_file(stamp_path);
+        }
+        if let Some(lock_path) = index_state_path(&state_root, "lock") {
+            let _ = fs::remove_file(lock_path);
+        }
+    }
+    Ok(())
 }
 
 fn refresh_index_root(root_raw: &str, opts: &Options) -> Result<(), String> {
@@ -2305,21 +2682,50 @@ fn run_indexed(
         );
     }
     let conn = open_index_db()?;
+    let fts_ready = ensure_index_search_ready(&conn).unwrap_or(false);
     let root_known = index_root_is_known(&conn, &root_key)?;
     spawn_index_refresh(&root_key, opts, !root_known);
     let stdout_is_tty = io::stdout().is_terminal();
     let use_style = style_enabled(opts, stdout_is_tty);
-    let mut stmt = conn
-        .prepare(
-            "SELECT d.path, s.value, e.kind, e.mtime, e.size
-             FROM entries e
-             JOIN dirs d ON e.dir_id = d.id
-             JOIN strings s ON e.name_id = s.id
-             WHERE d.path = ?1 OR d.path LIKE ?2",
-        )
-        .map_err(|e| e.to_string())?;
+    let base_name_expr = "lower(s.value)";
+    let full_path_expr =
+        "lower((CASE WHEN d.path = '/' THEN '/' || s.value ELSE d.path || '/' || s.value END) || CASE WHEN e.kind = 1 THEN '/' ELSE '' END)";
+    let sql_field_expr = if opts.force_full {
+        full_path_expr
+    } else {
+        base_name_expr
+    };
+    let mut sql = String::from(
+        "SELECT d.path, s.value, e.kind, e.mtime, e.size
+         FROM entries e
+         JOIN dirs d ON e.dir_id = d.id
+         JOIN strings s ON e.name_id = s.id
+         WHERE (d.path = ? OR d.path LIKE ?)",
+    );
+    let mut sql_params = vec![root_key.clone(), format!("{}%", root_prefix)];
+    match type_flag {
+        Some(TypeFlag::Dir) => sql.push_str(" AND e.kind = 1"),
+        Some(TypeFlag::File) => sql.push_str(" AND e.kind != 1"),
+        None => {}
+    }
+    for term in &terms {
+        if let Some((condition, extra_params)) = sql_prefilter_for_term(
+            term,
+            opts.regex_mode,
+            opts.force_full,
+            sql_field_expr,
+            fts_ready,
+        ) {
+            sql.push_str(" AND ");
+            sql.push('(');
+            sql.push_str(&condition);
+            sql.push(')');
+            sql_params.extend(extra_params);
+        }
+    }
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map(params![root_key, format!("{}%", root_prefix)], |row| {
+        .query_map(params_from_iter(sql_params.iter()), |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -3620,6 +4026,15 @@ fn main() -> ExitCode {
             }
         };
     }
+    if let Some(root) = opts.index_purge.as_deref() {
+        return match purge_index_root(root) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{}", e);
+                ExitCode::from(1)
+            }
+        };
+    }
     let snapshot_path = if opts.snapshot_cache || opts.snapshot_refresh {
         snapshot_cache_path()
     } else {
@@ -3739,6 +4154,7 @@ mod tests {
             index_mode: false,
             index_binary: false,
             index_refresh: None,
+            index_purge: None,
             absolute_paths: false,
             force_dir: false,
             force_file: false,

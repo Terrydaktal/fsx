@@ -39,7 +39,8 @@ Usage:
                        [--no-recurse|-R] [--follow-links]
                        [--ignore] [--hidden|-H] [--threads N]
                        [--cache-raw] [--snapshot-cache]
-                       [--index] [--index-refresh DIR]
+                       [--index] [--index-binary]
+                       [--index-refresh DIR] [--index-purge DIR]
                        [--color=auto|always|never] [--hyperlink]
   unearth (--version|-V)
 
@@ -193,11 +194,18 @@ Options:
       Query the global pooled path database instead of walking the filesystem.
       The database is stored at ~/.cache/unearth/index/unearth.db unless
       XDG_CACHE_HOME is set. Current DB rows are returned immediately; if the
-      root is missing or stale, one background refresh is started.
+      root is missing or stale, one background refresh is started. Plain terms
+      of three or more characters use trigram indexes over pooled names and
+      directory paths. Existing databases build these indexes once on the first
+      indexed query after upgrading, which increases that same database's size.
   --index-refresh DIR
       Rebuild indexed rows for DIR in the global database. Directory paths and
       repeated entry names are stored once and entries link to them by integer
       IDs.
+  --index-purge DIR
+      Remove indexed rows for DIR and all indexed children from the global
+      database. Existing roots are canonicalized; missing roots are normalized
+      lexically, so stale rows can be removed after a drive is disconnected.
   --timeout N
       Per-invocation timeout for each unearth call. Default: 6s
       Examples: --timeout 10, --timeout 10s, --timeout 2m
