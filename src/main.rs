@@ -1,13 +1,16 @@
 use chrono::{DateTime, Local};
 use jwalk::{Parallelism, WalkDir};
+use memmap2::Mmap;
 use regex::{Regex, RegexBuilder};
 use rusqlite::{params, params_from_iter, Connection};
+use std::borrow::Cow;
+use std::cmp::Ordering as CmpOrdering;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
-use std::io::{self, BufWriter, IsTerminal, Write};
+use std::io::{self, BufWriter, IsTerminal, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
@@ -31,6 +34,13 @@ const SNAPSHOT_REFRESH_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const SNAPSHOT_REFRESH_MIN_AGE: Duration = Duration::from_secs(30);
 const INDEX_REFRESH_MIN_AGE: Duration = Duration::from_secs(30);
 const INDEX_STREAM_FLUSH_LINES: usize = 1_000;
+const INDEX_INSERT_BATCH_SIZE: usize = 1_000;
+const INDEX_INCREMENTAL_MAX_CHANGES: usize = 100_000;
+const INDEX_INCREMENTAL_CHANGE_DIVISOR: usize = 5;
+const INDEX_SNAPSHOT_MAGIC: &[u8; 8] = b"UNRTHS01";
+const INDEX_MANIFEST_MAGIC: &[u8; 8] = b"UNRMNF02";
+const INDEX_DELTA_MAGIC: &[u8; 8] = b"UNRDLT01";
+const INDEX_DELTA_COMPACT_RECORDS: usize = 50_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TypeFlag {
@@ -89,6 +99,7 @@ struct Options {
     regex_mode: bool,
     sort_field: Option<SortField>,
     sort_order: Option<SortOrder>,
+    limit: Option<usize>,
     no_recurse: bool,
     follow_links: bool,
     respect_ignore: bool,
@@ -100,7 +111,9 @@ struct Options {
     snapshot_refresh: bool,
     index_mode: bool,
     index_binary: bool,
+    recent_limit: Option<usize>,
     index_refresh: Option<String>,
+    index_snapshot: Option<String>,
     index_purge: Option<String>,
     absolute_paths: bool,
     force_dir: bool,
@@ -120,6 +133,8 @@ struct SearchResult {
     is_dir: bool,
     is_symlink: bool,
     metadata: Option<fs::Metadata>,
+    indexed_activity_nanos: Option<i64>,
+    indexed_size: Option<u64>,
 }
 
 struct SearchRun {
@@ -183,12 +198,14 @@ Usage:
                        [--sizes]
                        [--contains-all]
                        [--path DIR]
-                       [--timeout N] [--sort date|size|name asc|desc]
+                       [--timeout N] [--sort date|size|name asc|desc] [--limit N]
                        [--no-recurse|-R] [--follow-links]
                        [--ignore] [--hidden|-H] [--threads N]
                        [--cache-raw] [--snapshot-cache]
                        [--index] [--index-binary]
-                       [--index-refresh DIR] [--index-purge DIR]
+                       [--recent N]
+                       [--index-refresh DIR] [--index-snapshot DIR]
+                       [--index-purge DIR]
                        [--color=auto|always|never] [--hyperlink]
                        [--highlight-match|--match-red]
   unearth (--version|-V)
@@ -260,9 +277,24 @@ Arguments:
     the root is missing or stale.
   - --index-binary writes --index results as repeated little-endian
     u32-length-prefixed path bytes instead of newline-delimited text.
+  - --recent N queries the indexed database for the N most recently
+    created-or-modified entries under DIR (or '.' when DIR is omitted), ordered
+    newest-first. It synchronously refreshes the covering indexed root before
+    querying, so results are never taken from a stale snapshot. Files,
+    directories, and symlinks are included by default; use -f or -d to restrict
+    the type. Terms before DIR filter results; --full/-F matches them against the
+    complete path. Filtered recent searches walk and filter paths first, then
+    read metadata only for matches. Add --long/-l to show the activity date and
+    size.
   - --index-refresh DIR rebuilds the indexed rows for DIR in that global
-    database. Directory paths and repeated entry names are stored once and
-    entries link to them by integer IDs.
+    database and atomically replaces its fast-start binary snapshot. Directory
+    paths and repeated entry names are stored once and entries link to them by
+    integer IDs. Unchanged path/kind fingerprints skip database and snapshot
+    reconstruction. Small changes are merge-diffed through a memory-mapped
+    manifest and published as snapshot deltas; large changes compact fresh base
+    files using in-memory ID assignment and batched full reconstruction.
+  - --index-snapshot DIR rebuilds only the fast-start binary snapshot from
+    existing indexed rows without walking the filesystem.
   - --index-purge DIR removes indexed rows for DIR and all indexed children.
     Existing roots are canonicalized; missing roots are normalized lexically.
   - --sizes prints compact sizes as SIZE<TAB>PATH (max 6 chars including
@@ -270,6 +302,8 @@ Arguments:
     using recursive directory totals for directory matches.
     For top-level system trees under / (/mnt, /media, /dev, /proc, /sys, /run),
     size is shown as '-' to avoid expensive recursive traversal.
+  - --limit N returns at most N listed results. With --sort, unearth selects
+    only the best N entries before sorting that subset. --counts ignores it.
   - Name contains-all mode is implicit with 2+ plain positional terms
     (legacy name+search_dir selector forms still use search_dir mode),
     or enabled by --contains-all:
@@ -312,6 +346,7 @@ fn parse_args() -> Result<Options, String> {
         regex_mode: false,
         sort_field: None,
         sort_order: None,
+        limit: None,
         no_recurse: false,
         follow_links: false,
         respect_ignore: false,
@@ -323,7 +358,9 @@ fn parse_args() -> Result<Options, String> {
         snapshot_refresh: false,
         index_mode: false,
         index_binary: false,
+        recent_limit: None,
         index_refresh: None,
+        index_snapshot: None,
         index_purge: None,
         absolute_paths: false,
         force_dir: false,
@@ -501,6 +538,30 @@ fn parse_args() -> Result<Options, String> {
                     i += 2;
                 }
             }
+            "--limit" => {
+                i += 1;
+                if i < args.len() {
+                    let parsed = args[i]
+                        .parse::<usize>()
+                        .map_err(|_| "--limit requires a positive integer".to_string())?;
+                    if parsed == 0 {
+                        return Err("--limit requires a positive integer".to_string());
+                    }
+                    opts.limit = Some(parsed);
+                } else {
+                    return Err("--limit requires a count".to_string());
+                }
+            }
+            _ if arg.starts_with("--limit=") => {
+                let parsed = arg
+                    .trim_start_matches("--limit=")
+                    .parse::<usize>()
+                    .map_err(|_| "--limit requires a positive integer".to_string())?;
+                if parsed == 0 {
+                    return Err("--limit requires a positive integer".to_string());
+                }
+                opts.limit = Some(parsed);
+            }
             "--no-recurse" | "-R" => opts.no_recurse = true,
             "--follow-links" => opts.follow_links = true,
             "--ignore" => opts.respect_ignore = true,
@@ -512,6 +573,33 @@ fn parse_args() -> Result<Options, String> {
             "--index-binary" => {
                 opts.index_mode = true;
                 opts.index_binary = true;
+            }
+            "--recent" => {
+                i += 1;
+                if i < args.len() {
+                    opts.recent_limit = Some(
+                        args[i]
+                            .parse::<usize>()
+                            .map_err(|_| "--recent requires a positive integer".to_string())?,
+                    );
+                    if opts.recent_limit == Some(0) {
+                        return Err("--recent requires a positive integer".to_string());
+                    }
+                    opts.index_mode = true;
+                } else {
+                    return Err("--recent requires a count".to_string());
+                }
+            }
+            _ if arg.starts_with("--recent=") => {
+                let value = arg.trim_start_matches("--recent=");
+                let parsed = value
+                    .parse::<usize>()
+                    .map_err(|_| "--recent requires a positive integer".to_string())?;
+                if parsed == 0 {
+                    return Err("--recent requires a positive integer".to_string());
+                }
+                opts.recent_limit = Some(parsed);
+                opts.index_mode = true;
             }
             "--index-refresh" => {
                 i += 1;
@@ -527,6 +615,21 @@ fn parse_args() -> Result<Options, String> {
                     return Err("--index-refresh requires a non-empty root path".to_string());
                 }
                 opts.index_refresh = Some(v);
+            }
+            "--index-snapshot" => {
+                i += 1;
+                if i < args.len() {
+                    opts.index_snapshot = Some(args[i].clone());
+                } else {
+                    return Err("--index-snapshot requires a root path".to_string());
+                }
+            }
+            _ if arg.starts_with("--index-snapshot=") => {
+                let v = arg.trim_start_matches("--index-snapshot=").to_string();
+                if v.is_empty() {
+                    return Err("--index-snapshot requires a non-empty root path".to_string());
+                }
+                opts.index_snapshot = Some(v);
             }
             "--index-purge" => {
                 i += 1;
@@ -571,7 +674,12 @@ fn parse_args() -> Result<Options, String> {
         i += 1;
     }
 
-    if opts.positional.is_empty() && opts.index_refresh.is_none() && opts.index_purge.is_none() {
+    if opts.positional.is_empty()
+        && opts.index_refresh.is_none()
+        && opts.index_snapshot.is_none()
+        && opts.index_purge.is_none()
+        && opts.recent_limit.is_none()
+    {
         return Err(usage());
     }
     Ok(opts)
@@ -1218,6 +1326,8 @@ fn walk_rayon_worker(
                     } else {
                         None
                     },
+                    indexed_activity_nanos: None,
+                    indexed_size: None,
                 });
 
                 if local_buf.len() >= 256 {
@@ -1725,7 +1835,25 @@ fn size_bytes_for_result(item: &SearchResult, opts: &Options, cache: &mut DirSta
         }
         return get_dirsize_bytes(&item.path, cache).unwrap_or(0);
     }
-    item.metadata.as_ref().map(|m| m.len()).unwrap_or(0)
+    item.metadata
+        .as_ref()
+        .map(|m| m.len())
+        .or(item.indexed_size)
+        .unwrap_or(0)
+}
+
+fn result_activity_nanos(item: &SearchResult) -> Option<i64> {
+    item.indexed_activity_nanos.or_else(|| {
+        item.metadata
+            .as_ref()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(system_time_to_unix_nanos)
+    })
+}
+
+fn result_activity_time(item: &SearchResult) -> Option<std::time::SystemTime> {
+    let nanos = u64::try_from(result_activity_nanos(item)?).ok()?;
+    std::time::UNIX_EPOCH.checked_add(Duration::from_nanos(nanos))
 }
 
 fn precompute_dirsize_cache(items: &[SearchResult], opts: &Options, cache: &mut DirStatsCache) {
@@ -1778,26 +1906,17 @@ fn sort_results(
     cache: &mut DirStatsCache,
 ) -> Vec<SearchResult> {
     let Some(field) = opts.sort_field else {
+        if let Some(limit) = opts.limit {
+            items.truncate(limit);
+        }
         return items;
     };
     let order = opts.sort_order.unwrap_or(SortOrder::Asc);
-    items.sort_by(|a, b| {
+    let mut compare = |a: &SearchResult, b: &SearchResult| {
         let ord = match field {
             SortField::Date => {
-                let da = a
-                    .metadata
-                    .as_ref()
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                let db = b
-                    .metadata
-                    .as_ref()
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
+                let da = result_activity_nanos(a).unwrap_or(0);
+                let db = result_activity_nanos(b).unwrap_or(0);
                 da.cmp(&db)
             }
             SortField::Size => {
@@ -1807,11 +1926,19 @@ fn sort_results(
             }
             SortField::Name => a.path.to_lowercase().cmp(&b.path.to_lowercase()),
         };
-        match order {
+        let ordered = match order {
             SortOrder::Asc => ord,
             SortOrder::Desc => ord.reverse(),
+        };
+        ordered.then_with(|| a.path.cmp(&b.path))
+    };
+    if let Some(limit) = opts.limit {
+        if limit < items.len() {
+            items.select_nth_unstable_by(limit, &mut compare);
+            items.truncate(limit);
         }
-    });
+    }
+    items.sort_by(&mut compare);
     items
 }
 
@@ -1944,6 +2071,320 @@ fn index_state_path(root_key: &str, suffix: &str) -> Option<PathBuf> {
     )))
 }
 
+fn stable_root_hash(root_key: &str) -> u64 {
+    root_key.bytes().fold(0xcbf29ce484222325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    })
+}
+
+fn index_snapshot_path(root_key: &str) -> Option<PathBuf> {
+    Some(
+        unearth_cache_dir()?
+            .join("index")
+            .join(format!("{:016x}.snapshot", stable_root_hash(root_key))),
+    )
+}
+
+fn index_manifest_path(root_key: &str) -> Option<PathBuf> {
+    Some(
+        unearth_cache_dir()?
+            .join("index")
+            .join(format!("{:016x}.manifest", stable_root_hash(root_key))),
+    )
+}
+
+fn index_delta_path(root_key: &str) -> Option<PathBuf> {
+    Some(
+        unearth_cache_dir()?
+            .join("index")
+            .join(format!("{:016x}.delta", stable_root_hash(root_key))),
+    )
+}
+
+fn write_len_prefixed(writer: &mut impl Write, value: &str) -> Result<(), String> {
+    let len = u32::try_from(value.len()).map_err(|_| "index string is too long".to_string())?;
+    writer
+        .write_all(&len.to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    writer
+        .write_all(value.as_bytes())
+        .map_err(|e| e.to_string())
+}
+
+fn read_u32_bytes(bytes: &[u8], cursor: &mut usize) -> Result<u32, String> {
+    let end = cursor.saturating_add(4);
+    let value = bytes
+        .get(*cursor..end)
+        .ok_or_else(|| "truncated index sidecar".to_string())?;
+    *cursor = end;
+    Ok(u32::from_le_bytes(value.try_into().unwrap()))
+}
+
+fn read_u64_bytes(bytes: &[u8], cursor: &mut usize) -> Result<u64, String> {
+    let end = cursor.saturating_add(8);
+    let value = bytes
+        .get(*cursor..end)
+        .ok_or_else(|| "truncated index sidecar".to_string())?;
+    *cursor = end;
+    Ok(u64::from_le_bytes(value.try_into().unwrap()))
+}
+
+fn read_i64_bytes(bytes: &[u8], cursor: &mut usize) -> Result<i64, String> {
+    Ok(read_u64_bytes(bytes, cursor)? as i64)
+}
+
+fn decode_optional_i64(value: i64) -> Option<i64> {
+    (value != i64::MIN).then_some(value)
+}
+
+fn encode_optional_i64(value: Option<i64>) -> i64 {
+    value.unwrap_or(i64::MIN)
+}
+
+fn read_string_bytes<'a>(bytes: &'a [u8], cursor: &mut usize) -> Result<&'a str, String> {
+    let len = read_u32_bytes(bytes, cursor)? as usize;
+    let end = cursor.saturating_add(len);
+    let value = bytes
+        .get(*cursor..end)
+        .ok_or_else(|| "truncated index sidecar string".to_string())?;
+    *cursor = end;
+    std::str::from_utf8(value).map_err(|e| e.to_string())
+}
+
+fn open_index_manifest(root_key: &str) -> Result<Option<Mmap>, String> {
+    let Some(path) = index_manifest_path(root_key) else {
+        return Ok(None);
+    };
+    let Ok(file) = File::open(path) else {
+        return Ok(None);
+    };
+    // The manifest is replaced atomically and remains immutable while mapped.
+    let mmap = unsafe { Mmap::map(&file) }.map_err(|e| e.to_string())?;
+    Ok(Some(mmap))
+}
+
+fn parse_index_manifest<'a>(
+    mmap: &'a Mmap,
+    root_key: &str,
+    fingerprint: &str,
+) -> Result<Vec<ExistingIndexEntry<'a>>, String> {
+    let bytes = mmap.as_ref();
+    if bytes.get(..8) != Some(INDEX_MANIFEST_MAGIC) {
+        return Err("unsupported index manifest version".to_string());
+    }
+    let mut cursor = 8;
+    if read_string_bytes(bytes, &mut cursor)? != root_key {
+        return Err("index manifest root mismatch".to_string());
+    }
+    if read_string_bytes(bytes, &mut cursor)? != fingerprint {
+        return Err("index manifest fingerprint mismatch".to_string());
+    }
+    let count = usize::try_from(read_u64_bytes(bytes, &mut cursor)?)
+        .map_err(|_| "index manifest is too large".to_string())?;
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let dir_id = read_i64_bytes(bytes, &mut cursor)?;
+        let name_id = read_i64_bytes(bytes, &mut cursor)?;
+        let kind = *bytes
+            .get(cursor)
+            .ok_or_else(|| "truncated index manifest kind".to_string())? as i64;
+        cursor += 1;
+        let mtime = decode_optional_i64(read_i64_bytes(bytes, &mut cursor)?);
+        let size = decode_optional_i64(read_i64_bytes(bytes, &mut cursor)?);
+        let activity = decode_optional_i64(read_i64_bytes(bytes, &mut cursor)?);
+        let path = read_string_bytes(bytes, &mut cursor)?;
+        entries.push(ExistingIndexEntry {
+            dir_id,
+            name_id,
+            path: Cow::Borrowed(path),
+            kind,
+            mtime,
+            size,
+            activity,
+        });
+    }
+    if cursor != bytes.len() {
+        return Err("index manifest has trailing data".to_string());
+    }
+    Ok(entries)
+}
+
+fn begin_index_manifest(
+    root_key: &str,
+    fingerprint: &str,
+    count: usize,
+) -> Result<(PathBuf, PathBuf, BufWriter<File>), String> {
+    let path = index_manifest_path(root_key)
+        .ok_or_else(|| "unable to resolve index manifest path".to_string())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "invalid manifest path".to_string())?;
+    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension(format!("manifest.tmp.{}", std::process::id()));
+    let mut writer =
+        BufWriter::with_capacity(1024 * 1024, File::create(&tmp).map_err(|e| e.to_string())?);
+    writer
+        .write_all(INDEX_MANIFEST_MAGIC)
+        .map_err(|e| e.to_string())?;
+    write_len_prefixed(&mut writer, root_key)?;
+    write_len_prefixed(&mut writer, fingerprint)?;
+    writer
+        .write_all(&(count as u64).to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    Ok((path, tmp, writer))
+}
+
+fn write_index_manifest_record(
+    writer: &mut impl Write,
+    entry: &PendingIndexEntry,
+    path: &str,
+) -> Result<(), String> {
+    writer
+        .write_all(&entry.dir_id.to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    writer
+        .write_all(&entry.name_id.to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    writer
+        .write_all(&[entry.kind as u8])
+        .map_err(|e| e.to_string())?;
+    writer
+        .write_all(&encode_optional_i64(entry.mtime).to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    writer
+        .write_all(&encode_optional_i64(entry.size).to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    writer
+        .write_all(&encode_optional_i64(entry.activity).to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    write_len_prefixed(writer, path)
+}
+
+fn finish_index_manifest(
+    path: PathBuf,
+    tmp: PathBuf,
+    mut writer: BufWriter<File>,
+) -> Result<(), String> {
+    writer.flush().map_err(|e| e.to_string())?;
+    writer.get_ref().sync_all().map_err(|e| e.to_string())?;
+    drop(writer);
+    fs::rename(&tmp, path).map_err(|e| e.to_string())
+}
+
+fn write_index_snapshot_from_db(conn: &Connection, root_key: &str) -> Result<(), String> {
+    let snapshot_path = index_snapshot_path(root_key)
+        .ok_or_else(|| "unable to resolve the unearth cache directory".to_string())?;
+    let parent = snapshot_path
+        .parent()
+        .ok_or_else(|| "invalid index snapshot path".to_string())?;
+    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let tmp_path = snapshot_path.with_extension(format!("snapshot.tmp.{}", std::process::id()));
+
+    let result = (|| -> Result<(), String> {
+        let file = File::create(&tmp_path).map_err(|e| e.to_string())?;
+        let mut writer = BufWriter::with_capacity(1024 * 1024, file);
+        writer
+            .write_all(INDEX_SNAPSHOT_MAGIC)
+            .map_err(|e| e.to_string())?;
+        let root_len = u32::try_from(root_key.len())
+            .map_err(|_| "indexed root path is too long".to_string())?;
+        writer
+            .write_all(&root_len.to_le_bytes())
+            .map_err(|e| e.to_string())?;
+        writer
+            .write_all(root_key.as_bytes())
+            .map_err(|e| e.to_string())?;
+        let counts_offset = writer.stream_position().map_err(|e| e.to_string())?;
+        writer.write_all(&[0u8; 24]).map_err(|e| e.to_string())?;
+
+        let root_prefix = index_path_prefix(root_key);
+        let root_prefix_end = format!("{}0", root_prefix.trim_end_matches('/'));
+        let mut stmt = conn
+            .prepare(
+                "SELECT d.path, s.value, e.kind
+                 FROM dirs d INDEXED BY idx_dirs_path
+                 CROSS JOIN entries e INDEXED BY idx_entries_dir ON e.dir_id = d.id
+                 JOIN strings s ON e.name_id = s.id
+                 WHERE d.path = ?1 OR (d.path >= ?2 AND d.path < ?3)",
+            )
+            .map_err(|e| e.to_string())?;
+        let mut rows = stmt
+            .query(params![root_key, root_prefix, root_prefix_end])
+            .map_err(|e| e.to_string())?;
+        let mut all_count = 0u64;
+        let mut file_count = 0u64;
+        let mut dir_count = 0u64;
+
+        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            let dir_path: String = row.get(0).map_err(|e| e.to_string())?;
+            let name: String = row.get(1).map_err(|e| e.to_string())?;
+            let kind: u8 = row.get(2).map_err(|e| e.to_string())?;
+            let mut path = if dir_path == "/" {
+                format!("/{}", name)
+            } else {
+                format!("{}/{}", dir_path, name)
+            };
+            if kind == 1 {
+                path.push('/');
+                dir_count = dir_count.saturating_add(1);
+            } else if kind == 0 {
+                file_count = file_count.saturating_add(1);
+            }
+            all_count = all_count.saturating_add(1);
+
+            let path_len = u32::try_from(path.len())
+                .map_err(|_| format!("indexed path is too long: {}", path))?;
+            writer.write_all(&[kind]).map_err(|e| e.to_string())?;
+            writer
+                .write_all(&path_len.to_le_bytes())
+                .map_err(|e| e.to_string())?;
+            writer
+                .write_all(path.as_bytes())
+                .map_err(|e| e.to_string())?;
+        }
+
+        writer.flush().map_err(|e| e.to_string())?;
+        writer
+            .seek(SeekFrom::Start(counts_offset))
+            .map_err(|e| e.to_string())?;
+        for count in [all_count, file_count, dir_count] {
+            writer
+                .write_all(&count.to_le_bytes())
+                .map_err(|e| e.to_string())?;
+        }
+        writer.flush().map_err(|e| e.to_string())?;
+        writer.get_ref().sync_all().map_err(|e| e.to_string())?;
+        drop(writer);
+        fs::rename(&tmp_path, &snapshot_path).map_err(|e| e.to_string())?;
+        if let Some(legacy_path) = index_state_path(root_key, "snapshot") {
+            if legacy_path != snapshot_path {
+                let _ = fs::remove_file(legacy_path);
+            }
+        }
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    result
+}
+
+fn rebuild_index_snapshot(root_raw: &str) -> Result<(), String> {
+    let root_key = normalize_index_root_arg(root_raw)?;
+    let conn = open_index_db()?;
+    if !index_root_is_known(&conn, &root_key)? {
+        return Err(format!(
+            "'{}' is not present in the unearth index",
+            root_key
+        ));
+    }
+    let fingerprint_key = index_fingerprint_key(&root_key);
+    let fingerprint = index_fingerprint_value(&conn, &fingerprint_key)?
+        .ok_or_else(|| format!("'{}' has no committed fingerprint", root_key))?;
+    rebuild_index_base_sidecars(&conn, &root_key, &fingerprint)
+}
+
 fn path_age_at_least(path: &Path, min_age: Duration) -> bool {
     let Ok(metadata) = fs::metadata(path) else {
         return true;
@@ -1987,6 +2428,7 @@ fn open_index_db() -> Result<Connection, String> {
             kind INTEGER NOT NULL,
             mtime INTEGER,
             size INTEGER,
+            activity INTEGER,
             UNIQUE(dir_id, name_id, kind)
         );
         CREATE TABLE IF NOT EXISTS indexed_roots (
@@ -2040,6 +2482,24 @@ fn open_index_db() -> Result<Connection, String> {
         ",
     )
     .map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(entries)")
+        .map_err(|e| e.to_string())?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    drop(stmt);
+    if !columns.iter().any(|column| column == "activity") {
+        conn.execute("ALTER TABLE entries ADD COLUMN activity INTEGER", [])
+            .map_err(|e| e.to_string())?;
+    }
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_entries_kind_activity ON entries(kind, activity DESC)",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
     Ok(conn)
 }
 
@@ -2066,52 +2526,660 @@ fn ensure_index_search_ready(conn: &Connection) -> Result<bool, String> {
     Ok(true)
 }
 
-fn db_get_or_insert_string(tx: &rusqlite::Transaction<'_>, value: &str) -> Result<i64, String> {
-    tx.prepare_cached("INSERT OR IGNORE INTO strings(value) VALUES (?)")
-        .map_err(|e| e.to_string())?
-        .execute([value])
-        .map_err(|e| e.to_string())?;
-    tx.prepare_cached("SELECT id FROM strings WHERE value = ?")
-        .map_err(|e| e.to_string())?
-        .query_row([value], |row| row.get(0))
-        .map_err(|e| e.to_string())
+#[derive(Clone, Copy)]
+struct PendingIndexEntry {
+    dir_id: i64,
+    name_id: i64,
+    kind: i64,
+    mtime: Option<i64>,
+    size: Option<i64>,
+    activity: Option<i64>,
 }
 
-fn db_get_or_insert_dir(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<i64, String> {
-    tx.prepare_cached("INSERT OR IGNORE INTO dirs(path) VALUES (?)")
-        .map_err(|e| e.to_string())?
-        .execute([path])
-        .map_err(|e| e.to_string())?;
-    tx.prepare_cached("SELECT id FROM dirs WHERE path = ?")
-        .map_err(|e| e.to_string())?
-        .query_row([path], |row| row.get(0))
-        .map_err(|e| e.to_string())
+#[derive(Debug, Eq, PartialEq)]
+struct ScannedIndexEntry {
+    path: String,
+    kind: i64,
+    mtime: Option<i64>,
+    size: Option<i64>,
+    activity: Option<i64>,
 }
 
-fn db_get_or_insert_string_cached(
+#[derive(Debug, Eq, PartialEq)]
+struct ExistingIndexEntry<'a> {
+    dir_id: i64,
+    name_id: i64,
+    path: Cow<'a, str>,
+    kind: i64,
+    mtime: Option<i64>,
+    size: Option<i64>,
+    activity: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+struct IndexDeltaEntry {
+    added: bool,
+    dir_id: i64,
+    name_id: i64,
+    kind: i64,
+    path: String,
+}
+
+fn scan_index_root(root: &Path, root_key: &str, threads: usize) -> Vec<ScannedIndexEntry> {
+    let mut entries: Vec<ScannedIndexEntry> = WalkDir::new(root)
+        .skip_hidden(false)
+        .parallelism(Parallelism::RayonNewPool(threads))
+        .process_read_dir({
+            let root_key = root_key.to_string();
+            move |_depth, _path, _state, children| {
+                for child in children.iter_mut() {
+                    if let Ok(entry) = child {
+                        if let Some(child_path) = entry.read_children_path.as_ref() {
+                            if is_root_index_prune_child(&root_key, child_path.as_ref()) {
+                                entry.read_children_path = None;
+                            }
+                        }
+                    }
+                }
+            }
+        })
+        .into_iter()
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            if path == root || path.file_name().is_none() || path.parent().is_none() {
+                return None;
+            }
+            let path = normalize_index_dir(&path);
+            if is_root_index_excluded_path(root_key, &path) {
+                return None;
+            }
+            let file_type = entry.file_type();
+            let kind = if file_type.is_dir() {
+                1
+            } else if file_type.is_symlink() {
+                2
+            } else {
+                0
+            };
+            Some(ScannedIndexEntry {
+                path,
+                kind,
+                mtime: None,
+                size: None,
+                activity: None,
+            })
+        })
+        .collect();
+
+    let populate = |entry: &mut ScannedIndexEntry| {
+        let metadata = fs::symlink_metadata(&entry.path).ok();
+        entry.mtime = metadata.as_ref().and_then(metadata_mtime_nanos);
+        entry.size = metadata.as_ref().and_then(metadata_size_i64);
+        entry.activity = metadata.as_ref().and_then(metadata_activity_nanos);
+    };
+    if threads == 1 {
+        entries.iter_mut().for_each(populate);
+    } else if let Ok(pool) = ThreadPoolBuilder::new().num_threads(threads).build() {
+        pool.install(|| entries.par_iter_mut().for_each(populate));
+    } else {
+        entries.iter_mut().for_each(populate);
+    }
+    entries
+}
+
+fn mix_index_fingerprint(mut value: u64) -> u64 {
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58476d1ce4e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d049bb133111eb);
+    value ^ (value >> 31)
+}
+
+fn index_fingerprint(entries: &[ScannedIndexEntry]) -> String {
+    let mut xor = 0u64;
+    let mut sum = 0u64;
+    let mut rotated_sum = 0u64;
+    for entry in entries {
+        let mut hash = 0xcbf29ce484222325u64;
+        for byte in entry.path.as_bytes() {
+            hash = (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
+        }
+        hash = (hash ^ entry.kind as u64).wrapping_mul(0x100000001b3);
+        let mixed = mix_index_fingerprint(hash);
+        xor ^= mixed;
+        sum = sum.wrapping_add(mixed);
+        rotated_sum = rotated_sum.wrapping_add(mixed.rotate_left((mixed & 63) as u32));
+    }
+    format!("{}:{xor:016x}:{sum:016x}:{rotated_sum:016x}", entries.len())
+}
+
+fn index_fingerprint_key(root_key: &str) -> String {
+    format!("root_fingerprint_v1:{:016x}", stable_root_hash(root_key))
+}
+
+fn index_fingerprint_value(conn: &Connection, key: &str) -> Result<Option<String>, String> {
+    match conn.query_row(
+        "SELECT value FROM index_meta WHERE key = ?1",
+        [key],
+        |row| row.get(0),
+    ) {
+        Ok(value) => Ok(Some(value)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn load_index_id_map(
+    conn: &Connection,
+    sql: &str,
+    query_params: impl rusqlite::Params,
+) -> Result<HashMap<String, i64>, String> {
+    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(query_params, |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(0)?))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut ids = HashMap::new();
+    for row in rows {
+        let (value, id) = row.map_err(|e| e.to_string())?;
+        ids.insert(value, id);
+    }
+    Ok(ids)
+}
+
+fn next_index_id(conn: &Connection, table: &str) -> Result<i64, String> {
+    conn.query_row(
+        &format!("SELECT COALESCE(MAX(id), 0) + 1 FROM {table}"),
+        [],
+        |row| row.get(0),
+    )
+    .map_err(|e| e.to_string())
+}
+
+fn system_time_to_unix_nanos(value: std::time::SystemTime) -> Option<i64> {
+    let duration = value.duration_since(std::time::UNIX_EPOCH).ok()?;
+    i64::try_from(duration.as_nanos()).ok()
+}
+
+fn metadata_mtime_nanos(metadata: &fs::Metadata) -> Option<i64> {
+    metadata.modified().ok().and_then(system_time_to_unix_nanos)
+}
+
+fn metadata_activity_nanos(metadata: &fs::Metadata) -> Option<i64> {
+    let modified = metadata_mtime_nanos(metadata);
+    let created = metadata.created().ok().and_then(system_time_to_unix_nanos);
+    match (modified, created) {
+        (Some(m), Some(c)) => Some(m.max(c)),
+        (Some(m), None) => Some(m),
+        (None, Some(c)) => Some(c),
+        (None, None) => None,
+    }
+}
+
+fn metadata_size_i64(metadata: &fs::Metadata) -> Option<i64> {
+    i64::try_from(metadata.len()).ok()
+}
+
+fn ensure_index_id(
+    stmt: &mut rusqlite::Statement<'_>,
+    ids: &mut HashMap<String, i64>,
+    next_id: &mut i64,
+    value: &str,
+) -> Result<i64, String> {
+    if let Some(id) = ids.get(value) {
+        return Ok(*id);
+    }
+    let id = *next_id;
+    *next_id = next_id
+        .checked_add(1)
+        .ok_or_else(|| "index ID space exhausted".to_string())?;
+    stmt.execute(params![id, value])
+        .map_err(|e| e.to_string())?;
+    ids.insert(value.to_string(), id);
+    Ok(id)
+}
+
+fn insert_index_entries(
     tx: &rusqlite::Transaction<'_>,
+    entries: &[PendingIndexEntry],
+) -> Result<(), String> {
+    for batch in entries.chunks(INDEX_INSERT_BATCH_SIZE) {
+        let values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?)", batch.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "INSERT INTO entries(dir_id, name_id, kind, mtime, size, activity) VALUES {values}"
+        );
+        let mut params = Vec::<rusqlite::types::Value>::with_capacity(batch.len() * 6);
+        for entry in batch {
+            params.push(entry.dir_id.into());
+            params.push(entry.name_id.into());
+            params.push(entry.kind.into());
+            params.push(entry.mtime.into());
+            params.push(entry.size.into());
+            params.push(entry.activity.into());
+        }
+        tx.prepare_cached(&sql)
+            .map_err(|e| e.to_string())?
+            .execute(params_from_iter(params))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn load_existing_index_entries(
+    conn: &Connection,
+    root_key: &str,
+    root_prefix: &str,
+    root_prefix_end: &str,
+) -> Result<Vec<ExistingIndexEntry<'static>>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT e.dir_id, e.name_id, d.path, s.value, e.kind, e.mtime, e.size, e.activity
+             FROM dirs d INDEXED BY idx_dirs_path
+             CROSS JOIN entries e INDEXED BY idx_entries_dir ON e.dir_id = d.id
+             JOIN strings s ON e.name_id = s.id
+             WHERE d.path = ?1 OR (d.path >= ?2 AND d.path < ?3)",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![root_key, root_prefix, root_prefix_end], |row| {
+            let dir_id = row.get(0)?;
+            let name_id = row.get(1)?;
+            let dir: String = row.get(2)?;
+            let name: String = row.get(3)?;
+            let kind = row.get(4)?;
+            let mtime = row.get(5)?;
+            let size = row.get(6)?;
+            let activity = row.get(7)?;
+            let path = if dir == "/" {
+                format!("/{name}")
+            } else {
+                format!("{dir}/{name}")
+            };
+            Ok(ExistingIndexEntry {
+                dir_id,
+                name_id,
+                path: Cow::Owned(path),
+                kind,
+                mtime,
+                size,
+                activity,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
+}
+
+fn compare_index_entry(path_a: &str, kind_a: i64, path_b: &str, kind_b: i64) -> CmpOrdering {
+    path_a.cmp(path_b).then_with(|| kind_a.cmp(&kind_b))
+}
+
+fn diff_index_entries(
+    scanned: &[ScannedIndexEntry],
+    existing: &[ExistingIndexEntry<'_>],
+) -> (Vec<usize>, Vec<usize>, Vec<(usize, usize)>) {
+    let mut removed = Vec::new();
+    let mut added = Vec::new();
+    let mut updated = Vec::new();
+    let (mut scan_idx, mut existing_idx) = (0, 0);
+
+    while scan_idx < scanned.len() && existing_idx < existing.len() {
+        match compare_index_entry(
+            &scanned[scan_idx].path,
+            scanned[scan_idx].kind,
+            &existing[existing_idx].path,
+            existing[existing_idx].kind,
+        ) {
+            CmpOrdering::Less => {
+                added.push(scan_idx);
+                scan_idx += 1;
+            }
+            CmpOrdering::Greater => {
+                removed.push(existing_idx);
+                existing_idx += 1;
+            }
+            CmpOrdering::Equal => {
+                if scanned[scan_idx].mtime != existing[existing_idx].mtime
+                    || scanned[scan_idx].size != existing[existing_idx].size
+                    || scanned[scan_idx].activity != existing[existing_idx].activity
+                {
+                    updated.push((existing_idx, scan_idx));
+                }
+                scan_idx += 1;
+                existing_idx += 1;
+            }
+        }
+    }
+    added.extend(scan_idx..scanned.len());
+    removed.extend(existing_idx..existing.len());
+    (removed, added, updated)
+}
+
+fn delete_index_entries(
+    tx: &rusqlite::Transaction<'_>,
+    existing: &[ExistingIndexEntry<'_>],
+    entry_indices: &[usize],
+) -> Result<(), String> {
+    for batch in entry_indices.chunks(INDEX_INSERT_BATCH_SIZE) {
+        let placeholders = std::iter::repeat_n("(?, ?, ?)", batch.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("DELETE FROM entries WHERE (dir_id, name_id, kind) IN ({placeholders})");
+        let values = batch.iter().flat_map(|index| {
+            let entry = &existing[*index];
+            [entry.dir_id, entry.name_id, entry.kind]
+        });
+        tx.prepare_cached(&sql)
+            .map_err(|e| e.to_string())?
+            .execute(params_from_iter(values))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn update_index_entries_metadata(
+    tx: &rusqlite::Transaction<'_>,
+    existing: &[ExistingIndexEntry<'_>],
+    scanned: &[ScannedIndexEntry],
+    updates: &[(usize, usize)],
+) -> Result<(), String> {
+    let mut stmt = tx
+        .prepare_cached(
+            "UPDATE entries
+             SET mtime = ?1, size = ?2, activity = ?3
+             WHERE dir_id = ?4 AND name_id = ?5 AND kind = ?6",
+        )
+        .map_err(|e| e.to_string())?;
+    for &(existing_idx, scanned_idx) in updates {
+        let old = &existing[existing_idx];
+        let new = &scanned[scanned_idx];
+        stmt.execute(params![
+            new.mtime,
+            new.size,
+            new.activity,
+            old.dir_id,
+            old.name_id,
+            old.kind,
+        ])
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn apply_index_metadata_updates(
+    existing: &mut [ExistingIndexEntry<'_>],
+    scanned: &[ScannedIndexEntry],
+    updates: &[(usize, usize)],
+) {
+    for &(existing_idx, scanned_idx) in updates {
+        let old = &mut existing[existing_idx];
+        let new = &scanned[scanned_idx];
+        old.mtime = new.mtime;
+        old.size = new.size;
+        old.activity = new.activity;
+    }
+}
+
+fn get_or_insert_index_id(
+    select: &mut rusqlite::Statement<'_>,
+    insert: &mut rusqlite::Statement<'_>,
     cache: &mut HashMap<String, i64>,
     value: &str,
 ) -> Result<i64, String> {
     if let Some(id) = cache.get(value) {
         return Ok(*id);
     }
-    let id = db_get_or_insert_string(tx, value)?;
+    let id = match select.query_row([value], |row| row.get(0)) {
+        Ok(id) => id,
+        Err(rusqlite::Error::QueryReturnedNoRows) => insert
+            .query_row([value], |row| row.get(0))
+            .map_err(|e| e.to_string())?,
+        Err(error) => return Err(error.to_string()),
+    };
     cache.insert(value.to_string(), id);
     Ok(id)
 }
 
-fn db_get_or_insert_dir_cached(
-    tx: &rusqlite::Transaction<'_>,
-    cache: &mut HashMap<String, i64>,
-    path: &str,
-) -> Result<i64, String> {
-    if let Some(id) = cache.get(path) {
-        return Ok(*id);
+fn incremental_change_limit(existing_len: usize, scanned_len: usize) -> usize {
+    let proportional = existing_len
+        .max(scanned_len)
+        .div_ceil(INDEX_INCREMENTAL_CHANGE_DIVISOR);
+    proportional.clamp(1_024, INDEX_INCREMENTAL_MAX_CHANGES)
+}
+
+fn write_manifest_from_existing(
+    root_key: &str,
+    fingerprint: &str,
+    entries: &[ExistingIndexEntry<'_>],
+) -> Result<(), String> {
+    let (path, tmp, mut writer) = begin_index_manifest(root_key, fingerprint, entries.len())?;
+    for entry in entries {
+        write_index_manifest_record(
+            &mut writer,
+            &PendingIndexEntry {
+                dir_id: entry.dir_id,
+                name_id: entry.name_id,
+                kind: entry.kind,
+                mtime: entry.mtime,
+                size: entry.size,
+                activity: entry.activity,
+            },
+            &entry.path,
+        )?;
     }
-    let id = db_get_or_insert_dir(tx, path)?;
-    cache.insert(path.to_string(), id);
-    Ok(id)
+    finish_index_manifest(path, tmp, writer)
+}
+
+fn write_manifest_from_scanned(
+    root_key: &str,
+    fingerprint: &str,
+    scanned: &[ScannedIndexEntry],
+    entries: &[PendingIndexEntry],
+) -> Result<(), String> {
+    if scanned.len() != entries.len() {
+        return Err("manifest entry count mismatch".to_string());
+    }
+    let (path, tmp, mut writer) = begin_index_manifest(root_key, fingerprint, scanned.len())?;
+    for (scanned, entry) in scanned.iter().zip(entries) {
+        write_index_manifest_record(&mut writer, entry, &scanned.path)?;
+    }
+    finish_index_manifest(path, tmp, writer)
+}
+
+fn write_incremental_manifest(
+    root_key: &str,
+    fingerprint: &str,
+    scanned: &[ScannedIndexEntry],
+    existing: &[ExistingIndexEntry<'_>],
+    added: &HashMap<usize, PendingIndexEntry>,
+) -> Result<(), String> {
+    let (path, tmp, mut writer) = begin_index_manifest(root_key, fingerprint, scanned.len())?;
+    let mut existing_idx = 0;
+    for (scan_idx, scanned_entry) in scanned.iter().enumerate() {
+        if let Some(entry) = added.get(&scan_idx) {
+            write_index_manifest_record(&mut writer, entry, &scanned_entry.path)?;
+            continue;
+        }
+        while existing_idx < existing.len()
+            && compare_index_entry(
+                &existing[existing_idx].path,
+                existing[existing_idx].kind,
+                &scanned_entry.path,
+                scanned_entry.kind,
+            ) == CmpOrdering::Less
+        {
+            existing_idx += 1;
+        }
+        let Some(entry) = existing.get(existing_idx) else {
+            return Err("incremental manifest lost an unchanged entry".to_string());
+        };
+        if compare_index_entry(
+            &entry.path,
+            entry.kind,
+            &scanned_entry.path,
+            scanned_entry.kind,
+        ) != CmpOrdering::Equal
+        {
+            return Err("incremental manifest entry mismatch".to_string());
+        }
+        write_index_manifest_record(
+            &mut writer,
+            &PendingIndexEntry {
+                dir_id: entry.dir_id,
+                name_id: entry.name_id,
+                kind: entry.kind,
+                mtime: entry.mtime,
+                size: entry.size,
+                activity: entry.activity,
+            },
+            &scanned_entry.path,
+        )?;
+        existing_idx += 1;
+    }
+    finish_index_manifest(path, tmp, writer)
+}
+
+fn read_index_delta(
+    root_key: &str,
+    fingerprint: &str,
+) -> Result<BTreeMap<(String, i64), IndexDeltaEntry>, String> {
+    let Some(path) = index_delta_path(root_key) else {
+        return Ok(BTreeMap::new());
+    };
+    let Ok(bytes) = fs::read(path) else {
+        return Ok(BTreeMap::new());
+    };
+    if bytes.get(..8) != Some(INDEX_DELTA_MAGIC) {
+        return Err("unsupported index delta version".to_string());
+    }
+    let mut cursor = 8;
+    if read_string_bytes(&bytes, &mut cursor)? != root_key {
+        return Err("index delta root mismatch".to_string());
+    }
+    if read_string_bytes(&bytes, &mut cursor)? != fingerprint {
+        return Err("index delta fingerprint mismatch".to_string());
+    }
+    let _all_count = read_u64_bytes(&bytes, &mut cursor)?;
+    let _file_count = read_u64_bytes(&bytes, &mut cursor)?;
+    let _dir_count = read_u64_bytes(&bytes, &mut cursor)?;
+    let count = usize::try_from(read_u64_bytes(&bytes, &mut cursor)?)
+        .map_err(|_| "index delta is too large".to_string())?;
+    let mut entries = BTreeMap::new();
+    for _ in 0..count {
+        let added = *bytes
+            .get(cursor)
+            .ok_or_else(|| "truncated index delta action".to_string())?
+            != 0;
+        cursor += 1;
+        let dir_id = read_i64_bytes(&bytes, &mut cursor)?;
+        let name_id = read_i64_bytes(&bytes, &mut cursor)?;
+        let kind = *bytes
+            .get(cursor)
+            .ok_or_else(|| "truncated index delta kind".to_string())? as i64;
+        cursor += 1;
+        let path = read_string_bytes(&bytes, &mut cursor)?.to_string();
+        entries.insert(
+            (path.clone(), kind),
+            IndexDeltaEntry {
+                added,
+                dir_id,
+                name_id,
+                kind,
+                path,
+            },
+        );
+    }
+    Ok(entries)
+}
+
+fn write_index_delta(
+    root_key: &str,
+    fingerprint: &str,
+    scanned: &[ScannedIndexEntry],
+    entries: &BTreeMap<(String, i64), IndexDeltaEntry>,
+) -> Result<(), String> {
+    if entries.is_empty() {
+        remove_index_delta(root_key);
+        return Ok(());
+    }
+    let path = index_delta_path(root_key)
+        .ok_or_else(|| "unable to resolve index delta path".to_string())?;
+    let tmp = path.with_extension(format!("delta.tmp.{}", std::process::id()));
+    let mut writer =
+        BufWriter::with_capacity(1024 * 1024, File::create(&tmp).map_err(|e| e.to_string())?);
+    writer
+        .write_all(INDEX_DELTA_MAGIC)
+        .map_err(|e| e.to_string())?;
+    write_len_prefixed(&mut writer, root_key)?;
+    write_len_prefixed(&mut writer, fingerprint)?;
+    let all_count = scanned.len() as u64;
+    let file_count = scanned.iter().filter(|entry| entry.kind == 0).count() as u64;
+    let dir_count = scanned.iter().filter(|entry| entry.kind == 1).count() as u64;
+    for value in [all_count, file_count, dir_count, entries.len() as u64] {
+        writer
+            .write_all(&value.to_le_bytes())
+            .map_err(|e| e.to_string())?;
+    }
+    for entry in entries.values() {
+        writer
+            .write_all(&[u8::from(entry.added)])
+            .map_err(|e| e.to_string())?;
+        writer
+            .write_all(&entry.dir_id.to_le_bytes())
+            .map_err(|e| e.to_string())?;
+        writer
+            .write_all(&entry.name_id.to_le_bytes())
+            .map_err(|e| e.to_string())?;
+        writer
+            .write_all(&[entry.kind as u8])
+            .map_err(|e| e.to_string())?;
+        write_len_prefixed(&mut writer, &entry.path)?;
+    }
+    writer.flush().map_err(|e| e.to_string())?;
+    writer.get_ref().sync_all().map_err(|e| e.to_string())?;
+    drop(writer);
+    fs::rename(tmp, path).map_err(|e| e.to_string())
+}
+
+fn remove_index_delta(root_key: &str) {
+    if let Some(path) = index_delta_path(root_key) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn rebuild_index_base_sidecars(
+    conn: &Connection,
+    root_key: &str,
+    fingerprint: &str,
+) -> Result<(), String> {
+    // Readers may briefly see the old base without a delta, but never a new base
+    // combined with tombstones that were defined against the old base.
+    remove_index_delta(root_key);
+    write_index_snapshot_from_db(conn, root_key)?;
+    let root_prefix = index_path_prefix(root_key);
+    let root_prefix_end = format!("{}0", root_prefix.trim_end_matches('/'));
+    let mut entries = load_existing_index_entries(conn, root_key, &root_prefix, &root_prefix_end)?;
+    entries.par_sort_unstable_by(|a, b| compare_index_entry(&a.path, a.kind, &b.path, b.kind));
+    write_manifest_from_existing(root_key, fingerprint, &entries)?;
+    Ok(())
+}
+
+fn index_sidecars_are_current(root_key: &str, fingerprint: &str) -> bool {
+    let snapshot_exists = index_snapshot_path(root_key).is_some_and(|path| path.is_file());
+    if !snapshot_exists {
+        return false;
+    }
+    let Ok(Some(mmap)) = open_index_manifest(root_key) else {
+        return false;
+    };
+    if parse_index_manifest(&mmap, root_key, fingerprint).is_err() {
+        return false;
+    }
+    read_index_delta(root_key, fingerprint).is_ok()
 }
 
 fn normalize_index_dir(path: &Path) -> String {
@@ -2431,6 +3499,18 @@ fn purge_index_root(root_raw: &str) -> Result<(), String> {
         if let Some(lock_path) = index_state_path(&state_root, "lock") {
             let _ = fs::remove_file(lock_path);
         }
+        if let Some(snapshot_path) = index_snapshot_path(&state_root) {
+            let _ = fs::remove_file(snapshot_path);
+        }
+        if let Some(manifest_path) = index_manifest_path(&state_root) {
+            let _ = fs::remove_file(manifest_path);
+        }
+        if let Some(delta_path) = index_delta_path(&state_root) {
+            let _ = fs::remove_file(delta_path);
+        }
+        if let Some(legacy_path) = index_state_path(&state_root, "snapshot") {
+            let _ = fs::remove_file(legacy_path);
+        }
     }
     Ok(())
 }
@@ -2445,8 +3525,221 @@ fn refresh_index_root(root_raw: &str, opts: &Options) -> Result<(), String> {
     }
     let root_key = normalize_index_dir(&root);
     let root_prefix = index_path_prefix(&root_key);
+    let root_prefix_end = format!("{}0", root_prefix.trim_end_matches('/'));
+    let mut scanned_entries = scan_index_root(&root, &root_key, opts.threads_override);
+    let fingerprint = index_fingerprint(&scanned_entries);
+    let fingerprint_key = index_fingerprint_key(&root_key);
     let mut conn = open_index_db()?;
-    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    scanned_entries
+        .par_sort_unstable_by(|a, b| compare_index_entry(&a.path, a.kind, &b.path, b.kind));
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
+    let previous_fingerprint = index_fingerprint_value(&tx, &fingerprint_key)?;
+    let manifest = open_index_manifest(&root_key).ok().flatten();
+    let mut existing_entries = if let (Some(manifest), Some(previous_fingerprint)) =
+        (manifest.as_ref(), previous_fingerprint.as_deref())
+    {
+        match parse_index_manifest(manifest, &root_key, previous_fingerprint) {
+            Ok(entries) => entries,
+            Err(_) => load_existing_index_entries(&tx, &root_key, &root_prefix, &root_prefix_end)?,
+        }
+    } else {
+        load_existing_index_entries(&tx, &root_key, &root_prefix, &root_prefix_end)?
+    };
+    existing_entries
+        .par_sort_unstable_by(|a, b| compare_index_entry(&a.path, a.kind, &b.path, b.kind));
+    let (removed_entry_indices, added_entry_indices, updated_entry_indices) =
+        diff_index_entries(&scanned_entries, &existing_entries);
+    let changed_count = removed_entry_indices.len() + added_entry_indices.len();
+    let incremental_limit = incremental_change_limit(existing_entries.len(), scanned_entries.len());
+    if !existing_entries.is_empty() && changed_count <= incremental_limit {
+        delete_index_entries(&tx, &existing_entries, &removed_entry_indices)?;
+        update_index_entries_metadata(
+            &tx,
+            &existing_entries,
+            &scanned_entries,
+            &updated_entry_indices,
+        )?;
+        apply_index_metadata_updates(
+            &mut existing_entries,
+            &scanned_entries,
+            &updated_entry_indices,
+        );
+
+        let mut select_string = tx
+            .prepare("SELECT id FROM strings WHERE value = ?1")
+            .map_err(|e| e.to_string())?;
+        let mut insert_string = tx
+            .prepare("INSERT INTO strings(value) VALUES (?1) RETURNING id")
+            .map_err(|e| e.to_string())?;
+        let mut select_dir = tx
+            .prepare("SELECT id FROM dirs WHERE path = ?1")
+            .map_err(|e| e.to_string())?;
+        let mut insert_dir = tx
+            .prepare("INSERT INTO dirs(path) VALUES (?1) RETURNING id")
+            .map_err(|e| e.to_string())?;
+        let mut string_ids = HashMap::new();
+        let mut dir_ids = HashMap::new();
+        let mut pending_entries = Vec::with_capacity(added_entry_indices.len());
+        let mut added_entries = HashMap::with_capacity(added_entry_indices.len());
+
+        for &index in &added_entry_indices {
+            let scanned = &scanned_entries[index];
+            let path = Path::new(&scanned.path);
+            let Some(name) = path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+            else {
+                continue;
+            };
+            let Some(parent) = path.parent() else {
+                continue;
+            };
+            let parent_key = normalize_index_dir(parent);
+            let parent_id = get_or_insert_index_id(
+                &mut select_dir,
+                &mut insert_dir,
+                &mut dir_ids,
+                &parent_key,
+            )?;
+            let name_id = get_or_insert_index_id(
+                &mut select_string,
+                &mut insert_string,
+                &mut string_ids,
+                &name,
+            )?;
+            let pending = PendingIndexEntry {
+                dir_id: parent_id,
+                name_id,
+                kind: scanned.kind,
+                mtime: scanned.mtime,
+                size: scanned.size,
+                activity: scanned.activity,
+            };
+            pending_entries.push(pending);
+            added_entries.insert(index, pending);
+            if scanned.kind == 1 {
+                get_or_insert_index_id(
+                    &mut select_dir,
+                    &mut insert_dir,
+                    &mut dir_ids,
+                    &scanned.path,
+                )?;
+            }
+        }
+        drop(select_string);
+        drop(insert_string);
+        drop(select_dir);
+        drop(insert_dir);
+        insert_index_entries(&tx, &pending_entries)?;
+        tx.execute(
+            "DELETE FROM dirs
+             WHERE (path = ?1 OR (path >= ?2 AND path < ?3))
+               AND NOT EXISTS (SELECT 1 FROM entries WHERE entries.dir_id = dirs.id)",
+            params![root_key, root_prefix, root_prefix_end],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM indexed_roots WHERE root = ?1 OR root LIKE ?2",
+            params![root_key, format!("{}%", root_prefix)],
+        )
+        .map_err(|e| e.to_string())?;
+        let refreshed_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0);
+        tx.execute(
+            "INSERT INTO indexed_roots(root, refreshed_at) VALUES (?1, ?2)",
+            params![root_key, refreshed_at],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR REPLACE INTO index_meta(key, value) VALUES (?1, ?2)",
+            params![fingerprint_key, fingerprint],
+        )
+        .map_err(|e| e.to_string())?;
+        if removed_entry_indices.is_empty() && added_entry_indices.is_empty() {
+            tx.commit().map_err(|e| e.to_string())?;
+            if !updated_entry_indices.is_empty() {
+                write_manifest_from_existing(&root_key, &fingerprint, &existing_entries)?;
+            } else if !index_sidecars_are_current(&root_key, &fingerprint) {
+                rebuild_index_base_sidecars(&conn, &root_key, &fingerprint)?;
+            }
+            if let Some(stamp) = index_state_path(&root_key, "stamp") {
+                write_stamp(&stamp);
+            }
+            return Ok(());
+        }
+        let mut delta = if let Some(previous) = previous_fingerprint.as_deref() {
+            read_index_delta(&root_key, previous)?
+        } else {
+            BTreeMap::new()
+        };
+        for index in &removed_entry_indices {
+            let entry = &existing_entries[*index];
+            let key = (entry.path.to_string(), entry.kind);
+            if delta.get(&key).is_some_and(|record| record.added) {
+                delta.remove(&key);
+            } else {
+                delta.insert(
+                    key,
+                    IndexDeltaEntry {
+                        added: false,
+                        dir_id: entry.dir_id,
+                        name_id: entry.name_id,
+                        kind: entry.kind,
+                        path: entry.path.to_string(),
+                    },
+                );
+            }
+        }
+        for (&index, entry) in &added_entries {
+            let scanned = &scanned_entries[index];
+            let key = (scanned.path.clone(), scanned.kind);
+            if delta.get(&key).is_some_and(|record| !record.added) {
+                delta.remove(&key);
+            } else {
+                delta.insert(
+                    key,
+                    IndexDeltaEntry {
+                        added: true,
+                        dir_id: entry.dir_id,
+                        name_id: entry.name_id,
+                        kind: entry.kind,
+                        path: scanned.path.clone(),
+                    },
+                );
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        write_incremental_manifest(
+            &root_key,
+            &fingerprint,
+            &scanned_entries,
+            &existing_entries,
+            &added_entries,
+        )?;
+        let snapshot_exists = index_snapshot_path(&root_key).is_some_and(|path| path.is_file());
+        if !snapshot_exists || delta.len() >= INDEX_DELTA_COMPACT_RECORDS {
+            rebuild_index_base_sidecars(&conn, &root_key, &fingerprint)?;
+        } else {
+            write_index_delta(&root_key, &fingerprint, &scanned_entries, &delta)?;
+        }
+        if let Some(stamp) = index_state_path(&root_key, "stamp") {
+            write_stamp(&stamp);
+        }
+        return Ok(());
+    }
+    drop(existing_entries);
+
+    tx.execute_batch(
+        "
+        DROP INDEX IF EXISTS idx_entries_dir;
+        DROP INDEX IF EXISTS idx_entries_name;
+        ",
+    )
+    .map_err(|e| e.to_string())?;
     tx.execute(
         "DELETE FROM entries WHERE dir_id IN (
             SELECT id FROM dirs WHERE path = ?1 OR path LIKE ?2
@@ -2455,54 +3748,32 @@ fn refresh_index_root(root_raw: &str, opts: &Options) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     tx.execute(
-        "DELETE FROM dirs WHERE path = ?1 OR path LIKE ?2",
-        params![root_key, format!("{}%", root_prefix)],
-    )
-    .map_err(|e| e.to_string())?;
-    tx.execute(
         "DELETE FROM indexed_roots WHERE root = ?1 OR root LIKE ?2",
         params![root_key, format!("{}%", root_prefix)],
     )
     .map_err(|e| e.to_string())?;
-    tx.execute_batch(
-        "
-        DROP INDEX IF EXISTS idx_entries_dir;
-        DROP INDEX IF EXISTS idx_entries_name;
-        ",
-    )
-    .map_err(|e| e.to_string())?;
-    let mut dir_ids = HashMap::<String, i64>::new();
-    let mut string_ids = HashMap::<String, i64>::new();
-    db_get_or_insert_dir_cached(&tx, &mut dir_ids, &root_key)?;
 
-    for entry in WalkDir::new(&root)
-        .skip_hidden(false)
-        .parallelism(Parallelism::RayonNewPool(opts.threads_override))
-        .process_read_dir({
-            let root_key = root_key.clone();
-            move |_depth, _path, _state, children| {
-                for child in children.iter_mut() {
-                    if let Ok(entry) = child {
-                        if let Some(child_path) = entry.read_children_path.as_ref() {
-                            if is_root_index_prune_child(&root_key, child_path.as_ref()) {
-                                entry.read_children_path = None;
-                            }
-                        }
-                    }
-                }
-            }
-        })
-    {
-        let Ok(entry) = entry else { continue };
-        let path = entry.path();
-        if path == root {
-            continue;
-        }
-        let path_key = normalize_index_dir(&path);
-        if is_root_index_excluded_path(&root_key, &path_key) {
-            continue;
-        }
-        let file_type = entry.file_type();
+    let mut string_ids = load_index_id_map(&tx, "SELECT id, value FROM strings", [])?;
+    let mut dir_ids = load_index_id_map(
+        &tx,
+        "SELECT id, path FROM dirs
+         WHERE path = ?1 OR (path >= ?2 AND path < ?3)",
+        params![root_key, root_prefix, root_prefix_end],
+    )?;
+    let mut next_string_id = next_index_id(&tx, "strings")?;
+    let mut next_dir_id = next_index_id(&tx, "dirs")?;
+    let mut insert_string = tx
+        .prepare("INSERT INTO strings(id, value) VALUES (?1, ?2)")
+        .map_err(|e| e.to_string())?;
+    let mut insert_dir = tx
+        .prepare("INSERT INTO dirs(id, path) VALUES (?1, ?2)")
+        .map_err(|e| e.to_string())?;
+    ensure_index_id(&mut insert_dir, &mut dir_ids, &mut next_dir_id, &root_key)?;
+    let mut pending_entries = Vec::<PendingIndexEntry>::new();
+
+    for scanned in &scanned_entries {
+        let path = Path::new(&scanned.path);
+        let path_key = &scanned.path;
         let Some(name) = path.file_name().map(|n| n.to_string_lossy().to_string()) else {
             continue;
         };
@@ -2510,32 +3781,39 @@ fn refresh_index_root(root_raw: &str, opts: &Options) -> Result<(), String> {
             continue;
         };
         let parent_key = normalize_index_dir(parent);
-        let parent_id = db_get_or_insert_dir_cached(&tx, &mut dir_ids, &parent_key)?;
-        let name_id = db_get_or_insert_string_cached(&tx, &mut string_ids, &name)?;
-        let kind = if file_type.is_dir() {
-            1i64
-        } else if file_type.is_symlink() {
-            2i64
-        } else {
-            0i64
-        };
-        tx.prepare_cached(
-            "INSERT OR REPLACE INTO entries(dir_id, name_id, kind, mtime, size)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-        )
-        .map_err(|e| e.to_string())?
-        .execute(params![
-            parent_id,
+        let parent_id =
+            ensure_index_id(&mut insert_dir, &mut dir_ids, &mut next_dir_id, &parent_key)?;
+        let name_id = ensure_index_id(
+            &mut insert_string,
+            &mut string_ids,
+            &mut next_string_id,
+            &name,
+        )?;
+        let kind = scanned.kind;
+        pending_entries.push(PendingIndexEntry {
+            dir_id: parent_id,
             name_id,
             kind,
-            Option::<i64>::None,
-            Option::<i64>::None
-        ])
-        .map_err(|e| e.to_string())?;
+            mtime: scanned.mtime,
+            size: scanned.size,
+            activity: scanned.activity,
+        });
         if kind == 1 {
-            db_get_or_insert_dir_cached(&tx, &mut dir_ids, &path_key)?;
+            ensure_index_id(&mut insert_dir, &mut dir_ids, &mut next_dir_id, path_key)?;
         }
     }
+    drop(insert_dir);
+    drop(insert_string);
+    insert_index_entries(&tx, &pending_entries)?;
+    drop(dir_ids);
+    drop(string_ids);
+    tx.execute(
+        "DELETE FROM dirs
+         WHERE (path = ?1 OR (path >= ?2 AND path < ?3))
+           AND NOT EXISTS (SELECT 1 FROM entries WHERE entries.dir_id = dirs.id)",
+        params![root_key, root_prefix, root_prefix_end],
+    )
+    .map_err(|e| e.to_string())?;
     let refreshed_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -2543,6 +3821,11 @@ fn refresh_index_root(root_raw: &str, opts: &Options) -> Result<(), String> {
     tx.execute(
         "INSERT OR REPLACE INTO indexed_roots(root, refreshed_at) VALUES (?1, ?2)",
         params![root_key, refreshed_at],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "INSERT OR REPLACE INTO index_meta(key, value) VALUES (?1, ?2)",
+        params![fingerprint_key, fingerprint],
     )
     .map_err(|e| e.to_string())?;
     tx.execute_batch(
@@ -2553,6 +3836,14 @@ fn refresh_index_root(root_raw: &str, opts: &Options) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
+    remove_index_delta(&root_key);
+    if let Err(error) = write_index_snapshot_from_db(&conn, &root_key) {
+        if let Some(snapshot_path) = index_snapshot_path(&root_key) {
+            let _ = fs::remove_file(snapshot_path);
+        }
+        return Err(format!("failed to build index snapshot: {}", error));
+    }
+    write_manifest_from_scanned(&root_key, &fingerprint, &scanned_entries, &pending_entries)?;
     if let Some(stamp) = index_state_path(&root_key, "stamp") {
         write_stamp(&stamp);
     }
@@ -2573,6 +3864,22 @@ fn index_root_is_known(conn: &Connection, root_key: &str) -> Result<bool, String
     Ok(count > 0)
 }
 
+fn covering_index_root(conn: &Connection, root_key: &str) -> Result<Option<String>, String> {
+    match conn.query_row(
+        "SELECT root
+         FROM indexed_roots
+         WHERE root = ?1 OR root = '/' OR ?1 LIKE root || '/%'
+         ORDER BY length(root) DESC
+         LIMIT 1",
+        params![root_key],
+        |row| row.get(0),
+    ) {
+        Ok(root) => Ok(Some(root)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 fn spawn_index_refresh(root_key: &str, opts: &Options, force: bool) {
     let Some(stamp_path) = index_state_path(root_key, "stamp") else {
         return;
@@ -2586,13 +3893,9 @@ fn spawn_index_refresh(root_key: &str, opts: &Options, force: bool) {
     if let Some(parent) = lock_path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let lock = File::options()
-        .write(true)
-        .create_new(true)
-        .open(&lock_path);
-    if lock.is_err() {
+    let Some(mut lock) = acquire_index_refresh_lock(&lock_path) else {
         return;
-    }
+    };
     let Ok(exe) = env::current_exe() else {
         let _ = fs::remove_file(lock_path);
         return;
@@ -2606,9 +3909,54 @@ fn spawn_index_refresh(root_key: &str, opts: &Options, force: bool) {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    if command.spawn().is_err() {
-        let _ = fs::remove_file(lock_path);
+    match command.spawn() {
+        Ok(child) => {
+            let _ = lock.set_len(0);
+            let _ = writeln!(lock, "{}", child.id());
+            let _ = lock.flush();
+        }
+        Err(_) => {
+            let _ = fs::remove_file(lock_path);
+        }
     }
+}
+
+fn index_refresh_lock_owner_is_running(contents: &str) -> bool {
+    let Ok(pid) = contents.trim().parse::<u32>() else {
+        return false;
+    };
+    let Ok(owner_exe) = fs::read_link(format!("/proc/{pid}/exe")) else {
+        return false;
+    };
+    env::current_exe().is_ok_and(|current_exe| owner_exe == current_exe)
+}
+
+fn acquire_index_refresh_lock(lock_path: &Path) -> Option<File> {
+    for _ in 0..2 {
+        match File::options().write(true).create_new(true).open(lock_path) {
+            Ok(mut lock) => {
+                if writeln!(lock, "{}", std::process::id()).is_err() || lock.flush().is_err() {
+                    let _ = fs::remove_file(lock_path);
+                    return None;
+                }
+                return Some(lock);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let observed = fs::read_to_string(lock_path).unwrap_or_default();
+                if index_refresh_lock_owner_is_running(&observed) {
+                    return None;
+                }
+                if fs::read_to_string(lock_path).unwrap_or_default() != observed {
+                    return None;
+                }
+                if fs::remove_file(lock_path).is_err() {
+                    return None;
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+    None
 }
 
 fn remove_index_refresh_lock(root_raw: &str) {
@@ -2651,6 +3999,388 @@ fn indexed_root_from_opts(
     Ok((root, terms))
 }
 
+fn recent_query_from_opts(opts: &Options) -> Result<(PathBuf, Vec<String>), String> {
+    if let Some(path) = opts.path_override.as_deref() {
+        return Ok((
+            PathBuf::from(expand_home_path(path)),
+            opts.positional.clone(),
+        ));
+    }
+    let mut terms = opts.positional.clone();
+    let root = terms
+        .last()
+        .filter(|token| is_implicit_content_path_token(token))
+        .map(|token| PathBuf::from(expand_home_path(token)));
+    if root.is_some() {
+        terms.pop();
+    }
+    Ok((root.unwrap_or_else(|| PathBuf::from(".")), terms))
+}
+
+fn recent_refresh_threads(opts: &Options, root: &Path) -> usize {
+    if opts.threads_explicit {
+        return opts.threads_override;
+    }
+    if root_prefers_single_thread(root) {
+        return 1;
+    }
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(opts.threads_override)
+        .min(16)
+        .max(1)
+}
+
+fn populate_recent_result_metadata(result: &mut SearchResult) {
+    let path = result.path.trim_end_matches('/');
+    let metadata = fs::symlink_metadata(path).ok();
+    result.indexed_activity_nanos = metadata.as_ref().and_then(metadata_activity_nanos);
+    result.indexed_size = metadata
+        .as_ref()
+        .and_then(|value| u64::try_from(value.len()).ok());
+    result.metadata = metadata;
+}
+
+fn run_recent_filtered_live(
+    opts: &Options,
+    root: PathBuf,
+    terms: &[String],
+    limit: usize,
+    cache: &mut DirStatsCache,
+    colors: &ColorSpec,
+) -> Result<SearchRun, String> {
+    let stdout_is_tty = io::stdout().is_terminal();
+    let use_style = style_enabled(opts, stdout_is_tty);
+    let mut type_flag = if opts.force_file {
+        Some(TypeFlag::File)
+    } else if opts.force_dir {
+        Some(TypeFlag::Dir)
+    } else {
+        None
+    };
+    let mut term_specs = Vec::<(String, i64)>::with_capacity(terms.len());
+    for term in terms {
+        let parsed = parse_name_pattern(term, opts.regex_mode);
+        if parsed.type_flag == Some(TypeFlag::Dir) && !opts.force_file {
+            type_flag = Some(TypeFlag::Dir);
+        }
+        term_specs.push((parsed.regex, term_selectivity_score(term, opts.regex_mode)));
+    }
+    term_specs.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)))
+    });
+    let regex_strings: Vec<String> = term_specs.into_iter().map(|(regex, _)| regex).collect();
+    let regexes = regex_strings
+        .iter()
+        .map(|regex| {
+            RegexBuilder::new(regex)
+                .case_insensitive(true)
+                .build()
+                .map_err(|error| format!("Invalid regex: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let first_regex = &regexes[0];
+    let is_catch_all = regex_strings[0] == ".*" || regex_strings[0] == "^.*$";
+    let timeout_triggered = Arc::new(AtomicBool::new(false));
+    let timeout_clone = timeout_triggered.clone();
+    let timeout_dur = opts.timeout_dur;
+    std::thread::spawn(move || {
+        std::thread::sleep(timeout_dur);
+        timeout_clone.store(true, Ordering::Relaxed);
+    });
+
+    let (tx, rx) = unbounded::<Vec<SearchResult>>();
+    walk_rayon_worker(
+        root.clone(),
+        first_regex,
+        is_catch_all,
+        &tx,
+        opts,
+        type_flag,
+        opts.force_full,
+        false,
+        false,
+        root_prefers_single_thread(&root),
+        &timeout_triggered,
+    );
+    drop(tx);
+    let mut results = Vec::new();
+    for chunk in rx {
+        results.extend(chunk);
+    }
+    for regex in regexes.iter().skip(1) {
+        results.retain(|result| {
+            if opts.force_full {
+                regex.is_match(&result.path)
+            } else {
+                let base = result
+                    .path
+                    .trim_end_matches('/')
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("");
+                regex.is_match(base)
+            }
+        });
+    }
+    if opts.force_full && regexes.len() > 1 {
+        results.retain(|result| {
+            let base = result
+                .path
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .unwrap_or("");
+            regexes.iter().any(|regex| regex.is_match(base))
+        });
+    }
+
+    let metadata_threads = recent_refresh_threads(opts, &root);
+    if metadata_threads == 1 {
+        results.iter_mut().for_each(populate_recent_result_metadata);
+    } else if let Ok(pool) = ThreadPoolBuilder::new()
+        .num_threads(metadata_threads)
+        .build()
+    {
+        pool.install(|| {
+            results
+                .par_iter_mut()
+                .for_each(populate_recent_result_metadata)
+        });
+    } else {
+        results.iter_mut().for_each(populate_recent_result_metadata);
+    }
+    results.retain(|result| result.indexed_activity_nanos.is_some());
+    let order = opts.sort_order.unwrap_or(SortOrder::Desc);
+    results.sort_unstable_by(|a, b| {
+        let a_activity = a.indexed_activity_nanos.unwrap_or(0);
+        let b_activity = b.indexed_activity_nanos.unwrap_or(0);
+        match order {
+            SortOrder::Asc => a_activity
+                .cmp(&b_activity)
+                .then_with(|| a.path.cmp(&b.path)),
+            SortOrder::Desc => b_activity
+                .cmp(&a_activity)
+                .then_with(|| a.path.cmp(&b.path)),
+        }
+    });
+    results.truncate(limit);
+    let highlight_patterns: Vec<(String, bool)> = regex_strings
+        .iter()
+        .cloned()
+        .map(|regex| (regex, opts.force_full))
+        .collect();
+    let highlight = opts
+        .highlight_match
+        .then(|| compile_highlight_spec(&highlight_patterns))
+        .transpose()?;
+    Ok(SearchRun {
+        lines: final_transform(
+            results,
+            opts,
+            use_style,
+            stdout_is_tty,
+            colors,
+            cache,
+            highlight.as_ref(),
+        ),
+        timed_out: timeout_triggered.load(Ordering::Relaxed),
+    })
+}
+
+fn run_recent_indexed(
+    opts: &Options,
+    cache: &mut DirStatsCache,
+    colors: &ColorSpec,
+) -> Result<SearchRun, String> {
+    let limit = opts
+        .recent_limit
+        .ok_or_else(|| "--recent requires a positive integer".to_string())?;
+    let (root_raw, terms) = recent_query_from_opts(opts)?;
+    let root = fs::canonicalize(&root_raw).map_err(|e| e.to_string())?;
+    if !terms.is_empty() {
+        return run_recent_filtered_live(opts, root, &terms, limit, cache, colors);
+    }
+    let root_key = normalize_index_dir(&root);
+    let root_prefix = index_path_prefix(&root_key);
+    let root_prefix_end = format!("{}0", root_prefix.trim_end_matches('/'));
+    let conn = open_index_db()?;
+    let covering_root = covering_index_root(&conn, &root_key)?;
+    let refresh_root = covering_root.as_deref().unwrap_or(&root_key).to_string();
+    drop(conn);
+    let mut refresh_opts = opts.clone();
+    refresh_opts.threads_override = recent_refresh_threads(opts, Path::new(&refresh_root));
+    refresh_index_root(&refresh_root, &refresh_opts)?;
+    let conn = open_index_db()?;
+    let fts_ready = ensure_index_search_ready(&conn).unwrap_or(false);
+    let mut regexes = Vec::with_capacity(terms.len());
+    for term in &terms {
+        let parsed = parse_name_pattern(term, opts.regex_mode);
+        regexes.push(
+            RegexBuilder::new(&parsed.regex)
+                .case_insensitive(true)
+                .build()
+                .map_err(|e| format!("Invalid regex: {}", e))?,
+        );
+    }
+
+    let stdout_is_tty = io::stdout().is_terminal();
+    let use_style = style_enabled(opts, stdout_is_tty);
+    let order = opts.sort_order.unwrap_or(SortOrder::Desc);
+    let order_sql = match order {
+        SortOrder::Asc => "ASC",
+        SortOrder::Desc => "DESC",
+    };
+    let base_name_expr = "lower(s.value)";
+    let full_path_expr =
+        "lower((CASE WHEN d.path = '/' THEN '/' || s.value ELSE d.path || '/' || s.value END) || CASE WHEN e.kind = 1 THEN '/' ELSE '' END)";
+    let sql_field_expr = if opts.force_full {
+        full_path_expr
+    } else {
+        base_name_expr
+    };
+    let mut sql = String::from(
+        "SELECT d.path, s.value, e.activity, e.size
+         FROM entries e INDEXED BY idx_entries_kind_activity
+         JOIN dirs d ON e.dir_id = d.id
+         JOIN strings s ON e.name_id = s.id
+         WHERE e.kind = ?
+           AND e.activity IS NOT NULL
+           AND (d.path = ? OR (d.path >= ? AND d.path < ?))",
+    );
+    let mut term_params = Vec::<String>::new();
+    for term in &terms {
+        if let Some((condition, extra_params)) = sql_prefilter_for_term(
+            term,
+            opts.regex_mode,
+            opts.force_full,
+            sql_field_expr,
+            fts_ready,
+        ) {
+            sql.push_str(" AND (");
+            sql.push_str(&condition);
+            sql.push(')');
+            term_params.extend(extra_params);
+        }
+    }
+    sql.push_str(&format!(
+        " ORDER BY e.activity {order_sql} LIMIT ? OFFSET ?"
+    ));
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+
+    let kinds: &[i64] = if opts.force_file {
+        &[0]
+    } else if opts.force_dir {
+        &[1]
+    } else {
+        &[0, 1, 2]
+    };
+    let mut results = Vec::with_capacity(limit.saturating_mul(kinds.len()));
+    let batch_size = limit.max(64).saturating_mul(4);
+    for &kind in kinds {
+        let mut offset = 0usize;
+        let mut visible_for_kind = 0usize;
+        while visible_for_kind < limit {
+            let mut query_params = Vec::<rusqlite::types::Value>::with_capacity(
+                6usize.saturating_add(term_params.len()),
+            );
+            query_params.push(kind.into());
+            query_params.push(root_key.clone().into());
+            query_params.push(root_prefix.clone().into());
+            query_params.push(root_prefix_end.clone().into());
+            query_params.extend(term_params.iter().cloned().map(Into::into));
+            query_params.push(
+                i64::try_from(batch_size)
+                    .map_err(|_| "recent batch too large".to_string())?
+                    .into(),
+            );
+            query_params.push(
+                i64::try_from(offset)
+                    .map_err(|_| "recent offset too large".to_string())?
+                    .into(),
+            );
+            let rows = stmt
+                .query_map(params_from_iter(query_params.iter()), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                })
+                .map_err(|e| e.to_string())?;
+
+            let mut fetched = 0usize;
+            for row in rows {
+                let (dir_path, name, activity, size) = row.map_err(|e| e.to_string())?;
+                fetched += 1;
+                let mut path = if dir_path == "/" {
+                    format!("/{}", name)
+                } else {
+                    format!("{}/{}", dir_path, name)
+                };
+                if kind == 1 {
+                    path.push('/');
+                }
+                if is_root_index_excluded_path(&root_key, &path) {
+                    continue;
+                }
+                if opts.visible_only && path_has_hidden_component(&path) {
+                    continue;
+                }
+                let base = path.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+                let matched = if opts.force_full {
+                    regexes.iter().all(|regex| regex.is_match(&path))
+                } else {
+                    regexes.iter().all(|regex| regex.is_match(base))
+                };
+                if !matched
+                    || (opts.force_full
+                        && regexes.len() > 1
+                        && !regexes.iter().any(|regex| regex.is_match(base)))
+                {
+                    continue;
+                }
+                results.push(SearchResult {
+                    path,
+                    is_dir: kind == 1,
+                    is_symlink: kind == 2,
+                    metadata: None,
+                    indexed_activity_nanos: activity,
+                    indexed_size: size.and_then(|value| u64::try_from(value).ok()),
+                });
+                visible_for_kind += 1;
+                if visible_for_kind >= limit {
+                    break;
+                }
+            }
+            if fetched < batch_size {
+                break;
+            }
+            offset = offset.saturating_add(batch_size);
+        }
+    }
+    results.sort_unstable_by(|a, b| {
+        let a_activity = a.indexed_activity_nanos.unwrap_or(0);
+        let b_activity = b.indexed_activity_nanos.unwrap_or(0);
+        match order {
+            SortOrder::Asc => a_activity
+                .cmp(&b_activity)
+                .then_with(|| a.path.cmp(&b.path)),
+            SortOrder::Desc => b_activity
+                .cmp(&a_activity)
+                .then_with(|| a.path.cmp(&b.path)),
+        }
+    });
+    results.truncate(limit);
+
+    Ok(SearchRun {
+        lines: final_transform(results, opts, use_style, stdout_is_tty, colors, cache, None),
+        timed_out: false,
+    })
+}
+
 fn run_indexed(
     opts: &Options,
     content_spec: Option<&ContainsAllSpec>,
@@ -2683,8 +4413,9 @@ fn run_indexed(
     }
     let conn = open_index_db()?;
     let fts_ready = ensure_index_search_ready(&conn).unwrap_or(false);
-    let root_known = index_root_is_known(&conn, &root_key)?;
-    spawn_index_refresh(&root_key, opts, !root_known);
+    let covering_root = covering_index_root(&conn, &root_key)?;
+    let refresh_root = covering_root.as_deref().unwrap_or(&root_key);
+    spawn_index_refresh(refresh_root, opts, covering_root.is_none());
     let stdout_is_tty = io::stdout().is_terminal();
     let use_style = style_enabled(opts, stdout_is_tty);
     let base_name_expr = "lower(s.value)";
@@ -2743,6 +4474,7 @@ fn run_indexed(
             None
         };
         let mut written_since_flush = 0usize;
+        let mut emitted = 0usize;
 
         for row in rows {
             let (dir_path, name, kind) = row.map_err(|e| e.to_string())?;
@@ -2779,6 +4511,9 @@ fn run_indexed(
             if opts.force_full && regexes.len() > 1 && !regexes.iter().any(|re| re.is_match(base)) {
                 continue;
             }
+            if opts.limit.is_some_and(|limit| emitted >= limit) {
+                break;
+            }
             if let Some(state) = cache_state.as_mut() {
                 cache_raw_record_path(&path, is_dir, state);
             }
@@ -2788,6 +4523,7 @@ fn run_indexed(
                 let _ = lock.write_all(path.as_bytes());
                 let _ = lock.write_all(b"\n");
             }
+            emitted += 1;
             written_since_flush += 1;
             if written_since_flush >= INDEX_STREAM_FLUSH_LINES {
                 let _ = lock.flush();
@@ -2847,6 +4583,8 @@ fn run_indexed(
             is_dir,
             is_symlink,
             metadata: None,
+            indexed_activity_nanos: None,
+            indexed_size: None,
         });
     }
     results.sort_by(|a, b| a.path.cmp(&b.path));
@@ -3000,19 +4738,21 @@ fn add_info_transform(
     }
     let mut out = Vec::new();
     for item in items {
-        if let Some(meta) = &item.metadata {
-            let dt: DateTime<Local> = meta
-                .modified()
-                .unwrap_or_else(|_| std::time::SystemTime::now())
-                .into();
+        if let Some(activity_time) = result_activity_time(&item) {
+            let dt: DateTime<Local> = activity_time.into();
             let dt_str = dt.format("%Y-%m-%d %H:%M:%S").to_string();
-            let mut human_size = format_size_iec(meta.len());
+            let mut human_size = format_size_iec(
+                item.metadata
+                    .as_ref()
+                    .map(|metadata| metadata.len())
+                    .or(item.indexed_size)
+                    .unwrap_or(0),
+            );
             let mut extra = String::new();
             if opts.long_extended {
                 if item.is_symlink {
                     let link_path = item.path.trim_end_matches('/');
                     if fs::metadata(link_path).map(|m| m.is_dir()).unwrap_or(false) {
-                        human_size = format_size_iec(meta.len());
                         extra = " 0".to_string();
                     }
                 } else if item.is_dir {
@@ -3024,9 +4764,10 @@ fn add_info_transform(
             }
             let path_display =
                 render_styled_path(&item, use_style, add_decorator, colors, opts, highlight);
+            let size_display = style_size(&human_size, use_style);
             out.push(format!(
                 "{} {}{} {}",
-                dt_str, human_size, extra, path_display
+                dt_str, size_display, extra, path_display
             ));
         } else {
             out.push(item.path);
@@ -3054,9 +4795,21 @@ fn sizes_transform(
         };
         let path_display =
             render_styled_path(&item, use_style, add_decorator, colors, opts, highlight);
-        out.push(format!("{}\t{}", compact, path_display));
+        out.push(format!(
+            "{}\t{}",
+            style_size(&compact, use_style),
+            path_display
+        ));
     }
     out
+}
+
+fn style_size(size: &str, use_style: bool) -> String {
+    if use_style {
+        format!("\x1b[1;96m{}\x1b[0m", size)
+    } else {
+        size.to_string()
+    }
 }
 
 fn counts_summary_transform(
@@ -3094,6 +4847,8 @@ fn counts_summary_transform(
             is_dir: true,
             is_symlink: false,
             metadata: None,
+            indexed_activity_nanos: None,
+            indexed_size: None,
         };
         let folder_display =
             render_styled_path(&folder_item, use_style, false, colors, opts, highlight);
@@ -3603,9 +5358,13 @@ fn run_standard(
         } else {
             None
         };
+        let mut emitted = 0usize;
 
         for chunk in rx {
             for info in chunk {
+                if opts.limit.is_some_and(|limit| emitted >= limit) {
+                    continue;
+                }
                 if let Some(state) = cache_state.as_mut() {
                     cache_raw_record_path(&info.path.to_string_lossy(), info.is_dir, state);
                 }
@@ -3614,6 +5373,7 @@ fn run_standard(
                     let _ = lock.write_all(b"/");
                 }
                 let _ = lock.write_all(b"\n");
+                emitted += 1;
             }
         }
 
@@ -4026,6 +5786,15 @@ fn main() -> ExitCode {
             }
         };
     }
+    if let Some(root) = opts.index_snapshot.as_deref() {
+        return match rebuild_index_snapshot(root) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{}", e);
+                ExitCode::from(1)
+            }
+        };
+    }
     if let Some(root) = opts.index_purge.as_deref() {
         return match purge_index_root(root) {
             Ok(()) => ExitCode::SUCCESS,
@@ -4079,7 +5848,9 @@ fn main() -> ExitCode {
     } else {
         parse_ls_colors()
     };
-    let result = if opts.index_mode {
+    let result = if opts.recent_limit.is_some() {
+        run_recent_indexed(&opts, &mut cache, &colors)
+    } else if opts.index_mode {
         run_indexed(&opts, content_spec.as_ref(), &mut cache, &colors)
     } else if let Some(spec) = content_spec {
         run_contains_all(&opts, spec, &mut cache, &colors)
@@ -4142,6 +5913,7 @@ mod tests {
             regex_mode: false,
             sort_field: None,
             sort_order: None,
+            limit: None,
             no_recurse: false,
             follow_links: false,
             respect_ignore: false,
@@ -4153,7 +5925,9 @@ mod tests {
             snapshot_refresh: false,
             index_mode: false,
             index_binary: false,
+            recent_limit: None,
             index_refresh: None,
+            index_snapshot: None,
             index_purge: None,
             absolute_paths: false,
             force_dir: false,
@@ -4187,6 +5961,40 @@ mod tests {
             root: PathBuf::from("/media/disk"),
         };
         assert_eq!(effective_threads_override(&opts, Some(&spec)), 32);
+        assert_eq!(recent_refresh_threads(&opts, Path::new("/media/disk")), 32);
+    }
+
+    #[test]
+    fn recent_refresh_keeps_media_serial_by_default() {
+        let opts = base_opts();
+        assert_eq!(recent_refresh_threads(&opts, Path::new("/media/disk")), 1);
+        assert!((1..=16).contains(&recent_refresh_threads(&opts, Path::new("/home/lewis"))));
+    }
+
+    #[test]
+    fn manifest_optional_i64_round_trip() {
+        for value in [None, Some(0), Some(42), Some(i64::MAX)] {
+            assert_eq!(decode_optional_i64(encode_optional_i64(value)), value);
+        }
+    }
+
+    #[test]
+    fn recent_query_separates_terms_from_explicit_path() {
+        let mut opts = base_opts();
+        opts.positional = vec!["poo".to_string(), "/home/lewis".to_string()];
+        let (root, terms) = recent_query_from_opts(&opts).unwrap();
+        assert_eq!(root, PathBuf::from("/home/lewis"));
+        assert_eq!(terms, vec!["poo"]);
+
+        opts.positional = vec!["poo".to_string()];
+        let (root, terms) = recent_query_from_opts(&opts).unwrap();
+        assert_eq!(root, PathBuf::from("."));
+        assert_eq!(terms, vec!["poo"]);
+
+        opts.path_override = Some("bare_folder".to_string());
+        let (root, terms) = recent_query_from_opts(&opts).unwrap();
+        assert_eq!(root, PathBuf::from("bare_folder"));
+        assert_eq!(terms, vec!["poo"]);
     }
 
     #[test]
@@ -4199,5 +6007,93 @@ mod tests {
         assert!(!is_root_index_excluded_path("/", "/media"));
         assert!(!is_root_index_excluded_path("/", "/home/lewis"));
         assert!(!is_root_index_excluded_path("/dev", "/dev/null"));
+    }
+
+    #[test]
+    fn index_diff_finds_additions_removals_and_kind_changes() {
+        let scanned = vec![
+            ScannedIndexEntry {
+                path: "/root/added".to_string(),
+                kind: 0,
+                mtime: None,
+                size: None,
+                activity: None,
+            },
+            ScannedIndexEntry {
+                path: "/root/changed".to_string(),
+                kind: 1,
+                mtime: None,
+                size: None,
+                activity: None,
+            },
+            ScannedIndexEntry {
+                path: "/root/kept".to_string(),
+                kind: 0,
+                mtime: None,
+                size: None,
+                activity: None,
+            },
+        ];
+        let existing = vec![
+            ExistingIndexEntry {
+                dir_id: 10,
+                name_id: 20,
+                path: Cow::Borrowed("/root/changed"),
+                kind: 0,
+                mtime: None,
+                size: None,
+                activity: None,
+            },
+            ExistingIndexEntry {
+                dir_id: 11,
+                name_id: 21,
+                path: Cow::Borrowed("/root/kept"),
+                kind: 0,
+                mtime: None,
+                size: None,
+                activity: None,
+            },
+            ExistingIndexEntry {
+                dir_id: 12,
+                name_id: 22,
+                path: Cow::Borrowed("/root/removed"),
+                kind: 0,
+                mtime: None,
+                size: None,
+                activity: None,
+            },
+        ];
+
+        let (removed, added, updated) = diff_index_entries(&scanned, &existing);
+
+        assert_eq!(removed, vec![0, 2]);
+        assert_eq!(added, vec![0, 1]);
+        assert!(updated.is_empty());
+    }
+
+    #[test]
+    fn index_diff_detects_same_count_rename() {
+        let scanned = vec![ScannedIndexEntry {
+            path: "/root/new-name".to_string(),
+            kind: 0,
+            mtime: None,
+            size: None,
+            activity: None,
+        }];
+        let existing = vec![ExistingIndexEntry {
+            dir_id: 42,
+            name_id: 52,
+            path: Cow::Borrowed("/root/old-name"),
+            kind: 0,
+            mtime: None,
+            size: None,
+            activity: None,
+        }];
+
+        let (removed, added, updated) = diff_index_entries(&scanned, &existing);
+
+        assert_eq!(removed, vec![0]);
+        assert_eq!(added, vec![0]);
+        assert!(updated.is_empty());
     }
 }

@@ -8,6 +8,39 @@ Build:
 cargo build --release
 ```
 
+## Indexed fast-start snapshots
+
+Unearth owns the indexed database and its per-root fast-start snapshots under
+`$XDG_CACHE_HOME/unearth/index` or `~/.cache/unearth/index`. Each snapshot uses
+a stable FNV-1a hash of its canonical root and has a `.snapshot` suffix; the
+canonical root is also embedded in the header and validated by consumers.
+
+The versioned binary file contains the canonical root, exact counts for all
+entries/files/directories, and `(kind, byte length, path)` records. The header
+and first records can be read without scanning the large SQLite database, while
+the remaining records are suitable for sequential background ingestion. A
+sorted `.manifest` sidecar stores each current path with its pooled directory and
+name IDs. Unearth memory-maps that file for incremental comparison instead of
+materializing the same paths from SQLite.
+
+`--index-refresh DIR` first performs a parallel path/kind scan and compares its
+stable order-independent fingerprint with the last committed refresh. Unchanged
+roots skip all SQLite and snapshot reconstruction. For a small change set, the
+sorted scan is merge-diffed with the memory-mapped manifest so only removed and
+added database entries are written. Unearth atomically replaces the manifest and
+writes a cumulative `.delta` containing snapshot additions and tombstones; the
+large base snapshot is not rewritten. A change set remains incremental while it
+is at most 20% of the larger entry count, with a floor of 1,024 and a ceiling of
+100,000 changes. A cumulative delta is compacted after 50,000 records. Larger
+changes preserve pooled IDs, assign new IDs in memory, and insert compact entry
+records in 1,000-row SQL batches as a full root reconstruction, then atomically
+replace the base snapshot and manifest. Missing, stale, or malformed sidecars are
+self-healed from the committed database. `--index-snapshot DIR` performs
+only the snapshot-build portion for an existing index, which is useful when
+upgrading. `--index-purge DIR` removes the associated snapshots. Consumers such
+as Friz may use the snapshot for startup and fall back to `unearth.db` when it is
+absent, incompatible, or does not cover the requested filtering mode.
+
 Run from this repo:
 
 ```bash
@@ -35,12 +68,14 @@ Usage:
                        [--contains-all]
                        [--highlight-match|--match-red]
                        [--path DIR]
-                       [--timeout N] [--sort date|size|name asc|desc]
+                       [--timeout N] [--sort date|size|name asc|desc] [--limit N]
                        [--no-recurse|-R] [--follow-links]
                        [--ignore] [--hidden|-H] [--threads N]
                        [--cache-raw] [--snapshot-cache]
                        [--index] [--index-binary]
-                       [--index-refresh DIR] [--index-purge DIR]
+                       [--recent N]
+                       [--index-refresh DIR] [--index-snapshot DIR]
+                       [--index-purge DIR]
                        [--color=auto|always|never] [--hyperlink]
   unearth (--version|-V)
 
@@ -165,6 +200,10 @@ Options:
       With --no-recurse/-R, size sort uses direct entry size for speed.
       Note: --counts output is always sorted ascending by count, then folder,
       and ignores --sort.
+  --limit N
+      Return at most N listed results. With --sort, unearth selects only the
+      best N entries and sorts that subset. --counts ignores this option.
+      Example: unearth "*" ~ --sort date desc --limit 10
   --no-recurse, -R
       Search only the immediate entries in each search root (no recursion).
   --follow-links
@@ -198,14 +237,34 @@ Options:
       of three or more characters use trigram indexes over pooled names and
       directory paths. Existing databases build these indexes once on the first
       indexed query after upgrading, which increases that same database's size.
+  --recent N
+      Query the indexed database for the N most recently created-or-modified
+      entries under DIR, ordered newest first. If DIR is omitted, '.' is used.
+      This uses the same unearth index as --index and synchronously refreshes the
+      covering indexed root before querying, so results never come from a stale
+      snapshot. Files, directories, and symlinks are included by default; use
+      -f or -d to restrict the type. Add --long/-l to show the activity
+      date and size beside each path. Terms before DIR filter the results;
+      --full/-F matches those terms against the complete path. Filtered recent
+      searches perform a live path walk, filter first, and read metadata only
+      for matching entries.
   --index-refresh DIR
       Rebuild indexed rows for DIR in the global database. Directory paths and
       repeated entry names are stored once and entries link to them by integer
-      IDs.
+      IDs. Entry metadata stores mtime, size, and a recent-activity timestamp
+      based on create/modify time for fast --recent queries.
+      Small change sets are merge-diffed through a memory-mapped manifest and
+      published as cumulative snapshot deltas; large changes use in-memory ID
+      assignment and batched full reconstruction. Sidecars are atomically
+      replaced after the database transaction commits.
+  --index-snapshot DIR
+      Rebuild only the fast-start binary snapshot from existing indexed rows.
+      This does not walk the filesystem or change the indexed database rows.
   --index-purge DIR
       Remove indexed rows for DIR and all indexed children from the global
-      database. Existing roots are canonicalized; missing roots are normalized
-      lexically, so stale rows can be removed after a drive is disconnected.
+      database and delete their fast-start snapshots. Existing roots are
+      canonicalized; missing roots are normalized lexically, so stale rows can
+      be removed after a drive is disconnected.
   --timeout N
       Per-invocation timeout for each unearth call. Default: 6s
       Examples: --timeout 10, --timeout 10s, --timeout 2m

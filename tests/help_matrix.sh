@@ -200,6 +200,12 @@ want_sort_asc=$'z_old\nm_mid\na_new'
 want_sort_desc=$'a_new\nm_mid\nz_old'
 assert_eq "sort date asc" "$(list_rel_raw "$SORT_ROOT" --sort date asc '*')" "$want_sort_asc"
 assert_eq "sort date desc" "$(list_rel_raw "$SORT_ROOT" --sort date desc '*')" "$want_sort_desc"
+assert_eq "sort date desc with limit" "$(list_rel_raw "$SORT_ROOT" --sort date desc --limit 2 '*')" $'a_new\nm_mid'
+assert_eq "sort date asc with equals limit" "$(list_rel_raw "$SORT_ROOT" --sort date asc --limit=1 '*')" "z_old"
+limit_zero_err="$("$F" --limit 0 '*' "$SORT_ROOT" 2>&1 >/dev/null || true)"
+assert_contains "limit zero errors" "$limit_zero_err" "--limit requires a positive integer"
+limit_missing_err="$("$F" --limit 2>&1 >/dev/null || true)"
+assert_contains "limit missing count errors" "$limit_missing_err" "--limit requires a count"
 
 # SORT MATRIX: size
 SIZE_ROOT="${TMP_BASE}/size_root"
@@ -444,6 +450,36 @@ dd if=/dev/zero of="${LONG_SYM_ROOT}/real_dir/blob" bs=1024 count=1024 status=no
 ln -s "${LONG_SYM_ROOT}/real_dir" "${LONG_SYM_ROOT}/sym_dir"
 long_sym_out="$("$F" --timeout "$F_TIMEOUT" -L sym_dir "$LONG_SYM_ROOT" 2>/dev/null)"
 assert_regex "extended long symlink dir not traversed" "$long_sym_out" '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]+([.][0-9]+)? ?(B|KiB|MiB|GiB|TiB) 0 .+/sym_dir$'
+
+# RECENT MATRIX
+RECENT_ROOT="${TMP_BASE}/recent_root"
+mkdir -p "${RECENT_ROOT}"
+touch "${RECENT_ROOT}/older.txt"
+sleep 1
+touch "${RECENT_ROOT}/middle.txt"
+sleep 1
+touch "${RECENT_ROOT}/newest.txt"
+sleep 1
+mkdir "${RECENT_ROOT}/newest_dir"
+recent_out="$("$F" --timeout "$F_TIMEOUT" --recent 2 "$RECENT_ROOT" 2>/dev/null | sed "s#^${RECENT_ROOT}/##")"
+assert_eq "recent includes directories by default" "$recent_out" $'newest_dir/\nnewest.txt'
+recent_files="$("$F" --timeout "$F_TIMEOUT" --recent 2 -f "$RECENT_ROOT" 2>/dev/null | sed "s#^${RECENT_ROOT}/##")"
+assert_eq "recent file filter returns newest files" "$recent_files" $'newest.txt\nmiddle.txt'
+recent_dirs="$("$F" --timeout "$F_TIMEOUT" --recent 1 -d "$RECENT_ROOT" 2>/dev/null | sed "s#^${RECENT_ROOT}/##")"
+assert_eq "recent directory filter returns newest directory" "$recent_dirs" "newest_dir/"
+mkdir -p "${RECENT_ROOT}/full_path_term"
+touch "${RECENT_ROOT}/full_path_term/unrelated.txt"
+recent_full_term="$("$F" --timeout "$F_TIMEOUT" --recent 1 -F full_path_term "$RECENT_ROOT" 2>/dev/null | sed "s#^${RECENT_ROOT}/##")"
+assert_eq "recent full-path term matches a parent component" "$recent_full_term" "full_path_term/unrelated.txt"
+recent_base_term="$("$F" --timeout "$F_TIMEOUT" --recent 1 full_path_term "$RECENT_ROOT" 2>/dev/null | sed "s#^${RECENT_ROOT}/##")"
+assert_eq "recent basename term excludes parent-only matches" "$recent_base_term" "full_path_term/"
+recent_long="$("$F" --timeout "$F_TIMEOUT" --recent 1 -l -f newest.txt "$RECENT_ROOT" 2>/dev/null)"
+assert_regex "recent long output shows indexed activity date and size" "$recent_long" "^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]+(\\.[0-9]+)? (B|KiB|MiB|GiB|TiB) ${RECENT_ROOT}/newest[.]txt$"
+sleep 1
+touch "${RECENT_ROOT}/older.txt"
+recent_updated="$("$F" --timeout "$F_TIMEOUT" --recent 1 -f "$RECENT_ROOT" 2>/dev/null | sed "s#^${RECENT_ROOT}/##")"
+assert_eq "recent refreshes metadata before every query" "$recent_updated" "older.txt"
+"$F" --timeout "$F_TIMEOUT" --index-purge "$RECENT_ROOT" >/dev/null 2>&1
 
 # IMPLICIT NAME CONTAINS-ALL + PATH MATRIX
 CONTENT_ROOT="${TMP_BASE}/content_root"
