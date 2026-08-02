@@ -69,6 +69,7 @@ Usage:
                        [--highlight-match|--match-red]
                        [--path DIR]
                        [--timeout N] [--sort date|size|name asc|desc] [--limit N]
+                       [--reverse]
                        [--no-recurse|-R] [--follow-links]
                        [--ignore] [--hidden|-H] [--threads N]
                        [--cache-raw] [--snapshot-cache]
@@ -204,6 +205,12 @@ Options:
       Return at most N listed results. With --sort, unearth selects only the
       best N entries and sorts that subset. --counts ignores this option.
       Example: unearth "*" ~ --sort date desc --limit 10
+  --reverse
+      Reverse the final result order. With --limit, the limit is selected
+      before the selected results are reversed.
+  --hyperlink
+      Emit split file:// hyperlinks. The parent-directory link includes
+      ?select= so PCManFM can preselect the matching file or directory.
   --no-recurse, -R
       Search only the immediate entries in each search root (no recursion).
   --follow-links

@@ -202,6 +202,7 @@ assert_eq "sort date asc" "$(list_rel_raw "$SORT_ROOT" --sort date asc '*')" "$w
 assert_eq "sort date desc" "$(list_rel_raw "$SORT_ROOT" --sort date desc '*')" "$want_sort_desc"
 assert_eq "sort date desc with limit" "$(list_rel_raw "$SORT_ROOT" --sort date desc --limit 2 '*')" $'a_new\nm_mid'
 assert_eq "sort date asc with equals limit" "$(list_rel_raw "$SORT_ROOT" --sort date asc --limit=1 '*')" "z_old"
+assert_eq "reverse after sort and limit" "$(list_rel_raw "$SORT_ROOT" --sort date desc --limit 2 --reverse '*')" $'m_mid\na_new'
 limit_zero_err="$("$F" --limit 0 '*' "$SORT_ROOT" 2>&1 >/dev/null || true)"
 assert_contains "limit zero errors" "$limit_zero_err" "--limit requires a positive integer"
 limit_missing_err="$("$F" --limit 2>&1 >/dev/null || true)"

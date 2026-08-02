@@ -100,6 +100,7 @@ struct Options {
     sort_field: Option<SortField>,
     sort_order: Option<SortOrder>,
     limit: Option<usize>,
+    reverse: bool,
     no_recurse: bool,
     follow_links: bool,
     respect_ignore: bool,
@@ -199,6 +200,7 @@ Usage:
                        [--contains-all]
                        [--path DIR]
                        [--timeout N] [--sort date|size|name asc|desc] [--limit N]
+                       [--reverse]
                        [--no-recurse|-R] [--follow-links]
                        [--ignore] [--hidden|-H] [--threads N]
                        [--cache-raw] [--snapshot-cache]
@@ -265,6 +267,8 @@ Arguments:
   - Regex mode is only enabled with --regex/-r.
   - --highlight-match (alias: --match-red) shows matched text in red inside
     output paths.
+  - --hyperlink emits split file:// hyperlinks. The parent-directory link
+    includes ?select= so PCManFM can preselect the matching file or directory.
   - --counts prints match counts grouped by parent folder.
     This mode outputs summary rows instead of full match paths.
   - --snapshot-cache prints the last complete snapshot for this exact command
@@ -304,6 +308,8 @@ Arguments:
     size is shown as '-' to avoid expensive recursive traversal.
   - --limit N returns at most N listed results. With --sort, unearth selects
     only the best N entries before sorting that subset. --counts ignores it.
+  - --reverse reverses the final result order. When combined with --limit,
+    the limit is selected first, then the selected results are reversed.
   - Name contains-all mode is implicit with 2+ plain positional terms
     (legacy name+search_dir selector forms still use search_dir mode),
     or enabled by --contains-all:
@@ -347,6 +353,7 @@ fn parse_args() -> Result<Options, String> {
         sort_field: None,
         sort_order: None,
         limit: None,
+        reverse: false,
         no_recurse: false,
         follow_links: false,
         respect_ignore: false,
@@ -562,6 +569,7 @@ fn parse_args() -> Result<Options, String> {
                 }
                 opts.limit = Some(parsed);
             }
+            "--reverse" => opts.reverse = true,
             "--no-recurse" | "-R" => opts.no_recurse = true,
             "--follow-links" => opts.follow_links = true,
             "--ignore" => opts.respect_ignore = true,
@@ -711,6 +719,7 @@ fn can_stream_direct(opts: &Options, use_style: bool) -> bool {
         && opts.sort_field.is_none()
         && !opts.long_format
         && !opts.sizes
+        && !opts.reverse
         && !opts.snapshot_cache
         && !opts.snapshot_refresh
         && !opts.absolute_paths
@@ -4736,7 +4745,8 @@ fn add_info_transform(
     if !opts.long_format {
         return items.into_iter().map(|i| i.path).collect();
     }
-    let mut out = Vec::new();
+    let mut rows = Vec::with_capacity(items.len());
+    let mut max_size_width = 0usize;
     for item in items {
         if let Some(activity_time) = result_activity_time(&item) {
             let dt: DateTime<Local> = activity_time.into();
@@ -4764,13 +4774,23 @@ fn add_info_transform(
             }
             let path_display =
                 render_styled_path(&item, use_style, add_decorator, colors, opts, highlight);
-            let size_display = style_size(&human_size, use_style);
+            max_size_width = max_size_width.max(human_size.len());
+            rows.push((Some((dt_str, human_size, extra)), path_display));
+        } else {
+            rows.push((None, item.path));
+        }
+    }
+    let mut out = Vec::with_capacity(rows.len());
+    for (info, path_display) in rows {
+        if let Some((dt_str, human_size, extra)) = info {
+            let padded_size = format!("{:>width$}", human_size, width = max_size_width);
+            let size_display = style_size(&padded_size, use_style);
             out.push(format!(
                 "{} {}{} {}",
                 dt_str, size_display, extra, path_display
             ));
         } else {
-            out.push(item.path);
+            out.push(path_display);
         }
     }
     out
@@ -5069,6 +5089,30 @@ fn colorize_segment_with_highlights(
     out
 }
 
+fn encode_file_uri_path(path: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    encoded
+}
+
+fn parent_file_uri(prefix: &str, leaf_path: &str) -> String {
+    let encoded_prefix = encode_file_uri_path(prefix);
+    format!(
+        "file://{}?select={}",
+        encoded_prefix,
+        encode_file_uri_path(leaf_path)
+    )
+}
+
 fn render_styled_path(
     res: &SearchResult,
     use_style: bool,
@@ -5164,12 +5208,15 @@ fn render_styled_path(
         if prefix.is_empty() {
             final_str = format!(
                 "\x1b]8;;file://{}\x1b\\{}\x1b]8;;\x1b\\",
-                abs_leaf, final_str
+                encode_file_uri_path(&abs_leaf),
+                final_str,
             );
         } else {
+            let encoded_leaf = encode_file_uri_path(&abs_leaf);
+            let prefix_target = parent_file_uri(&abs_prefix, &abs_leaf);
             final_str = format!(
-                "\x1b]8;;file://{}\x1b\\{}\x1b]8;;\x1b\\\x1b]8;;file://{}\x1b\\{}\x1b]8;;\x1b\\",
-                abs_prefix, prefix_colored, abs_leaf, leaf_colored
+                "\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\\x1b]8;;file://{}\x1b\\{}\x1b]8;;\x1b\\",
+                prefix_target, prefix_colored, encoded_leaf, leaf_colored
             );
         }
     }
@@ -5189,10 +5236,18 @@ fn final_transform(
     cache_transform(&items, opts);
     let add_decorators = stdout_is_tty || opts.classify;
     if opts.counts {
-        return counts_summary_transform(items, stdout_is_tty, use_style, colors, opts, highlight);
+        let mut lines =
+            counts_summary_transform(items, stdout_is_tty, use_style, colors, opts, highlight);
+        if opts.reverse {
+            lines.reverse();
+        }
+        return lines;
     }
     precompute_dirsize_cache(&items, opts, cache);
-    let items = sort_results(items, opts, cache);
+    let mut items = sort_results(items, opts, cache);
+    if opts.reverse {
+        items.reverse();
+    }
     if opts.sizes {
         return sizes_transform(
             items,
@@ -5914,6 +5969,7 @@ mod tests {
             sort_field: None,
             sort_order: None,
             limit: None,
+            reverse: false,
             no_recurse: false,
             follow_links: false,
             respect_ignore: false,
@@ -6007,6 +6063,21 @@ mod tests {
         assert!(!is_root_index_excluded_path("/", "/media"));
         assert!(!is_root_index_excluded_path("/", "/home/lewis"));
         assert!(!is_root_index_excluded_path("/dev", "/dev/null"));
+    }
+
+    #[test]
+    fn parent_file_uri_selects_files_and_directories() {
+        assert_eq!(
+            parent_file_uri(
+                "/home/lewis/Videos/obs/",
+                "/home/lewis/Videos/obs/2026-08-01 13-33-34.mp4",
+            ),
+            "file:///home/lewis/Videos/obs/?select=/home/lewis/Videos/obs/2026-08-01%2013-33-34.mp4"
+        );
+        assert_eq!(
+            parent_file_uri("/home/lewis/Videos/", "/home/lewis/Videos/obs/"),
+            "file:///home/lewis/Videos/?select=/home/lewis/Videos/obs/"
+        );
     }
 
     #[test]
