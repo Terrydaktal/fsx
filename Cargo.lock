@@ -664,6 +664,7 @@ dependencies = [
  "crossbeam-channel",
  "jemallocator",
  "jwalk",
+ "libc",
  "memmap2",
  "ntfs",
  "rayon",

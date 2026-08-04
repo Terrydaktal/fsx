@@ -41,6 +41,51 @@ upgrading. `--index-purge DIR` removes the associated snapshots. Consumers such
 as Friz may use the snapshot for startup and fall back to `unearth.db` when it is
 absent, incompatible, or does not cover the requested filtering mode.
 
+## Live index
+
+The live index uses the same pooled SQLite database; it does not create a second database or a
+Friz-specific cache. Start it in the foreground with one or more roots:
+
+```bash
+unearth --watch /home /media
+```
+
+Unearth starts the event backend before the initial scan so changes made during that scan are not
+lost. It prefers fanotify file-handle events when the kernel permits filesystem marks. Without the
+required permission or filesystem support it falls back to recursive inotify. Inotify needs one
+watch per directory, so very large trees may require a higher `fs.inotify.max_user_watches` value;
+fanotify avoids that per-directory watch cost.
+
+The privileged fanotify path requires the kernel capabilities needed for filesystem marks and
+`open_by_handle_at` (`CAP_SYS_ADMIN` and, on kernels that enforce it, `CAP_DAC_READ_SEARCH`). A
+normal user invocation therefore uses inotify and keeps the SQLite database owned by that user;
+running the whole command as root is not required for the fallback and can make the cache
+inaccessible to later user queries.
+
+Events are coalesced into short SQLite transactions. Current entries retain modification time,
+size, activity time, event kind, and the latest actor metadata. Actor classification is deliberately
+conservative: fanotify can identify the executable and UID/PID when available; inotify records the
+actor as unknown because ordinary inotify events do not carry a process identity. Overflow,
+unmount, unresolved file handles, renames of whole directories, and new mount points trigger a
+reconciliation scan. A removed drive is not deleted from the pooled database; its rows remain
+available until the mount is reattached and reconciled or the root is purged.
+
+The watcher is event-driven by default and does not perform unconditional periodic scans. Queue
+overflow, unmounts, unresolved file handles, directory moves, and new mount points still trigger
+targeted reconciliation. Set `UNEARTH_WATCH_RECONCILE_SECS` to a positive number of seconds to
+enable an additional periodic safety scan, or set it to `0` to explicitly disable that optional
+scan. A full initial scan is still performed when the watcher starts.
+
+Inspect persisted state with:
+
+```bash
+unearth --watch-status
+```
+
+Live event updates write the pooled database directly and do not delete or rebuild binary sidecars
+for every event. Indexed queries read the current pooled database immediately; an explicit refresh
+or sidecar rebuild can publish a matching snapshot atomically.
+
 Run from this repo:
 
 ```bash
@@ -50,7 +95,7 @@ Run from this repo:
 Install to your PATH:
 
 ```bash
-install -Dm755 ./target/release/unearth ~/.local/bin/unearth
+ln -sfn "$PWD/target/release/unearth" ~/.local/bin/unearth
 ```
 
 ```
@@ -73,10 +118,11 @@ Usage:
                        [--no-recurse|-R] [--follow-links]
                        [--ignore] [--hidden|-H] [--threads N]
                        [--cache-raw] [--snapshot-cache]
-                       [--index] [--index-binary]
+                       [--index|--index-if-watched] [--index-binary]
                        [--recent N]
                        [--index-refresh DIR] [--index-snapshot DIR]
                        [--index-purge DIR]
+                       [--watch ROOT ...] [--watch-status]
                        [--color=auto|always|never] [--hyperlink]
   unearth (--version|-V)
 
@@ -244,17 +290,25 @@ Options:
       of three or more characters use trigram indexes over pooled names and
       directory paths. Existing databases build these indexes once on the first
       indexed query after upgrading, which increases that same database's size.
+  --watch ROOT ...
+      Perform an initial scan and continuously update the pooled database from
+      fanotify filesystem or recursive inotify events. Runs in the foreground,
+      claims each root exclusively, and records heartbeat/recovery state.
+  --watch-status
+      Print persisted watcher backend, state, generation, and recovery status.
+  --index-if-watched
+      Query the pooled database when a clean live watcher covers the requested
+      root; otherwise use the normal filesystem scan.
   --recent N
       Query the indexed database for the N most recently created-or-modified
       entries under DIR, ordered newest first. If DIR is omitted, '.' is used.
       This uses the same unearth index as --index and synchronously refreshes the
-      covering indexed root before querying, so results never come from a stale
-      snapshot. Files, directories, and symlinks are included by default; use
+      covering indexed root unless a clean --watch owner covers it, so results
+      never come from an intentionally stale snapshot. Files, directories, and symlinks are included by default; use
       -f or -d to restrict the type. Add --long/-l to show the activity
       date and size beside each path. Terms before DIR filter the results;
-      --full/-F matches those terms against the complete path. Filtered recent
-      searches perform a live path walk, filter first, and read metadata only
-      for matching entries.
+      --full/-F matches those terms against the complete path. Filtering is
+      performed in SQL before matching rows are rendered.
   --index-refresh DIR
       Rebuild indexed rows for DIR in the global database. Directory paths and
       repeated entry names are stored once and entries link to them by integer
