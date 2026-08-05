@@ -121,6 +121,7 @@ struct Options {
     index_purge: Option<String>,
     watch: bool,
     watch_status: bool,
+    watch_metrics: Option<String>,
     absolute_paths: bool,
     force_dir: bool,
     force_file: bool,
@@ -213,7 +214,7 @@ Usage:
                        [--recent N]
                        [--index-refresh DIR] [--index-snapshot DIR]
                        [--index-purge DIR]
-                       [--watch ROOT ...] [--watch-status]
+                       [--watch ROOT ...] [--watch-status] [--watch-metrics FILE]
                        [--color=auto|always|never] [--hyperlink]
                        [--highlight-match|--match-red]
   unearth (--version|-V)
@@ -315,14 +316,19 @@ Arguments:
   - --watch ROOT ... starts the live index owner for one or more directory roots. It performs
     an initial scan, then batches create/modify/delete/rename events into the same pooled SQLite
     database. fanotify is preferred when the kernel and permissions support filesystem file
-    handles; inotify is used as the recursive fallback. The owner is exclusive per root and
-    records a boot ID, process start time, and heartbeat. Queue overflow, unmounts, unsupported
+    handles; inotify is used as the recursive fallback. The owner is exclusive per root; a new
+    invocation asks an existing owner for graceful shutdown before replacing it. It records a
+    boot ID, process start time, and heartbeat. Queue overflow, unmounts, unsupported
     event resolution, and new mount points trigger a scoped reconciliation scan instead of
     silently losing entries. Periodic safety scans are disabled by default; set
     UNEARTH_WATCH_RECONCILE_SECS to a positive number to enable them. This command stays in
-    the foreground until interrupted.
+    the foreground until interrupted. Starting a watcher for an already watched root asks the
+    existing owner to stop and replaces it with the new options.
   - --watch-status prints live watcher state recorded in the pooled database and exits.
     It marks a state stopped when the recorded watcher process is no longer alive.
+  - --watch-metrics FILE samples the watch process once per second and writes a TSV report,
+    truncating it at startup. It contains current RSS/virtual memory, user/system CPU time,
+    CPU percentage, thread count, event throughput, and refresh/database timings.
   - --sizes prints compact sizes as SIZE<TAB>PATH (max 6 chars including
     unit, e.g., 1.111M, 111.1M),
     using recursive directory totals for directory matches.
@@ -394,6 +400,7 @@ fn parse_args() -> Result<Options, String> {
         index_purge: None,
         watch: false,
         watch_status: false,
+        watch_metrics: None,
         absolute_paths: false,
         force_dir: false,
         force_file: false,
@@ -682,6 +689,21 @@ fn parse_args() -> Result<Options, String> {
             }
             "--watch" => opts.watch = true,
             "--watch-status" => opts.watch_status = true,
+            "--watch-metrics" => {
+                i += 1;
+                if i < args.len() {
+                    opts.watch_metrics = Some(args[i].clone());
+                } else {
+                    return Err("--watch-metrics requires a report file path".to_string());
+                }
+            }
+            _ if arg.starts_with("--watch-metrics=") => {
+                let value = arg.trim_start_matches("--watch-metrics=");
+                if value.is_empty() {
+                    return Err("--watch-metrics requires a non-empty report file path".to_string());
+                }
+                opts.watch_metrics = Some(value.to_string());
+            }
             "--cache" => return Err("--cache was renamed to --cache-raw".to_string()),
             "--bypass" | "-b" => opts.force_pattern_mode = true,
             "--long" | "-l" => opts.long_format = true,
@@ -744,6 +766,9 @@ fn parse_args() -> Result<Options, String> {
             || opts.snapshot_refresh)
     {
         return Err("--watch cannot be combined with search or snapshot modes".to_string());
+    }
+    if opts.watch_metrics.is_some() && !opts.watch {
+        return Err("--watch-metrics requires --watch".to_string());
     }
     Ok(opts)
 }
@@ -6112,6 +6137,7 @@ mod tests {
             index_purge: None,
             watch: false,
             watch_status: false,
+            watch_metrics: None,
             absolute_paths: false,
             force_dir: false,
             force_file: false,

@@ -1,5 +1,5 @@
 use super::*;
-use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
+use crossbeam_channel::{bounded, Receiver, Sender};
 use jwalk::{Parallelism, WalkDir};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -8,8 +8,9 @@ use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const EVENT_CREATE: i64 = 1;
 const EVENT_MODIFY: i64 = 2;
@@ -24,8 +25,363 @@ const ACTOR_RECONCILE: &str = "unearth:reconcile";
 const WATCH_BATCH_MAX: usize = 4096;
 const WATCH_CHANNEL_CAPACITY: usize = 16_384;
 const WATCH_BATCH_DELAY: Duration = Duration::from_millis(125);
-const WATCH_POLL_DELAY: Duration = Duration::from_millis(40);
+const WATCH_BACKEND_WAIT: Duration = Duration::from_millis(500);
+const WATCH_MOUNT_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+const WATCH_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const PENDING_MOVE_TIMEOUT: Duration = Duration::from_secs(2);
+const WATCH_RESTART_TIMEOUT: Duration = Duration::from_secs(10);
+const LIVE_ID_CACHE_CAPACITY: usize = 32_768;
+
+#[derive(Default)]
+struct MetricsCounters {
+    raw_events: AtomicU64,
+    coalesced_events: AtomicU64,
+    batches: AtomicU64,
+    upserts: AtomicU64,
+    removes: AtomicU64,
+    moves: AtomicU64,
+    reconciles: AtomicU64,
+    overflows: AtomicU64,
+    refreshes: AtomicU64,
+    refresh_nanos: AtomicU64,
+    subtree_scans: AtomicU64,
+    subtree_scan_nanos: AtomicU64,
+    db_transactions: AtomicU64,
+    db_nanos: AtomicU64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct MetricsSnapshot {
+    raw_events: u64,
+    coalesced_events: u64,
+    batches: u64,
+    upserts: u64,
+    removes: u64,
+    moves: u64,
+    reconciles: u64,
+    overflows: u64,
+    refreshes: u64,
+    refresh_nanos: u64,
+    subtree_scans: u64,
+    subtree_scan_nanos: u64,
+    db_transactions: u64,
+    db_nanos: u64,
+}
+
+impl MetricsCounters {
+    fn snapshot(&self) -> MetricsSnapshot {
+        MetricsSnapshot {
+            raw_events: self.raw_events.load(Ordering::Relaxed),
+            coalesced_events: self.coalesced_events.load(Ordering::Relaxed),
+            batches: self.batches.load(Ordering::Relaxed),
+            upserts: self.upserts.load(Ordering::Relaxed),
+            removes: self.removes.load(Ordering::Relaxed),
+            moves: self.moves.load(Ordering::Relaxed),
+            reconciles: self.reconciles.load(Ordering::Relaxed),
+            overflows: self.overflows.load(Ordering::Relaxed),
+            refreshes: self.refreshes.load(Ordering::Relaxed),
+            refresh_nanos: self.refresh_nanos.load(Ordering::Relaxed),
+            subtree_scans: self.subtree_scans.load(Ordering::Relaxed),
+            subtree_scan_nanos: self.subtree_scan_nanos.load(Ordering::Relaxed),
+            db_transactions: self.db_transactions.load(Ordering::Relaxed),
+            db_nanos: self.db_nanos.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Default)]
+struct DbCaches {
+    dirs: HashMap<String, i64>,
+    names: HashMap<String, i64>,
+    actors: HashMap<String, CachedActor>,
+}
+
+#[derive(Clone, Copy)]
+struct CachedActor {
+    id: i64,
+    last_seen: i64,
+}
+
+impl DbCaches {
+    fn clear(&mut self) {
+        self.dirs.clear();
+        self.names.clear();
+        self.actors.clear();
+    }
+
+    fn insert(map: &mut HashMap<String, i64>, key: String, value: i64) {
+        if !map.contains_key(&key) && map.len() >= LIVE_ID_CACHE_CAPACITY {
+            if let Some(evicted) = map.keys().next().cloned() {
+                map.remove(&evicted);
+            }
+        }
+        map.insert(key, value);
+    }
+
+    fn insert_actor(&mut self, key: String, actor: CachedActor) {
+        if !self.actors.contains_key(&key) && self.actors.len() >= LIVE_ID_CACHE_CAPACITY {
+            if let Some(evicted) = self.actors.keys().next().cloned() {
+                self.actors.remove(&evicted);
+            }
+        }
+        self.actors.insert(key, actor);
+    }
+
+    fn invalidate_dirs_below(&mut self, path: &str) {
+        let prefix = if path == "/" {
+            "/".to_string()
+        } else {
+            format!("{path}/")
+        };
+        self.dirs
+            .retain(|key, _| key != path && !key.starts_with(&prefix));
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct ProcessSample {
+    rss_bytes: u64,
+    vm_bytes: u64,
+    threads: u64,
+    cpu_user_nanos: u64,
+    cpu_system_nanos: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn read_process_sample() -> ProcessSample {
+    let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let value = |key: &str, multiplier: u64| {
+        status
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix(key)
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .and_then(|raw| raw.parse::<u64>().ok())
+                    .map(|value| value.saturating_mul(multiplier))
+            })
+            .unwrap_or(0)
+    };
+    let mut usage = unsafe { std::mem::zeroed::<libc::rusage>() };
+    let (cpu_user_nanos, cpu_system_nanos) =
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } == 0 {
+            (
+                timeval_to_nanos(usage.ru_utime),
+                timeval_to_nanos(usage.ru_stime),
+            )
+        } else {
+            (0, 0)
+        };
+    ProcessSample {
+        rss_bytes: value("VmRSS:", 1024),
+        vm_bytes: value("VmSize:", 1024),
+        threads: value("Threads:", 1),
+        cpu_user_nanos,
+        cpu_system_nanos,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_process_sample() -> ProcessSample {
+    ProcessSample::default()
+}
+
+#[cfg(target_os = "linux")]
+fn timeval_to_nanos(value: libc::timeval) -> u64 {
+    let seconds = u64::try_from(value.tv_sec).unwrap_or(0);
+    let micros = u64::try_from(value.tv_usec).unwrap_or(0);
+    seconds
+        .saturating_mul(1_000_000_000)
+        .saturating_add(micros.saturating_mul(1_000))
+}
+
+struct MetricsLogger {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl MetricsLogger {
+    fn start(path: &Path, counters: Arc<MetricsCounters>) -> Result<Self, String> {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent).map_err(|error| {
+                format!(
+                    "cannot create metrics report directory '{}': {error}",
+                    parent.display()
+                )
+            })?;
+        }
+        let file = File::create(path).map_err(|error| {
+            format!("cannot create metrics report '{}': {error}", path.display())
+        })?;
+        let mut writer = BufWriter::new(file);
+        writeln!(
+            writer,
+            "timestamp_ms\telapsed_ms\tpid\trss_bytes\tvm_bytes\tthreads\tcpu_user_ms\tcpu_system_ms\tcpu_total_ms\tcpu_percent\traw_events\tcoalesced_events\tbatches\tupserts\tremoves\tmoves\treconciles\toverflows\trefreshes\trefresh_ms\tsubtree_scans\tsubtree_scan_ms\tdb_transactions\tdb_ms"
+        )
+        .map_err(|error| format!("cannot write metrics report header: {error}"))?;
+        writer
+            .flush()
+            .map_err(|error| format!("cannot flush metrics report header: {error}"))?;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let pid = std::process::id();
+        let started = Instant::now();
+        let handle = thread::Builder::new()
+            .name("unearth-metrics".to_string())
+            .spawn(move || {
+                let mut writer = writer;
+                let mut previous = None;
+                let mut last_written = Instant::now();
+                let sample = read_process_sample();
+                if let Err(error) = write_metrics_row(
+                    &mut writer,
+                    started,
+                    last_written,
+                    previous,
+                    sample,
+                    pid,
+                    &counters,
+                ) {
+                    eprintln!("unearth: metrics report write failed: {error}");
+                    return;
+                }
+                previous = Some((last_written, sample));
+                let _ = writer.flush();
+
+                while !thread_stop.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_secs(1));
+                    let now = Instant::now();
+                    let sample = read_process_sample();
+                    if let Err(error) = write_metrics_row(
+                        &mut writer,
+                        started,
+                        now,
+                        previous,
+                        sample,
+                        pid,
+                        &counters,
+                    ) {
+                        eprintln!("unearth: metrics report write failed: {error}");
+                        break;
+                    }
+                    let _ = writer.flush();
+                    previous = Some((now, sample));
+                    last_written = now;
+                }
+
+                let now = Instant::now();
+                if now.duration_since(last_written) >= Duration::from_millis(100) {
+                    let sample = read_process_sample();
+                    if write_metrics_row(
+                        &mut writer,
+                        started,
+                        now,
+                        previous,
+                        sample,
+                        pid,
+                        &counters,
+                    )
+                    .is_ok()
+                    {
+                        let _ = writer.flush();
+                    }
+                }
+            })
+            .map_err(|error| format!("cannot start metrics sampler: {error}"))?;
+        Ok(Self {
+            stop,
+            handle: Some(handle),
+        })
+    }
+}
+
+impl Drop for MetricsLogger {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn write_metrics_row(
+    writer: &mut BufWriter<File>,
+    started: Instant,
+    at: Instant,
+    previous: Option<(Instant, ProcessSample)>,
+    sample: ProcessSample,
+    pid: u32,
+    counters: &MetricsCounters,
+) -> io::Result<()> {
+    let elapsed = at.duration_since(started);
+    let cpu_total_nanos = sample
+        .cpu_user_nanos
+        .saturating_add(sample.cpu_system_nanos);
+    let cpu_percent = previous
+        .and_then(|(previous_at, previous_sample)| {
+            let wall_nanos = at.duration_since(previous_at).as_nanos();
+            if wall_nanos == 0 {
+                return None;
+            }
+            let previous_cpu = previous_sample
+                .cpu_user_nanos
+                .saturating_add(previous_sample.cpu_system_nanos);
+            Some((cpu_total_nanos.saturating_sub(previous_cpu) as f64 / wall_nanos as f64) * 100.0)
+        })
+        .unwrap_or(0.0);
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_millis())
+        .unwrap_or_default();
+    let metrics = counters.snapshot();
+    writeln!(
+        writer,
+        "{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{:.3}\t{}\t{:.3}",
+        timestamp_ms,
+        elapsed.as_millis(),
+        pid,
+        sample.rss_bytes,
+        sample.vm_bytes,
+        sample.threads,
+        sample.cpu_user_nanos as f64 / 1_000_000.0,
+        sample.cpu_system_nanos as f64 / 1_000_000.0,
+        cpu_total_nanos as f64 / 1_000_000.0,
+        cpu_percent,
+        metrics.raw_events,
+        metrics.coalesced_events,
+        metrics.batches,
+        metrics.upserts,
+        metrics.removes,
+        metrics.moves,
+        metrics.reconciles,
+        metrics.overflows,
+        metrics.refreshes,
+        metrics.refresh_nanos as f64 / 1_000_000.0,
+        metrics.subtree_scans,
+        metrics.subtree_scan_nanos as f64 / 1_000_000.0,
+        metrics.db_transactions,
+        metrics.db_nanos as f64 / 1_000_000.0,
+    )
+}
+
+fn add_elapsed(counter: &AtomicU64, started: Instant) {
+    counter.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
+fn metric_add(counter: Option<&AtomicU64>, amount: u64) {
+    if let Some(counter) = counter {
+        counter.fetch_add(amount, Ordering::Relaxed);
+    }
+}
+
+fn metric_elapsed(counter: Option<&AtomicU64>, started: Instant) {
+    if let Some(counter) = counter {
+        add_elapsed(counter, started);
+    }
+}
 
 #[cfg(unix)]
 static WATCH_STOP: AtomicBool = AtomicBool::new(false);
@@ -140,7 +496,74 @@ fn owner_is_alive(pid: Option<i64>, boot_id: Option<&str>, starttime: Option<i64
     Path::new(&format!("/proc/{pid}")).exists()
 }
 
+fn stop_existing_watchers(roots: &[RootState]) -> Result<(), String> {
+    let conn = open_index_db()?;
+    let current = current_owner();
+    let mut owners = Vec::new();
+    for root in roots {
+        let existing: Option<ExistingOwner> = conn
+            .query_row(
+                "SELECT watcher_pid, owner_boot_id, owner_starttime, status
+                 FROM watch_state WHERE root=?1",
+                [&root.key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some((Some(pid), Some(boot_id), Some(starttime), status)) = existing else {
+            continue;
+        };
+        let same_owner =
+            pid == current.pid && boot_id == current.boot_id && starttime == current.starttime;
+        if same_owner
+            || !matches!(
+                status.as_deref(),
+                Some("starting" | "running" | "recovering")
+            )
+            || !owner_is_alive(Some(pid), Some(&boot_id), Some(starttime))
+        {
+            continue;
+        }
+        if !owners
+            .iter()
+            .any(|(existing_pid, existing_boot, existing_start)| {
+                *existing_pid == pid && existing_boot == &boot_id && *existing_start == starttime
+            })
+        {
+            owners.push((pid, boot_id, starttime));
+        }
+    }
+    drop(conn);
+
+    for (pid, boot_id, starttime) in &owners {
+        eprintln!(
+            "unearth: stopping existing watcher pid {} before restarting its root",
+            pid
+        );
+        let result = unsafe { libc::kill(*pid as libc::pid_t, libc::SIGTERM) };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(format!("cannot stop existing watcher pid {}: {error}", pid));
+            }
+        }
+        let deadline = Instant::now() + WATCH_RESTART_TIMEOUT;
+        while owner_is_alive(Some(*pid), Some(boot_id), Some(*starttime)) {
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "existing watcher pid {} did not stop within {} seconds",
+                    pid,
+                    WATCH_RESTART_TIMEOUT.as_secs()
+                ));
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+    Ok(())
+}
+
 fn claim_watch_states(roots: &[RootState]) -> Result<(), String> {
+    stop_existing_watchers(roots)?;
     let owner = current_owner();
     let conn = open_index_db()?;
     let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
@@ -193,9 +616,12 @@ fn claim_watch_states(roots: &[RootState]) -> Result<(), String> {
     tx.commit().map_err(|e| e.to_string())
 }
 
-fn heartbeat_states(roots: &[RootState], backend: &str) -> Result<(), String> {
-    let owner = current_owner();
-    let conn = open_index_db()?;
+fn heartbeat_states(
+    conn: &mut Connection,
+    roots: &[RootState],
+    backend: &str,
+    owner: &WatcherOwner,
+) -> Result<(), String> {
     let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
     for root in roots {
         tx.execute(
@@ -398,8 +824,21 @@ pub(crate) fn run(opts: &Options) -> Result<(), String> {
     }
 
     claim_watch_states(&roots)?;
-    let threads = opts.threads_override.max(1);
-    let _ = ThreadPoolBuilder::new().num_threads(threads).build_global();
+    let mut metrics_counters = None;
+    let _metrics_logger = if let Some(path) = opts.watch_metrics.as_deref() {
+        let counters = Arc::new(MetricsCounters::default());
+        let logger = match MetricsLogger::start(Path::new(path), Arc::clone(&counters)) {
+            Ok(logger) => logger,
+            Err(error) => {
+                shutdown_states(&roots);
+                return Err(error);
+            }
+        };
+        metrics_counters = Some(counters);
+        Some(logger)
+    } else {
+        None
+    };
     let (events, backend, backend_error) = match start_backend(&roots) {
         Ok(result) => result,
         Err(error) => {
@@ -414,10 +853,26 @@ pub(crate) fn run(opts: &Options) -> Result<(), String> {
     }
     update_states(&roots, &backend, "starting", false, true, None, false)?;
     let mut event_conn = open_index_db()?;
+    let owner = current_owner();
+    let mut db_caches = DbCaches::default();
 
     let mut initial_error = None;
     for root in &roots {
-        if let Err(error) = refresh_index_root(&root.key, opts) {
+        let started = Instant::now();
+        let result = refresh_index_root(&root.key, opts);
+        metric_add(
+            metrics_counters
+                .as_deref()
+                .map(|metrics| &metrics.refreshes),
+            1,
+        );
+        metric_elapsed(
+            metrics_counters
+                .as_deref()
+                .map(|metrics| &metrics.refresh_nanos),
+            started,
+        );
+        if let Err(error) = result {
             initial_error = Some(format!("{}: {}", root.key, error));
             update_state_error(&root.key, &backend, &error)?;
         } else {
@@ -435,7 +890,15 @@ pub(crate) fn run(opts: &Options) -> Result<(), String> {
         }
     }
     if !startup_events.is_empty() {
-        if let Err(error) = process_batch(&roots, &backend, opts, startup_events, &mut event_conn) {
+        if let Err(error) = process_batch(
+            &roots,
+            &backend,
+            opts,
+            startup_events,
+            &mut event_conn,
+            &mut db_caches,
+            metrics_counters.as_deref(),
+        ) {
             for root in &roots {
                 let _ = update_state_error(&root.key, &backend, &error);
             }
@@ -461,14 +924,28 @@ pub(crate) fn run(opts: &Options) -> Result<(), String> {
         if WATCH_STOP.load(Ordering::Relaxed) {
             break;
         }
-        if last_heartbeat.elapsed() >= Duration::from_secs(5) {
-            heartbeat_states(&roots, &backend)?;
+        if last_heartbeat.elapsed() >= WATCH_HEARTBEAT_INTERVAL {
+            heartbeat_states(&mut event_conn, &roots, &backend, &owner)?;
             last_heartbeat = std::time::Instant::now();
         }
         if reconcile_interval.is_some_and(|interval| last_periodic_reconcile.elapsed() >= interval)
         {
             for root in &roots {
-                if let Err(error) = reconcile_subtree(&root.path, opts) {
+                let started = Instant::now();
+                let result = reconcile_subtree(&root.path, opts, &mut db_caches);
+                metric_add(
+                    metrics_counters
+                        .as_deref()
+                        .map(|metrics| &metrics.subtree_scans),
+                    1,
+                );
+                metric_elapsed(
+                    metrics_counters
+                        .as_deref()
+                        .map(|metrics| &metrics.subtree_scan_nanos),
+                    started,
+                );
+                if let Err(error) = result {
                     eprintln!(
                         "unearth: periodic reconciliation of {} failed: {error}",
                         root.key
@@ -491,18 +968,25 @@ pub(crate) fn run(opts: &Options) -> Result<(), String> {
         let mut batch = vec![first];
         let deadline = std::time::Instant::now() + WATCH_BATCH_DELAY;
         while batch.len() < WATCH_BATCH_MAX {
-            match events.try_recv() {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match events.recv_timeout(remaining) {
                 Ok(event) => batch.push(event),
-                Err(TryRecvError::Empty) => {
-                    if std::time::Instant::now() >= deadline {
-                        break;
-                    }
-                    thread::sleep(WATCH_POLL_DELAY);
-                }
-                Err(TryRecvError::Disconnected) => break,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout)
+                | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             }
         }
-        if let Err(error) = process_batch(&roots, &backend, opts, batch, &mut event_conn) {
+        if let Err(error) = process_batch(
+            &roots,
+            &backend,
+            opts,
+            batch,
+            &mut event_conn,
+            &mut db_caches,
+            metrics_counters.as_deref(),
+        ) {
             eprintln!("unearth: live event batch failed: {error}; retaining watcher");
             for root in &roots {
                 let _ = update_state_error(&root.key, &backend, &error);
@@ -644,11 +1128,23 @@ fn process_batch(
     opts: &Options,
     batch: Vec<FsEvent>,
     conn: &mut Connection,
+    db_caches: &mut DbCaches,
+    metrics: Option<&MetricsCounters>,
 ) -> Result<(), String> {
+    metric_add(
+        metrics.map(|metrics| &metrics.raw_events),
+        batch.len() as u64,
+    );
     let batch = coalesce_batch(batch);
+    metric_add(
+        metrics.map(|metrics| &metrics.coalesced_events),
+        batch.len() as u64,
+    );
+    metric_add(metrics.map(|metrics| &metrics.batches), 1);
     let mut full_refresh = HashSet::<String>::new();
     let mut reconcile = HashSet::<PathBuf>::new();
     let mut touched_roots = HashSet::<String>::new();
+    let db_started = Instant::now();
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|e| e.to_string())?;
@@ -688,6 +1184,7 @@ fn process_batch(
         }
         match event.action {
             Action::Overflow => {
+                metric_add(metrics.map(|metrics| &metrics.overflows), 1);
                 if event.path != Path::new("/") && event.path != root.path {
                     reconcile.insert(event.path.clone());
                 } else {
@@ -701,28 +1198,33 @@ fn process_batch(
                 .map_err(|e| e.to_string())?;
             }
             Action::Reconcile => {
+                metric_add(metrics.map(|metrics| &metrics.reconciles), 1);
                 reconcile.insert(event.path.clone());
                 touched_roots.insert(root.key.clone());
             }
             Action::Upsert => {
+                metric_add(metrics.map(|metrics| &metrics.upserts), 1);
                 upsert_path(
                     &tx,
                     &event.path,
                     event.is_dir,
                     &event.actor,
                     event.event_kind,
+                    db_caches,
                 )?;
                 touch_state(&tx, &root.key, event.at)?;
                 touched_roots.insert(root.key.clone());
             }
             Action::Remove => {
-                remove_path(&tx, &event.path, event.is_dir)?;
+                metric_add(metrics.map(|metrics| &metrics.removes), 1);
+                remove_path(&tx, &event.path, event.is_dir, db_caches)?;
                 touch_state(&tx, &root.key, event.at)?;
                 touched_roots.insert(root.key.clone());
             }
             Action::Move => {
+                metric_add(metrics.map(|metrics| &metrics.moves), 1);
                 if let Some(old_path) = event.old_path.as_deref() {
-                    remove_path(&tx, old_path, event.is_dir)?;
+                    remove_path(&tx, old_path, event.is_dir, db_caches)?;
                 }
                 upsert_path(
                     &tx,
@@ -730,6 +1232,7 @@ fn process_batch(
                     event.is_dir,
                     &event.actor,
                     event.event_kind,
+                    db_caches,
                 )?;
                 if event.is_dir {
                     reconcile.insert(event.path.clone());
@@ -740,9 +1243,16 @@ fn process_batch(
         }
     }
     tx.commit().map_err(|e| e.to_string())?;
-    for path in reconcile {
+    metric_add(metrics.map(|metrics| &metrics.db_transactions), 1);
+    metric_elapsed(metrics.map(|metrics| &metrics.db_nanos), db_started);
+    reconcile.retain(|path| !full_refresh.iter().any(|root| path_in_root(root, path)));
+    for path in collapse_reconcile_paths(reconcile) {
         if path.is_dir() {
-            if let Err(error) = reconcile_subtree(&path, opts) {
+            let started = Instant::now();
+            let result = reconcile_subtree(&path, opts, db_caches);
+            metric_add(metrics.map(|metrics| &metrics.subtree_scans), 1);
+            metric_elapsed(metrics.map(|metrics| &metrics.subtree_scan_nanos), started);
+            if let Err(error) = result {
                 if let Some(root) = matching_root(roots, &path) {
                     update_state_error(&root.key, backend, &error)?;
                     full_refresh.insert(root.key.clone());
@@ -753,7 +1263,13 @@ fn process_batch(
         }
     }
     for root in full_refresh {
-        if let Err(error) = refresh_index_root(&root, opts) {
+        db_caches.clear();
+        let started = Instant::now();
+        let result = refresh_index_root(&root, opts);
+        db_caches.clear();
+        metric_add(metrics.map(|metrics| &metrics.refreshes), 1);
+        metric_elapsed(metrics.map(|metrics| &metrics.refresh_nanos), started);
+        if let Err(error) = result {
             update_state_error(&root, backend, &error)?;
         } else {
             mark_reconciled(&root, backend)?;
@@ -789,64 +1305,134 @@ fn coalesce_batch(batch: Vec<FsEvent>) -> Vec<FsEvent> {
     result
 }
 
+fn collapse_reconcile_paths(paths: HashSet<PathBuf>) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = paths.into_iter().collect();
+    paths.sort_by_key(|path| path.components().count());
+    let mut collapsed = Vec::with_capacity(paths.len());
+    'candidate: for path in paths {
+        if collapsed
+            .iter()
+            .any(|parent: &PathBuf| path.strip_prefix(parent).is_ok())
+        {
+            continue 'candidate;
+        }
+        collapsed.push(path);
+    }
+    collapsed
+}
+
 fn touch_state(tx: &Transaction<'_>, root: &str, at: i64) -> Result<(), String> {
-    tx.execute(
+    tx.prepare_cached(
         "UPDATE watch_state SET last_event=?2, generation=generation+1,
          status='running', dirty=0, online=1, error=NULL WHERE root=?1",
-        params![root, at / 1_000_000_000],
     )
+    .map_err(|e| e.to_string())?
+    .execute(params![root, at / 1_000_000_000])
     .map_err(|e| e.to_string())?;
     Ok(())
 }
 
-fn actor_id(tx: &Transaction<'_>, actor: &Actor, at: i64) -> Result<i64, String> {
-    tx.execute(
+fn actor_id_cached(
+    tx: &Transaction<'_>,
+    actor: &Actor,
+    at: i64,
+    caches: &mut DbCaches,
+) -> Result<i64, String> {
+    let key = actor.executable.clone();
+    let timestamp = at / 1_000_000_000;
+    if let Some(cached) = caches.actors.get_mut(&key) {
+        if cached.last_seen != timestamp {
+            tx.prepare_cached("UPDATE actors SET classification=?2, last_seen=?3 WHERE id=?1")
+                .map_err(|e| e.to_string())?
+                .execute(params![cached.id, actor.classification, timestamp])
+                .map_err(|e| e.to_string())?;
+            cached.last_seen = timestamp;
+        }
+        return Ok(cached.id);
+    }
+    tx.prepare_cached(
         "INSERT INTO actors(executable, classification, first_seen, last_seen)
          VALUES (?1, ?2, ?3, ?3)
          ON CONFLICT(executable) DO UPDATE SET classification=excluded.classification,
              last_seen=excluded.last_seen",
-        params![actor.executable, actor.classification, at / 1_000_000_000],
     )
+    .map_err(|e| e.to_string())?
+    .execute(params![key, actor.classification, timestamp])
     .map_err(|e| e.to_string())?;
-    tx.query_row(
-        "SELECT id FROM actors WHERE executable=?1",
-        [&actor.executable],
-        |row| row.get(0),
-    )
-    .map_err(|e| e.to_string())
-}
-
-fn ensure_dir(tx: &Transaction<'_>, path: &str) -> Result<i64, String> {
-    tx.execute("INSERT OR IGNORE INTO dirs(path) VALUES (?1)", [path])
+    let id = tx
+        .prepare_cached("SELECT id FROM actors WHERE executable=?1")
+        .map_err(|e| e.to_string())?
+        .query_row([&actor.executable], |row| row.get(0))
         .map_err(|e| e.to_string())?;
-    tx.query_row("SELECT id FROM dirs WHERE path=?1", [path], |row| {
-        row.get(0)
-    })
-    .map_err(|e| e.to_string())
+    caches.insert_actor(
+        actor.executable.clone(),
+        CachedActor {
+            id,
+            last_seen: timestamp,
+        },
+    );
+    Ok(id)
 }
 
-fn ensure_dir_chain(tx: &Transaction<'_>, path: &Path) -> Result<i64, String> {
+fn ensure_dir_cached(
+    tx: &Transaction<'_>,
+    path: &str,
+    caches: &mut DbCaches,
+) -> Result<i64, String> {
+    if let Some(id) = caches.dirs.get(path).copied() {
+        return Ok(id);
+    }
+    tx.prepare_cached("INSERT OR IGNORE INTO dirs(path) VALUES (?1)")
+        .map_err(|e| e.to_string())?
+        .execute([path])
+        .map_err(|e| e.to_string())?;
+    let id = tx
+        .prepare_cached("SELECT id FROM dirs WHERE path=?1")
+        .map_err(|e| e.to_string())?
+        .query_row([path], |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    DbCaches::insert(&mut caches.dirs, path.to_string(), id);
+    Ok(id)
+}
+
+fn ensure_dir_chain(
+    tx: &Transaction<'_>,
+    path: &Path,
+    caches: &mut DbCaches,
+) -> Result<i64, String> {
     let key = normalize_index_dir(path);
     let mut current = PathBuf::from("/");
-    ensure_dir(tx, "/")?;
+    ensure_dir_cached(tx, "/", caches)?;
     if key != "/" {
         for component in Path::new(&key).components() {
             if let Component::Normal(part) = component {
                 current.push(part);
-                ensure_dir(tx, &normalize_index_dir(&current))?;
+                ensure_dir_cached(tx, &normalize_index_dir(&current), caches)?;
             }
         }
     }
-    ensure_dir(tx, &key)
+    ensure_dir_cached(tx, &key, caches)
 }
 
-fn ensure_name(tx: &Transaction<'_>, name: &str) -> Result<i64, String> {
-    tx.execute("INSERT OR IGNORE INTO strings(value) VALUES (?1)", [name])
+fn ensure_name_cached(
+    tx: &Transaction<'_>,
+    name: &str,
+    caches: &mut DbCaches,
+) -> Result<i64, String> {
+    if let Some(id) = caches.names.get(name).copied() {
+        return Ok(id);
+    }
+    tx.prepare_cached("INSERT OR IGNORE INTO strings(value) VALUES (?1)")
+        .map_err(|e| e.to_string())?
+        .execute([name])
         .map_err(|e| e.to_string())?;
-    tx.query_row("SELECT id FROM strings WHERE value=?1", [name], |row| {
-        row.get(0)
-    })
-    .map_err(|e| e.to_string())
+    let id = tx
+        .prepare_cached("SELECT id FROM strings WHERE value=?1")
+        .map_err(|e| e.to_string())?
+        .query_row([name], |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    DbCaches::insert(&mut caches.names, name.to_string(), id);
+    Ok(id)
 }
 
 fn upsert_path(
@@ -855,12 +1441,13 @@ fn upsert_path(
     is_dir_hint: bool,
     actor: &Actor,
     event_kind: i64,
+    caches: &mut DbCaches,
 ) -> Result<(), String> {
     let path = normalize_index_dir(raw_path);
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            remove_path(tx, raw_path, is_dir_hint)?;
+            remove_path(tx, raw_path, is_dir_hint, caches)?;
             return Ok(());
         }
         Err(error) => return Err(error.to_string()),
@@ -881,15 +1468,14 @@ fn upsert_path(
         .ok_or_else(|| "event path has no basename".to_string())?
         .to_string_lossy()
         .into_owned();
-    let dir_id = ensure_dir_chain(tx, parent)?;
-    let name_id = ensure_name(tx, &name)?;
-    let actor_id = actor_id(tx, actor, now_nanos())?;
-    tx.execute(
-        "DELETE FROM entries WHERE dir_id=?1 AND name_id=?2 AND kind<>?3",
-        params![dir_id, name_id, kind],
-    )
-    .map_err(|e| e.to_string())?;
-    tx.execute(
+    let dir_id = ensure_dir_chain(tx, parent, caches)?;
+    let name_id = ensure_name_cached(tx, &name, caches)?;
+    let actor_id = actor_id_cached(tx, actor, now_nanos(), caches)?;
+    tx.prepare_cached("DELETE FROM entries WHERE dir_id=?1 AND name_id=?2 AND kind<>?3")
+        .map_err(|e| e.to_string())?
+        .execute(params![dir_id, name_id, kind])
+        .map_err(|e| e.to_string())?;
+    tx.prepare_cached(
         "INSERT INTO entries(dir_id, name_id, kind, mtime, size, activity,
                              event_kind, actor_id, actor_uid, actor_pid, event_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
@@ -907,7 +1493,9 @@ fn upsert_path(
              event_at=CASE WHEN excluded.event_kind = 6
                                 OR excluded.actor_id = (SELECT id FROM actors WHERE executable = 'unknown')
                            THEN entries.event_at ELSE excluded.event_at END",
-        params![
+    )
+    .map_err(|e| e.to_string())?
+    .execute(params![
             dir_id,
             name_id,
             kind,
@@ -919,16 +1507,20 @@ fn upsert_path(
             actor.uid,
             actor.pid,
             now_nanos(),
-        ],
-    )
+        ])
     .map_err(|e| e.to_string())?;
     if is_dir {
-        ensure_dir(tx, &path)?;
+        ensure_dir_cached(tx, &path, caches)?;
     }
     Ok(())
 }
 
-fn remove_path(tx: &Transaction<'_>, raw_path: &Path, is_dir_hint: bool) -> Result<(), String> {
+fn remove_path(
+    tx: &Transaction<'_>,
+    raw_path: &Path,
+    is_dir_hint: bool,
+    caches: &mut DbCaches,
+) -> Result<(), String> {
     let path = normalize_index_dir(raw_path);
     if path == "/" {
         return Ok(());
@@ -942,53 +1534,67 @@ fn remove_path(tx: &Transaction<'_>, raw_path: &Path, is_dir_hint: bool) -> Resu
         .to_string_lossy()
         .into_owned();
     let parent_key = normalize_index_dir(parent);
-    let name_id: Option<i64> = tx
-        .query_row("SELECT id FROM strings WHERE value=?1", [&name], |row| {
-            row.get(0)
-        })
-        .optional()
-        .map_err(|e| e.to_string())?;
-    let parent_id: Option<i64> = tx
-        .query_row("SELECT id FROM dirs WHERE path=?1", [&parent_key], |row| {
-            row.get(0)
-        })
-        .optional()
-        .map_err(|e| e.to_string())?;
+    let name_id = if let Some(id) = caches.names.get(&name).copied() {
+        Some(id)
+    } else {
+        let id: Option<i64> = tx
+            .prepare_cached("SELECT id FROM strings WHERE value=?1")
+            .map_err(|e| e.to_string())?
+            .query_row([&name], |row| row.get(0))
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if let Some(id) = id {
+            DbCaches::insert(&mut caches.names, name.clone(), id);
+        }
+        id
+    };
+    let parent_id = if let Some(id) = caches.dirs.get(&parent_key).copied() {
+        Some(id)
+    } else {
+        let id: Option<i64> = tx
+            .prepare_cached("SELECT id FROM dirs WHERE path=?1")
+            .map_err(|e| e.to_string())?
+            .query_row([&parent_key], |row| row.get(0))
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if let Some(id) = id {
+            DbCaches::insert(&mut caches.dirs, parent_key.clone(), id);
+        }
+        id
+    };
     let escaped_path = sql_like_escape(&path);
     let subtree_pattern = format!("{escaped_path}/%");
-    let is_dir = is_dir_hint
-        || tx
-            .query_row(
-                "SELECT COUNT(*) FROM dirs WHERE path=?1 OR path LIKE ?2 ESCAPE '\\'",
-                params![path, &subtree_pattern],
-                |row| row.get::<_, i64>(0),
-            )
+    let is_dir = is_dir_hint || caches.dirs.contains_key(&path) || {
+        tx.prepare_cached("SELECT COUNT(*) FROM dirs WHERE path=?1 OR path LIKE ?2 ESCAPE '\\'")
             .map_err(|e| e.to_string())?
-            > 0;
+            .query_row(params![path, &subtree_pattern], |row| row.get::<_, i64>(0))
+            .map_err(|e| e.to_string())?
+            > 0
+    };
     if is_dir {
-        tx.execute(
+        tx.prepare_cached(
             "DELETE FROM entries WHERE dir_id IN
              (SELECT id FROM dirs WHERE path=?1 OR path LIKE ?2 ESCAPE '\\')
              OR (dir_id=?3 AND name_id=?4)",
-            params![path, &subtree_pattern, parent_id, name_id],
         )
+        .map_err(|e| e.to_string())?
+        .execute(params![path, &subtree_pattern, parent_id, name_id])
         .map_err(|e| e.to_string())?;
-        tx.execute(
-            "DELETE FROM dirs WHERE path=?1 OR path LIKE ?2 ESCAPE '\\'",
-            params![path, &subtree_pattern],
-        )
-        .map_err(|e| e.to_string())?;
+        tx.prepare_cached("DELETE FROM dirs WHERE path=?1 OR path LIKE ?2 ESCAPE '\\'")
+            .map_err(|e| e.to_string())?
+            .execute(params![path, &subtree_pattern])
+            .map_err(|e| e.to_string())?;
+        caches.invalidate_dirs_below(&path);
     } else if let (Some(parent_id), Some(name_id)) = (parent_id, name_id) {
-        tx.execute(
-            "DELETE FROM entries WHERE dir_id=?1 AND name_id=?2",
-            params![parent_id, name_id],
-        )
-        .map_err(|e| e.to_string())?;
+        tx.prepare_cached("DELETE FROM entries WHERE dir_id=?1 AND name_id=?2")
+            .map_err(|e| e.to_string())?
+            .execute(params![parent_id, name_id])
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
 
-fn reconcile_subtree(path: &Path, opts: &Options) -> Result<(), String> {
+fn reconcile_subtree(path: &Path, opts: &Options, caches: &mut DbCaches) -> Result<(), String> {
     let path = path.to_path_buf();
     if !path.is_dir() {
         return Ok(());
@@ -1004,24 +1610,28 @@ fn reconcile_subtree(path: &Path, opts: &Options) -> Result<(), String> {
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|e| e.to_string())?;
-    tx.execute(
+    tx.prepare_cached(
         "DELETE FROM entries WHERE dir_id IN
          (SELECT id FROM dirs WHERE path=?1 OR path LIKE ?2 ESCAPE '\\')",
-        params![root_key, format!("{}/%", sql_like_escape(&root_key))],
     )
+    .map_err(|e| e.to_string())?
+    .execute(params![
+        root_key,
+        format!("{}/%", sql_like_escape(&root_key))
+    ])
     .map_err(|e| e.to_string())?;
-    tx.execute(
-        "DELETE FROM dirs WHERE path LIKE ?1 ESCAPE '\\'",
-        [format!("{}/%", sql_like_escape(&root_key))],
-    )
-    .map_err(|e| e.to_string())?;
-    ensure_dir(&tx, &root_key)?;
+    tx.prepare_cached("DELETE FROM dirs WHERE path LIKE ?1 ESCAPE '\\'")
+        .map_err(|e| e.to_string())?
+        .execute([format!("{}/%", sql_like_escape(&root_key))])
+        .map_err(|e| e.to_string())?;
+    caches.invalidate_dirs_below(&root_key);
+    ensure_dir_cached(&tx, &root_key, caches)?;
     let actor = Actor::reconcile();
     for entry in entries {
         let path = PathBuf::from(entry.path);
         let metadata = fs::symlink_metadata(&path).ok();
         if metadata.is_some() {
-            upsert_path(&tx, &path, entry.kind == 1, &actor, EVENT_RECONCILE)?;
+            upsert_path(&tx, &path, entry.kind == 1, &actor, EVENT_RECONCILE, caches)?;
         }
     }
     tx.commit().map_err(|e| e.to_string())
@@ -1160,6 +1770,26 @@ struct InotifyWatcher {
     pending_moves: HashMap<u32, PendingMove>,
     mounted: HashSet<PathBuf>,
     last_mount_check: std::time::Instant,
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_backend_event(fd: RawFd) -> Result<(), std::io::Error> {
+    let timeout_ms = WATCH_BACKEND_WAIT.as_millis().min(i32::MAX as u128) as i32;
+    let mut pollfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        let result = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+        if result >= 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1305,7 +1935,7 @@ impl InotifyWatcher {
     }
 
     fn poll_mounts(&mut self, tx: &Sender<FsEvent>) {
-        if self.last_mount_check.elapsed() < Duration::from_secs(2) {
+        if self.last_mount_check.elapsed() < WATCH_MOUNT_CHECK_INTERVAL {
             return;
         }
         let current: HashSet<PathBuf> = self
@@ -1363,7 +1993,20 @@ impl InotifyWatcher {
             if read < 0 {
                 let error = std::io::Error::last_os_error();
                 if error.kind() == std::io::ErrorKind::WouldBlock {
-                    thread::sleep(WATCH_POLL_DELAY);
+                    if let Err(error) = wait_for_backend_event(self.fd) {
+                        let _ = tx.send(event(
+                            Action::Overflow,
+                            PathBuf::from("/"),
+                            true,
+                            "inotify",
+                            Actor::unknown(),
+                        ));
+                        eprintln!("unearth: inotify wait failed: {error}");
+                        break;
+                    }
+                    continue;
+                }
+                if error.kind() == std::io::ErrorKind::Interrupted {
                     continue;
                 }
                 let _ = tx.send(event(
@@ -1906,7 +2549,7 @@ impl FanotifyWatcher {
         let mut buffer = vec![0u8; 1024 * 1024];
         let mut last_mount_check = std::time::Instant::now();
         loop {
-            if last_mount_check.elapsed() >= Duration::from_secs(2) {
+            if last_mount_check.elapsed() >= WATCH_MOUNT_CHECK_INTERVAL {
                 self.add_new_mounts(&tx);
                 last_mount_check = std::time::Instant::now();
             }
@@ -1914,7 +2557,20 @@ impl FanotifyWatcher {
             if read < 0 {
                 let error = std::io::Error::last_os_error();
                 if error.kind() == std::io::ErrorKind::WouldBlock {
-                    thread::sleep(WATCH_POLL_DELAY);
+                    if let Err(error) = wait_for_backend_event(self.fd) {
+                        let _ = tx.send(event(
+                            Action::Overflow,
+                            PathBuf::from("/"),
+                            true,
+                            "fanotify",
+                            Actor::unknown(),
+                        ));
+                        eprintln!("unearth: fanotify wait failed: {error}");
+                        break;
+                    }
+                    continue;
+                }
+                if error.kind() == std::io::ErrorKind::Interrupted {
                     continue;
                 }
                 let _ = tx.send(event(
@@ -2135,6 +2791,34 @@ mod tests {
         let result = coalesce_batch(batch);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].action, Action::Reconcile);
+    }
+
+    #[test]
+    fn reconciliation_collapses_nested_paths_to_the_oldest_ancestor() {
+        let paths = HashSet::from([
+            PathBuf::from("/home/user/project"),
+            PathBuf::from("/home/user/project/src"),
+            PathBuf::from("/home/user/project/src/bin"),
+            PathBuf::from("/home/user/other"),
+        ]);
+        let result = collapse_reconcile_paths(paths);
+        assert_eq!(
+            result,
+            vec![
+                PathBuf::from("/home/user/project"),
+                PathBuf::from("/home/user/other")
+            ]
+        );
+    }
+
+    #[test]
+    fn reconciliation_does_not_collapse_sibling_prefixes() {
+        let paths = HashSet::from([
+            PathBuf::from("/home/user/app"),
+            PathBuf::from("/home/user/apple"),
+        ]);
+        let result = collapse_reconcile_paths(paths);
+        assert_eq!(result.len(), 2);
     }
 
     #[test]

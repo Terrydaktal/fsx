@@ -82,6 +82,22 @@ Inspect persisted state with:
 unearth --watch-status
 ```
 
+Collect one-second resource samples for a watcher with:
+
+```bash
+unearth --watch --watch-metrics "$HOME/.cache/unearth/home-metrics.tsv" "$HOME"
+```
+
+The TSV contains current RSS and virtual memory, cumulative user/system CPU time, interval CPU
+percentage, thread count, event counters, and scan/database timings. It is truncated when the
+watcher starts and flushed after every sample, so it can be inspected while the watcher runs.
+
+For a compact summary of a completed report:
+
+```bash
+awk -F '\t' 'NR==1 {for (i=1;i<=NF;i++) c[$i]=i; next} {n++; r=$(c["rss_bytes"]); p=$(c["cpu_percent"]); rs+=r; ps+=p; if (r>rp) rp=r; if (p>pp) pp=p; ms=$(c["elapsed_ms"]); raw=$(c["raw_events"]); b=$(c["batches"])} END {printf "samples=%d duration=%.1fs avg-rss=%.2fMiB peak-rss=%.2fMiB avg-cpu=%.3f%% peak-cpu=%.3f%% raw-events=%d batches=%d\n", n, ms/1000, rs/n/1048576, rp/1048576, ps/n, pp, raw, b}' "$HOME/.cache/unearth/home-metrics.tsv"
+```
+
 Live event updates write the pooled database directly and do not delete or rebuild binary sidecars
 for every event. Indexed queries read the current pooled database immediately; an explicit refresh
 or sidecar rebuild can publish a matching snapshot atomically.
@@ -122,7 +138,7 @@ Usage:
                        [--recent N]
                        [--index-refresh DIR] [--index-snapshot DIR]
                        [--index-purge DIR]
-                       [--watch ROOT ...] [--watch-status]
+                       [--watch ROOT ...] [--watch-status] [--watch-metrics FILE]
                        [--color=auto|always|never] [--hyperlink]
   unearth (--version|-V)
 
@@ -293,9 +309,15 @@ Options:
   --watch ROOT ...
       Perform an initial scan and continuously update the pooled database from
       fanotify filesystem or recursive inotify events. Runs in the foreground,
-      claims each root exclusively, and records heartbeat/recovery state.
+      records heartbeat/recovery state, and replaces an existing live watcher
+      for the same root after asking it to stop gracefully.
   --watch-status
       Print persisted watcher backend, state, generation, and recovery status.
+  --watch-metrics FILE
+      Sample the live watcher once per second and write a TSV report containing
+      RSS/virtual memory, user/system CPU time, CPU percentage, thread count,
+      event throughput, and refresh/database timings. This is valid only with
+      --watch; the file is truncated when the watcher starts.
   --index-if-watched
       Query the pooled database when a clean live watcher covers the requested
       root; otherwise use the normal filesystem scan.
