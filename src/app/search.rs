@@ -9,7 +9,8 @@ use super::patterns::{
 };
 use super::presentation::{
     cache_raw_record_path, can_stream_direct, compile_highlight_spec, escape_terminal_text,
-    final_transform, init_raw_cache_state, render_styled_path, style_enabled,
+    final_transform, init_raw_cache_state, render_styled_path, style_enabled, RenderCache,
+    RenderContext,
 };
 use crossbeam_channel::{bounded, unbounded, Sender};
 use rayon::prelude::*;
@@ -187,7 +188,8 @@ pub(crate) fn run_standard(
                 if let Some(state) = cache_state.as_mut() {
                     cache_raw_record_path(&info.path.to_string_lossy(), info.is_dir, state);
                 }
-                let display_path = escape_terminal_text(&info.path.to_string_lossy());
+                let raw_path = info.path.to_string_lossy();
+                let display_path = escape_terminal_text(&raw_path);
                 lock.write_all(display_path.as_bytes())
                     .map_err(|e| e.to_string())?;
                 if info.is_dir && !info.path.as_os_str().as_bytes().ends_with(b"/") {
@@ -542,6 +544,15 @@ pub(crate) fn run_full(
         } else {
             None
         };
+        let mut render_cache = RenderCache::default();
+        let mut render_context = RenderContext {
+            use_style,
+            add_decorator: opts.classify,
+            colors,
+            opts,
+            highlight: highlight_spec.as_ref(),
+            cache: &mut render_cache,
+        };
         let mut emitted = 0usize;
         let mut stopped_by_limit = false;
         for chunk in rx {
@@ -552,15 +563,11 @@ pub(crate) fn run_full(
                 if let Some(state) = cache_state.as_mut() {
                     cache_raw_record_path(&item.path, item.is_dir, state);
                 }
-                let display = render_styled_path(
-                    &item,
-                    use_style,
-                    opts.classify,
-                    colors,
-                    opts,
-                    highlight_spec.as_ref(),
-                );
-                writeln!(output, "{display}").map_err(|e| e.to_string())?;
+                let display = render_styled_path(&item, &mut render_context);
+                output
+                    .write_all(display.as_bytes())
+                    .and_then(|_| output.write_all(b"\n"))
+                    .map_err(|e| e.to_string())?;
                 emitted += 1;
                 if opts.limit.is_some_and(|limit| emitted >= limit) {
                     timeout_triggered.store(true, Ordering::Relaxed);

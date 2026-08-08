@@ -144,7 +144,8 @@ pub(crate) struct RawCacheState {
 #[derive(Clone)]
 pub(crate) struct ColorSpec {
     pub(crate) by_key: HashMap<String, String>,
-    pub(crate) globs: Vec<(Regex, String)>,
+    pub(crate) suffix_globs: HashMap<String, (usize, String)>,
+    pub(crate) globs: Vec<(usize, Regex, String)>,
     pub(crate) color_prefix_dir: String,
     pub(crate) color_dir: String,
     pub(crate) color_link: String,

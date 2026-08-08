@@ -9,6 +9,7 @@ use super::model::{
 use chrono::{DateTime, Local};
 use rayon::prelude::*;
 use regex::{Regex, RegexBuilder};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, OpenOptions};
@@ -25,7 +26,10 @@ pub(crate) fn style_enabled(opts: &Options, stdout_is_tty: bool) -> bool {
     }
 }
 
-pub(crate) fn escape_terminal_text(text: &str) -> String {
+pub(crate) fn escape_terminal_text(text: &str) -> Cow<'_, str> {
+    if !text.bytes().any(|byte| byte < 0x20 || byte == 0x7f) {
+        return Cow::Borrowed(text);
+    }
     let mut escaped = String::with_capacity(text.len());
     for ch in text.chars() {
         match ch {
@@ -38,7 +42,7 @@ pub(crate) fn escape_terminal_text(text: &str) -> String {
             _ => escaped.push(ch),
         }
     }
-    escaped
+    Cow::Owned(escaped)
 }
 
 pub(crate) fn can_stream_direct(opts: &Options, use_style: bool) -> bool {
@@ -412,14 +416,10 @@ pub(crate) fn get_dirsize_bytes(path: &str, cache: &mut DirStatsCache) -> Option
 
 pub(crate) fn add_info_transform(
     items: Vec<SearchResult>,
-    opts: &Options,
     cache: &mut DirStatsCache,
-    use_style: bool,
-    add_decorator: bool,
-    colors: &ColorSpec,
-    highlight: Option<&HighlightSpec>,
+    context: &mut RenderContext<'_>,
 ) -> Vec<String> {
-    if !opts.long_format {
+    if !context.opts.long_format {
         return items.into_iter().map(|i| i.path).collect();
     }
     let mut rows = Vec::with_capacity(items.len());
@@ -436,7 +436,7 @@ pub(crate) fn add_info_transform(
                     .unwrap_or(0),
             );
             let mut extra = String::new();
-            if opts.long_extended {
+            if context.opts.long_extended {
                 if item.is_symlink {
                     let link_path = item.path.trim_end_matches('/');
                     if fs::metadata(link_path).map(|m| m.is_dir()).unwrap_or(false) {
@@ -449,13 +449,11 @@ pub(crate) fn add_info_transform(
                     }
                 }
             }
-            let path_display =
-                render_styled_path(&item, use_style, add_decorator, colors, opts, highlight);
+            let path_display = render_styled_path(&item, context);
             max_size_width = max_size_width.max(human_size.len());
             rows.push((Some((dt_str, human_size, extra)), path_display));
         } else {
-            let path_display =
-                render_styled_path(&item, use_style, add_decorator, colors, opts, highlight);
+            let path_display = render_styled_path(&item, context);
             rows.push((None, path_display));
         }
     }
@@ -463,7 +461,7 @@ pub(crate) fn add_info_transform(
     for (info, path_display) in rows {
         if let Some((dt_str, human_size, extra)) = info {
             let padded_size = format!("{:>width$}", human_size, width = max_size_width);
-            let size_display = style_size(&padded_size, use_style);
+            let size_display = style_size(&padded_size, context.use_style);
             out.push(format!(
                 "{} {}{} {}",
                 dt_str, size_display, extra, path_display
@@ -477,26 +475,21 @@ pub(crate) fn add_info_transform(
 
 pub(crate) fn sizes_transform(
     items: Vec<SearchResult>,
-    opts: &Options,
     cache: &mut DirStatsCache,
-    use_style: bool,
-    add_decorator: bool,
-    colors: &ColorSpec,
-    highlight: Option<&HighlightSpec>,
+    context: &mut RenderContext<'_>,
 ) -> Vec<String> {
     let mut out = Vec::with_capacity(items.len());
     for item in items {
         let compact = if should_skip_root_size_tree(&item.path) {
             "-".to_string()
         } else {
-            let bytes = size_bytes_for_result(&item, opts, cache);
+            let bytes = size_bytes_for_result(&item, context.opts, cache);
             format_size_compact_3(bytes)
         };
-        let path_display =
-            render_styled_path(&item, use_style, add_decorator, colors, opts, highlight);
+        let path_display = render_styled_path(&item, context);
         out.push(format!(
             "{}\t{}",
-            style_size(&compact, use_style),
+            style_size(&compact, context.use_style),
             path_display
         ));
     }
@@ -514,10 +507,7 @@ pub(crate) fn style_size(size: &str, use_style: bool) -> String {
 pub(crate) fn counts_summary_transform(
     items: Vec<SearchResult>,
     show_header: bool,
-    use_style: bool,
-    colors: &ColorSpec,
-    opts: &Options,
-    highlight: Option<&HighlightSpec>,
+    context: &mut RenderContext<'_>,
 ) -> Vec<String> {
     let mut counts: HashMap<String, u64> = HashMap::new();
     for item in items {
@@ -549,57 +539,65 @@ pub(crate) fn counts_summary_transform(
             indexed_activity_nanos: None,
             indexed_size: None,
         };
-        let folder_display =
-            render_styled_path(&folder_item, use_style, false, colors, opts, highlight);
-        let count_display = style_size(&format!("{:>7}", n), use_style);
+        let folder_display = render_styled_path(&folder_item, context);
+        let count_display = style_size(&format!("{:>7}", n), context.use_style);
         out.push(format!("{}  {}", count_display, folder_display));
     }
     out
 }
 
 pub(crate) fn parse_ls_colors() -> ColorSpec {
+    parse_ls_colors_value(&env::var("LS_COLORS").unwrap_or_default())
+}
+
+pub(crate) fn parse_ls_colors_value(spec: &str) -> ColorSpec {
     let mut by_key = HashMap::new();
+    let mut suffix_globs = HashMap::new();
     let mut globs = Vec::new();
     let (mut color_dir, mut color_link, mut color_exec) = (
         "01;34".to_string(),
         "01;36".to_string(),
         "01;32".to_string(),
     );
-    if let Ok(spec) = env::var("LS_COLORS") {
-        for entry in spec.split(':') {
-            if let Some((k, v)) = entry.split_once('=') {
-                if k.starts_with('*') {
-                    let mut rx = String::from("^");
-                    for ch in k.chars() {
-                        match ch {
-                            '*' => rx.push_str(".*"),
-                            '?' => rx.push('.'),
-                            '.' | '+' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|'
-                            | '\\' => {
-                                rx.push('\\');
-                                rx.push(ch);
-                            }
-                            _ => rx.push(ch),
+    for (order, entry) in spec.split(':').enumerate() {
+        if let Some((k, v)) = entry.split_once('=') {
+            if let Some(suffix) = k.strip_prefix('*') {
+                if !suffix.contains(['*', '?', '\\']) {
+                    suffix_globs
+                        .entry(suffix.to_string())
+                        .or_insert_with(|| (order, v.to_string()));
+                    continue;
+                }
+                let mut rx = String::from("^");
+                for ch in k.chars() {
+                    match ch {
+                        '*' => rx.push_str(".*"),
+                        '?' => rx.push('.'),
+                        '.' | '+' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|' | '\\' => {
+                            rx.push('\\');
+                            rx.push(ch);
                         }
+                        _ => rx.push(ch),
                     }
-                    rx.push('$');
-                    if let Ok(re) = Regex::new(&rx) {
-                        globs.push((re, v.to_string()));
-                    }
-                } else {
-                    by_key.insert(k.to_string(), v.to_string());
-                    match k {
-                        "di" => color_dir = v.to_string(),
-                        "ln" => color_link = v.to_string(),
-                        "ex" => color_exec = v.to_string(),
-                        _ => {}
-                    }
+                }
+                rx.push('$');
+                if let Ok(re) = Regex::new(&rx) {
+                    globs.push((order, re, v.to_string()));
+                }
+            } else {
+                by_key.insert(k.to_string(), v.to_string());
+                match k {
+                    "di" => color_dir = v.to_string(),
+                    "ln" => color_link = v.to_string(),
+                    "ex" => color_exec = v.to_string(),
+                    _ => {}
                 }
             }
         }
     }
     ColorSpec {
         by_key,
+        suffix_globs,
         globs,
         color_prefix_dir: "38;2;255;255;255".to_string(),
         color_dir,
@@ -611,6 +609,7 @@ pub(crate) fn parse_ls_colors() -> ColorSpec {
 pub(crate) fn default_color_spec() -> ColorSpec {
     ColorSpec {
         by_key: HashMap::new(),
+        suffix_globs: HashMap::new(),
         globs: Vec::new(),
         color_prefix_dir: "38;2;255;255;255".to_string(),
         color_dir: "01;34".to_string(),
@@ -619,37 +618,59 @@ pub(crate) fn default_color_spec() -> ColorSpec {
     }
 }
 
-pub(crate) fn color_code_for_path(res: &SearchResult, colors: &ColorSpec) -> String {
+pub(crate) fn color_code_for_path<'a>(
+    res: &SearchResult,
+    colors: &'a ColorSpec,
+) -> Option<&'a str> {
     let ln_code = colors
         .by_key
         .get("ln")
-        .cloned()
-        .unwrap_or_else(|| colors.color_link.clone());
+        .map(String::as_str)
+        .unwrap_or(colors.color_link.as_str());
     let symlink_target_mode = res.is_symlink && ln_code == "target";
     if res.is_symlink && !symlink_target_mode {
-        return ln_code;
+        return Some(ln_code);
     }
     if res.is_dir
         || (symlink_target_mode && res.metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false))
     {
-        return colors
-            .by_key
-            .get("di")
-            .cloned()
-            .unwrap_or_else(|| colors.color_dir.clone());
+        return Some(
+            colors
+                .by_key
+                .get("di")
+                .map(String::as_str)
+                .unwrap_or(colors.color_dir.as_str()),
+        );
     }
     let base = res.path.rsplit('/').next().unwrap_or("");
-    for (re, val) in &colors.globs {
-        if re.is_match(base) {
-            return val.clone();
+    let mut best: Option<(usize, &str)> = None;
+    let mut consider = |order: usize, code: &'a str| {
+        if best.is_none_or(|(best_order, _)| order < best_order) {
+            best = Some((order, code));
         }
+    };
+    for (start, _) in base.char_indices() {
+        if let Some((order, code)) = colors.suffix_globs.get(&base[start..]) {
+            consider(*order, code.as_str());
+        }
+    }
+    if let Some((order, code)) = colors.suffix_globs.get("") {
+        consider(*order, code.as_str());
+    }
+    for (order, re, val) in &colors.globs {
+        if re.is_match(base) {
+            consider(*order, val.as_str());
+        }
+    }
+    if let Some((_, code)) = best {
+        return Some(code);
     }
     if let Some(m) = &res.metadata {
         if m.permissions().mode() & 0o111 != 0 {
-            return colors.color_exec.clone();
+            return Some(colors.color_exec.as_str());
         }
     }
-    String::new()
+    None
 }
 
 pub(crate) fn decorator_for_res(res: &SearchResult) -> Option<char> {
@@ -784,102 +805,109 @@ pub(crate) fn encode_file_uri_path(path: &str) -> String {
     encoded
 }
 
+#[cfg(test)]
 pub(crate) fn parent_file_uri(prefix: &str, leaf_path: &str) -> String {
-    let encoded_prefix = encode_file_uri_path(prefix);
-    format!(
-        "file://{}?select={}",
-        encoded_prefix,
-        encode_file_uri_path(leaf_path)
-    )
+    let encoded_leaf = encode_file_uri_path(leaf_path);
+    parent_file_uri_encoded(prefix, &encoded_leaf)
 }
 
-pub(crate) fn render_styled_path(
-    res: &SearchResult,
-    use_style: bool,
-    add_decorator: bool,
-    colors: &ColorSpec,
-    opts: &Options,
-    highlight: Option<&HighlightSpec>,
-) -> String {
+#[cfg(test)]
+fn parent_file_uri_encoded(prefix: &str, encoded_leaf: &str) -> String {
+    let encoded_prefix = encode_file_uri_path(prefix);
+    format!("file://{}?select={}", encoded_prefix, encoded_leaf)
+}
+
+#[derive(Default)]
+pub(crate) struct RenderCache {
+    encoded_parent_paths: HashMap<String, String>,
+}
+
+pub(crate) struct RenderContext<'a> {
+    pub(crate) use_style: bool,
+    pub(crate) add_decorator: bool,
+    pub(crate) colors: &'a ColorSpec,
+    pub(crate) opts: &'a Options,
+    pub(crate) highlight: Option<&'a HighlightSpec>,
+    pub(crate) cache: &'a mut RenderCache,
+}
+
+pub(crate) fn render_styled_path(res: &SearchResult, context: &mut RenderContext<'_>) -> String {
     let mut display_path = escape_terminal_text(&res.path);
-    if add_decorator {
+    if context.add_decorator {
         if let Some(d) = decorator_for_res(res) {
             if !display_path.ends_with(d) {
-                display_path.push(d);
+                display_path.to_mut().push(d);
             }
         }
     }
+    let display_path = display_path.as_ref();
     let (prefix, leaf) = if display_path.ends_with('/') {
         let core = display_path.trim_end_matches('/');
         if let Some((p, l)) = core.rsplit_once('/') {
             (format!("{}/", p), format!("{}/", l))
         } else {
-            (String::new(), display_path.clone())
+            (String::new(), display_path.to_string())
         }
     } else if let Some((p, l)) = display_path.rsplit_once('/') {
         (format!("{}/", p), l.to_string())
     } else {
-        (String::new(), display_path.clone())
+        (String::new(), display_path.to_string())
     };
-    if !use_style {
-        let (plain_prefix, plain_leaf) = if let Some(spec) = highlight {
+    if !context.use_style {
+        let (plain_prefix, plain_leaf) = if let Some(spec) = context.highlight {
             (
                 colorize_segment_with_highlights(&prefix, None, &spec.prefix_rules),
                 colorize_segment_with_highlights(&leaf, None, &spec.leaf_rules),
             )
         } else {
-            (prefix.clone(), leaf.clone())
+            (prefix.to_string(), leaf.to_string())
         };
-        if opts.hyperlinks {
-            return hyperlink_path(&plain_prefix, &plain_leaf, &res.path);
+        if context.opts.hyperlinks {
+            return hyperlink_path(&plain_prefix, &plain_leaf, &res.path, context.cache);
         }
         return format!("{}{}", plain_prefix, plain_leaf);
     }
-    let leaf_code = color_code_for_path(res, colors);
-    let leaf_colored = if let Some(spec) = highlight {
-        colorize_segment_with_highlights(
-            &leaf,
-            if leaf_code.is_empty() {
-                None
-            } else {
-                Some(leaf_code.as_str())
-            },
-            &spec.leaf_rules,
-        )
-    } else if leaf_code.is_empty() {
-        leaf.clone()
-    } else {
+    let leaf_code = color_code_for_path(res, context.colors);
+    let leaf_colored = if let Some(spec) = context.highlight {
+        colorize_segment_with_highlights(&leaf, leaf_code, &spec.leaf_rules)
+    } else if let Some(leaf_code) = leaf_code {
         format!("\x1b[{}m{}\x1b[0m", leaf_code, leaf)
+    } else {
+        leaf.to_string()
     };
     let prefix_colored = if prefix.is_empty() {
         String::new()
-    } else if let Some(spec) = highlight {
+    } else if let Some(spec) = context.highlight {
         colorize_segment_with_highlights(
             &prefix,
-            Some(colors.color_prefix_dir.as_str()),
+            Some(context.colors.color_prefix_dir.as_str()),
             &spec.prefix_rules,
         )
     } else {
-        format!("\x1b[{}m{}\x1b[0m", colors.color_prefix_dir, prefix)
+        format!("\x1b[{}m{}\x1b[0m", context.colors.color_prefix_dir, prefix)
     };
-    let mut final_str = if prefix.is_empty() {
-        leaf_colored.clone()
+    if context.opts.hyperlinks {
+        return hyperlink_path(&prefix_colored, &leaf_colored, &res.path, context.cache);
+    }
+    if prefix.is_empty() {
+        leaf_colored
     } else {
         format!("{}{}", prefix_colored, leaf_colored)
-    };
-    if opts.hyperlinks {
-        final_str = hyperlink_path(&prefix_colored, &leaf_colored, &res.path);
     }
-    final_str
 }
 
-fn hyperlink_path(prefix: &str, leaf: &str, path: &str) -> String {
-    let mut abs_leaf = path.to_string();
-    if !abs_leaf.starts_with('/') {
-        if let Ok(cwd) = env::current_dir() {
-            abs_leaf = format!("{}/{}", cwd.display(), abs_leaf.trim_start_matches("./"));
-        }
-    }
+fn hyperlink_path(prefix: &str, leaf: &str, path: &str, render_cache: &mut RenderCache) -> String {
+    let abs_leaf = if path.starts_with('/') {
+        Cow::Borrowed(path)
+    } else if let Ok(cwd) = env::current_dir() {
+        Cow::Owned(format!(
+            "{}/{}",
+            cwd.display(),
+            path.trim_start_matches("./")
+        ))
+    } else {
+        Cow::Borrowed(path)
+    };
     let raw_leaf = abs_leaf.trim_end_matches('/');
     let raw_parent = Path::new(raw_leaf)
         .parent()
@@ -898,7 +926,11 @@ fn hyperlink_path(prefix: &str, leaf: &str, path: &str) -> String {
         )
     } else {
         let encoded_leaf = encode_file_uri_path(&abs_leaf);
-        let prefix_target = parent_file_uri(&raw_prefix, &abs_leaf);
+        let encoded_prefix = render_cache
+            .encoded_parent_paths
+            .entry(raw_prefix.clone())
+            .or_insert_with(|| encode_file_uri_path(&raw_prefix));
+        let prefix_target = format!("file://{}?select={}", encoded_prefix, encoded_leaf);
         format!(
             "\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\\x1b]8;;file://{}\x1b\\{}\x1b]8;;\x1b\\",
             prefix_target, prefix, encoded_leaf, leaf
@@ -917,10 +949,18 @@ pub(crate) fn final_transform(
 ) -> Vec<String> {
     let items = absolute_paths_transform(items, opts);
     cache_transform(&items, opts);
+    let mut render_cache = RenderCache::default();
     let add_decorators = stdout_is_tty || opts.classify;
     if opts.counts {
-        let mut lines =
-            counts_summary_transform(items, stdout_is_tty, use_style, colors, opts, highlight);
+        let mut context = RenderContext {
+            use_style,
+            add_decorator: add_decorators,
+            colors,
+            opts,
+            highlight,
+            cache: &mut render_cache,
+        };
+        let mut lines = counts_summary_transform(items, stdout_is_tty, &mut context);
         if opts.reverse {
             lines.reverse();
         }
@@ -940,40 +980,25 @@ pub(crate) fn final_transform(
     if opts.reverse {
         items.reverse();
     }
+    let mut context = RenderContext {
+        use_style,
+        add_decorator: add_decorators,
+        colors,
+        opts,
+        highlight,
+        cache: &mut render_cache,
+    };
     if opts.sizes {
-        return sizes_transform(
-            items,
-            opts,
-            cache,
-            use_style,
-            add_decorators,
-            colors,
-            highlight,
-        );
+        return sizes_transform(items, cache, &mut context);
     }
     let mut out = Vec::new();
     if opts.long_format {
-        for item_str in add_info_transform(
-            items,
-            opts,
-            cache,
-            use_style,
-            add_decorators,
-            colors,
-            highlight,
-        ) {
+        for item_str in add_info_transform(items, cache, &mut context) {
             out.push(item_str);
         }
     } else {
         for res in items {
-            out.push(render_styled_path(
-                &res,
-                use_style,
-                add_decorators,
-                colors,
-                opts,
-                highlight,
-            ));
+            out.push(render_styled_path(&res, &mut context));
         }
     }
     out

@@ -48,7 +48,8 @@ pub(crate) fn write_snapshot_cache(path: &Path, lines: &[String]) -> io::Result<
             .open(&tmp)?;
         let mut writer = BufWriter::with_capacity(128 * 1024, file);
         for line in lines {
-            writeln!(writer, "{}", line)?;
+            writer.write_all(line.as_bytes())?;
+            writer.write_all(b"\n")?;
         }
         writer.flush()?;
         writer.get_ref().sync_all()?;

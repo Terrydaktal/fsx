@@ -119,6 +119,9 @@ Arguments:
     covers the requested search root. Otherwise it performs the normal live
     filesystem scan. This is intended for shell functions that need an
     automatic indexed-or-scan fallback.
+    Recursive directory sizes use SQL aggregation when that clean index has a
+    stored size for every regular file in the subtree; incomplete subtrees
+    fall back to the live filesystem size walker.
     Full-path (-F) searches use the same fallback automatically when a clean
     watcher covers the root; --index-if-watched remains available explicitly.
   - --index-binary writes --index results as repeated little-endian
@@ -806,7 +809,10 @@ pub(crate) fn cli_main() -> ExitCode {
                 let stdout = io::stdout();
                 let mut lock = BufWriter::with_capacity(128 * 1024, stdout.lock());
                 for line in run.lines {
-                    if let Err(error) = writeln!(lock, "{}", line) {
+                    if let Err(error) = lock
+                        .write_all(line.as_bytes())
+                        .and_then(|_| lock.write_all(b"\n"))
+                    {
                         eprintln!("unearth: failed to write output: {error}");
                         return ExitCode::from(1);
                     }

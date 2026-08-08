@@ -1,6 +1,8 @@
 use super::*;
 use rusqlite::Connection;
 use std::borrow::Cow;
+use std::io::Write;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -50,6 +52,54 @@ fn base_opts() -> Options {
         path_override: None,
         positional: Vec::new(),
     }
+}
+
+#[test]
+fn incompatible_daemon_query_response_requests_local_fallback() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    server.write_all(b"UNRS0001").unwrap();
+    drop(server);
+
+    assert!(begin_query_results(client).unwrap().is_none());
+}
+
+#[test]
+fn current_daemon_query_response_starts_record_reader() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    server.write_all(QUERY_RESPONSE_MAGIC).unwrap();
+    server.write_all(&[0]).unwrap();
+    drop(server);
+
+    assert!(begin_query_results(client).unwrap().is_some());
+}
+
+#[test]
+fn ls_colors_suffix_rules_preserve_first_match_precedence() {
+    let colors = parse_ls_colors_value(
+        "*boggle*=complex:*.rs=suffix:*.tar.gz=archive:di=dir:ln=link:ex=exec",
+    );
+    let result = |path: &str| SearchResult {
+        path: path.to_string(),
+        is_dir: false,
+        is_symlink: false,
+        metadata: None,
+        indexed_activity_nanos: None,
+        indexed_size: None,
+    };
+
+    assert_eq!(
+        color_code_for_path(&result("boggle.rs"), &colors),
+        Some("complex")
+    );
+    assert_eq!(
+        color_code_for_path(&result("notes.rs"), &colors),
+        Some("suffix")
+    );
+    assert_eq!(
+        color_code_for_path(&result("archive.tar.gz"), &colors),
+        Some("archive")
+    );
+    assert_eq!(color_code_for_path(&result("plain"), &colors), None);
 }
 
 #[test]
@@ -190,6 +240,80 @@ fn index_batch_insert_is_idempotent_for_live_entries() {
         )
         .unwrap();
     assert_eq!(row, (11, 22, 33, 4, 99));
+}
+
+#[test]
+fn indexed_directory_stats_aggregate_complete_subtrees() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE dirs (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
+         CREATE TABLE entries (
+             id INTEGER PRIMARY KEY,
+             dir_id INTEGER NOT NULL,
+             kind INTEGER NOT NULL,
+             size INTEGER
+         );
+         CREATE INDEX idx_entries_dir ON entries(dir_id);
+         INSERT INTO dirs(id, path) VALUES (1, '/root'), (2, '/root/nested');
+         INSERT INTO entries(id, dir_id, kind, size) VALUES
+             (1, 1, 0, 5),
+             (2, 1, 1, 4096),
+             (3, 2, 0, 7),
+             (4, 2, 2, 11);",
+    )
+    .unwrap();
+
+    let mut opts = base_opts();
+    opts.sizes = true;
+    let items = vec![SearchResult {
+        path: "/root/".to_string(),
+        is_dir: true,
+        is_symlink: false,
+        metadata: None,
+        indexed_activity_nanos: None,
+        indexed_size: None,
+    }];
+    let mut cache = DirStatsCache::default();
+
+    populate_indexed_dirsize_cache(&conn, "/root", &items, &opts, &mut cache).unwrap();
+
+    assert_eq!(cache.bytes_map.get("/root"), Some(&12));
+    assert_eq!(cache.map.get("/root").map(|stats| stats.files), Some(2));
+}
+
+#[test]
+fn indexed_directory_stats_skip_subtrees_with_missing_sizes() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE dirs (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
+         CREATE TABLE entries (
+             id INTEGER PRIMARY KEY,
+             dir_id INTEGER NOT NULL,
+             kind INTEGER NOT NULL,
+             size INTEGER
+         );
+         CREATE INDEX idx_entries_dir ON entries(dir_id);
+         INSERT INTO dirs(id, path) VALUES (1, '/root');
+         INSERT INTO entries(id, dir_id, kind, size) VALUES (1, 1, 0, NULL);",
+    )
+    .unwrap();
+
+    let mut opts = base_opts();
+    opts.sizes = true;
+    let items = vec![SearchResult {
+        path: "/root/".to_string(),
+        is_dir: true,
+        is_symlink: false,
+        metadata: None,
+        indexed_activity_nanos: None,
+        indexed_size: None,
+    }];
+    let mut cache = DirStatsCache::default();
+
+    populate_indexed_dirsize_cache(&conn, "/root", &items, &opts, &mut cache).unwrap();
+
+    assert!(!cache.bytes_map.contains_key("/root"));
+    assert!(!cache.map.contains_key("/root"));
 }
 
 #[test]

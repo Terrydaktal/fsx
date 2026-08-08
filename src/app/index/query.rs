@@ -8,6 +8,76 @@ use std::os::unix::fs::FileTypeExt;
 
 const QUERY_CONSUMER_STOP: &str = "unearth query consumer stopped after limit";
 
+fn needs_recursive_indexed_dirsize(opts: &Options) -> bool {
+    opts.sizes
+        || opts.long_extended
+        || matches!(opts.sort_field, Some(SortField::Size) if !opts.no_recurse)
+}
+
+/// Populate the presentation cache from a clean watcher-backed index.
+///
+/// A missing regular-file size makes a subtree unsafe to aggregate, so that
+/// subtree is deliberately left uncached and the existing filesystem walker
+/// remains the fallback.
+pub(crate) fn populate_indexed_dirsize_cache(
+    conn: &Connection,
+    root_key: &str,
+    items: &[SearchResult],
+    opts: &Options,
+    cache: &mut DirStatsCache,
+) -> Result<(), String> {
+    if !needs_recursive_indexed_dirsize(opts) {
+        return Ok(());
+    }
+
+    let root_prefix = index_path_prefix(root_key);
+    let mut needed_dirs = items
+        .iter()
+        .filter(|item| should_use_recursive_dirsize(item, opts))
+        .map(|item| normalize_dir_key(&item.path))
+        .filter(|path| !should_skip_root_size_tree(path))
+        .filter(|path| path == root_key || path.starts_with(&root_prefix))
+        .collect::<Vec<_>>();
+    needed_dirs.sort_unstable();
+    needed_dirs.dedup();
+
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT
+                 COALESCE(SUM(CASE WHEN e.kind = 0 THEN e.size ELSE 0 END), 0),
+             COALESCE(SUM(CASE WHEN e.kind = 0 THEN 1 ELSE 0 END), 0),
+             COALESCE(SUM(CASE WHEN e.kind = 0 AND e.size IS NULL THEN 1 ELSE 0 END), 0)
+             FROM dirs d
+             JOIN entries e INDEXED BY idx_entries_dir ON e.dir_id = d.id
+             WHERE d.path = ?1 OR (d.path >= ?2 AND d.path < ?3)",
+        )
+        .map_err(|e| e.to_string())?;
+
+    for path in needed_dirs {
+        let prefix = index_path_prefix(&path);
+        let prefix_end = format!("{}0", prefix.trim_end_matches('/'));
+        let (bytes, files, missing_sizes): (i64, i64, i64) = stmt
+            .query_row(rusqlite::params![path, prefix, prefix_end], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(|e| e.to_string())?;
+        if missing_sizes != 0 {
+            continue;
+        }
+        let bytes =
+            u64::try_from(bytes).map_err(|_| "indexed directory size overflow".to_string())?;
+        let files = u64::try_from(files).map_err(|_| "indexed file count overflow".to_string())?;
+        let stats = DirStats {
+            files,
+            bytes,
+            human: format_size_iec(bytes),
+        };
+        cache.bytes_map.insert(path.clone(), bytes);
+        cache.map.insert(path, stats);
+    }
+    Ok(())
+}
+
 pub(crate) fn write_binary_path_record<W: Write>(writer: &mut W, path: &str) -> io::Result<()> {
     let len = u32::try_from(path.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "path too long"))?;
@@ -272,6 +342,10 @@ pub(crate) fn run_recent_indexed(
         }
     });
     results.truncate(limit);
+
+    if live {
+        let _ = populate_indexed_dirsize_cache(&conn, &root_key, &results, opts, cache);
+    }
 
     Ok(SearchRun {
         lines: final_transform(results, opts, use_style, stdout_is_tty, colors, cache, None),
@@ -576,21 +650,31 @@ where
     Ok(())
 }
 
-pub(crate) fn read_query_results<F>(stream: UnixStream, mut emit: F) -> Result<(), String>
-where
-    F: FnMut(SearchResult) -> Result<(), String>,
-{
+pub(crate) fn begin_query_results(
+    stream: UnixStream,
+) -> Result<Option<BufReader<UnixStream>>, String> {
     let mut reader = BufReader::new(stream);
     let mut magic = [0u8; 8];
-    reader.read_exact(&mut magic).map_err(|e| e.to_string())?;
-    if &magic != QUERY_RESPONSE_MAGIC {
-        return Err("invalid unearth query response header".to_string());
+    if reader.read_exact(&mut magic).is_err() || &magic != QUERY_RESPONSE_MAGIC {
+        return Ok(None);
     }
     let mut status = [0u8; 1];
-    reader.read_exact(&mut status).map_err(|e| e.to_string())?;
+    if reader.read_exact(&mut status).is_err() {
+        return Ok(None);
+    }
     if status[0] != 0 {
         return Err(read_query_string(&mut reader)?);
     }
+    Ok(Some(reader))
+}
+
+pub(crate) fn read_query_results<F>(
+    reader: &mut BufReader<UnixStream>,
+    mut emit: F,
+) -> Result<(), String>
+where
+    F: FnMut(SearchResult) -> Result<(), String>,
+{
     loop {
         let mut length = [0u8; 4];
         reader.read_exact(&mut length).map_err(|e| e.to_string())?;
@@ -669,6 +753,10 @@ pub(crate) fn run_indexed_via_daemon(
     if write_query_request(&mut stream, opts, &root, &terms).is_err() {
         return Ok(None);
     }
+    let mut reader = match begin_query_results(stream)? {
+        Some(reader) => reader,
+        None => return Ok(None),
+    };
     let stdout_is_tty = io::stdout().is_terminal();
     let use_style = style_enabled(opts, stdout_is_tty);
     if opts.recent_limit.is_none() && can_stream_direct(opts, use_style) {
@@ -680,7 +768,7 @@ pub(crate) fn run_indexed_via_daemon(
             None
         };
         let mut emitted = 0usize;
-        let result = read_query_results(stream, |result| {
+        let result = read_query_results(&mut reader, |result| {
             if opts.limit.is_some_and(|limit| emitted >= limit) {
                 return Err(QUERY_CONSUMER_STOP.to_string());
             }
@@ -714,7 +802,7 @@ pub(crate) fn run_indexed_via_daemon(
         }));
     }
     let mut results = Vec::new();
-    read_query_results(stream, |result| {
+    read_query_results(&mut reader, |result| {
         results.push(result);
         Ok(())
     })
@@ -739,6 +827,7 @@ pub(crate) fn run_indexed_via_daemon(
     } else {
         results.sort_by(|a, b| a.path.cmp(&b.path));
     }
+    let _ = populate_indexed_dirsize_cache(&status_conn, &root_key, &results, opts, cache);
     Ok(Some(SearchRun {
         lines: final_transform(results, opts, use_style, stdout_is_tty, colors, cache, None),
         timed_out: false,
@@ -782,7 +871,8 @@ pub(crate) fn run_indexed(
     let fts_ready = index_search_is_ready(&conn);
     let covering_root = covering_index_root(&conn, &root_key)?;
     let refresh_root = covering_root.as_deref().unwrap_or(&root_key);
-    if !watch_state_covers_root(&conn, &root_key)? {
+    let clean_index = watch_state_covers_root(&conn, &root_key)?;
+    if !clean_index {
         spawn_index_refresh(refresh_root, opts, covering_root.is_none());
     }
     let stdout_is_tty = io::stdout().is_terminal();
@@ -964,6 +1054,9 @@ pub(crate) fn run_indexed(
         });
     }
     results.sort_by(|a, b| a.path.cmp(&b.path));
+    if clean_index {
+        let _ = populate_indexed_dirsize_cache(&conn, &root_key, &results, opts, cache);
+    }
     Ok(SearchRun {
         lines: final_transform(results, opts, use_style, stdout_is_tty, colors, cache, None),
         timed_out: false,

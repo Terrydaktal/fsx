@@ -82,6 +82,12 @@ run under a supervisor such as the user service in `systemd/unearthd.service`. T
 When a clean watcher covers the requested root, `--full` searches automatically query the daemon's
 Unix socket. If no daemon covers the root, Unearth falls back to its normal filesystem scan.
 
+For indexed searches that request recursive directory sizes (`--sizes` or `-L`), Unearth aggregates
+the stored regular-file sizes directly in SQLite while the watcher is clean. If the watcher is
+dirty, absent, or any regular-file size in a requested subtree is missing, that subtree uses the
+existing live filesystem walker instead, preserving size correctness during refreshes and partial
+indexes.
+
 Unearth starts the event backend before the initial scan so changes made during that scan are not
 lost. It prefers fanotify file-handle events when the kernel permits filesystem marks. Without the
 required permission or filesystem support it falls back to recursive inotify. Inotify needs one
