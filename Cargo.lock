@@ -662,6 +662,7 @@ version = "0.9.3"
 dependencies = [
  "chrono",
  "crossbeam-channel",
+ "jemalloc-sys",
  "jemallocator",
  "jwalk",
  "libc",

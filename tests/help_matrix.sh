@@ -89,7 +89,7 @@ DIR_ROOT="${TMP_BASE}/dir_root"
 SD_BASE="${TMP_BASE}/search_dir_root"
 TOKEN="sdtok_${RANDOM}_$$"
 NEEDLE="needle_${RANDOM}_$$"
-trap 'rm -rf "$TMP_BASE"' EXIT
+trap '/usr/bin/rm -rf -- "$TMP_BASE"' EXIT
 
 mkdir -p "$FILE_ROOT" "$DIR_ROOT"
 touch "${FILE_ROOT}/abc" "${FILE_ROOT}/xabc" "${FILE_ROOT}/abcx" "${FILE_ROOT}/xabcx" "${FILE_ROOT}/x.tecneq"
@@ -280,7 +280,7 @@ mkdir -p "$SIZES_FILE_ROOT"
 dd if=/dev/zero of="${SIZES_FILE_ROOT}/large.bin" bs=1 count=512 status=none
 dd if=/dev/zero of="${SIZES_FILE_ROOT}/small.bin" bs=1 count=128 status=none
 sizes_file_desc="$("$F" --timeout "$F_TIMEOUT" --sizes --sort size desc -f '*' "$SIZES_FILE_ROOT" 2>/dev/null | sed "s#\t${SIZES_FILE_ROOT}/#\t#")"
-want_sizes_file_desc=$'512B\tlarge.bin\n128B\tsmall.bin'
+want_sizes_file_desc=$'512.0B\tlarge.bin\n128.0B\tsmall.bin'
 assert_eq "sizes reports file values" "$sizes_file_desc" "$want_sizes_file_desc"
 
 # SORT MATRIX: name
@@ -366,16 +366,35 @@ counts_color_out="$("$F" --timeout "$F_TIMEOUT" hit "$COUNTS_ROOT" --counts --co
 assert_contains "counts output colors folder column when requested" "$counts_color_out" $'\033['
 counts_link_out="$("$F" --timeout "$F_TIMEOUT" hit "$COUNTS_ROOT" --counts --color=always --hyperlink 2>/dev/null)"
 assert_contains "counts output hyperlinks folder column when requested" "$counts_link_out" $'\033]8;;file://'
+plain_link_out="$("$F" --timeout "$F_TIMEOUT" abc "$FILE_ROOT" --color=never --hyperlink 2>/dev/null)"
+assert_contains "hyperlinks work independently of color" "$plain_link_out" $'\033]8;;file://'
 
 threads_err="$("$F" --timeout "$F_TIMEOUT" --threads 0 abc "$NONREC_ROOT" 2>&1 >/dev/null || true)"
 assert_contains "threads invalid value errors" "$threads_err" "--threads requires a positive integer"
 
+missing_timeout_err="$("$F" --timeout 2>&1 >/dev/null || true)"
+assert_contains "timeout missing value errors" "$missing_timeout_err" "--timeout requires a duration"
+missing_sort_err="$("$F" --sort 2>&1 >/dev/null || true)"
+assert_contains "sort missing value errors" "$missing_sort_err" "--sort requires a field"
+unknown_option_err="$("$F" --not-a-real-option abc "$NONREC_ROOT" 2>&1 >/dev/null || true)"
+assert_contains "unknown options error" "$unknown_option_err" "Unknown option"
+invalid_regex_err="$("$F" -F -r '[' "$NONREC_ROOT" 2>&1 >/dev/null || true)"
+assert_contains "invalid regex errors" "$invalid_regex_err" "Invalid regex"
+binary_mode_err="$("$F" --index-binary --long '*' "$NONREC_ROOT" 2>&1 >/dev/null || true)"
+assert_contains "binary mode rejects text options" "$binary_mode_err" "--index-binary cannot be combined"
+if ! "$F" / "$NONREC_ROOT" >/dev/null 2>&1; then
+  echo "FAIL: slash pattern should not panic" >&2
+  exit 1
+fi
+
 # CACHE-RAW MATRIX
 CACHE_USER="unearth_cache_test_${RANDOM}_$$"
 CACHE_FISH_PID="424242"
-CACHE_ROOT="/tmp/fzf-history-${CACHE_USER}"
-rm -rf "$CACHE_ROOT"
-cache_raw_out="$(USER="$CACHE_USER" FISH_PID="$CACHE_FISH_PID" "$F" --timeout "$F_TIMEOUT" --cache-raw abc -f "$FILE_ROOT" 2>/dev/null | sed "s#^${FILE_ROOT}/##" | sort)"
+XDG_RUNTIME_TEST="${TMP_BASE}/runtime"
+CACHE_ROOT="${XDG_RUNTIME_TEST}/unearth"
+/usr/bin/mkdir -p -- "$XDG_RUNTIME_TEST"
+/usr/bin/rm -rf -- "$CACHE_ROOT"
+cache_raw_out="$(USER="$CACHE_USER" FISH_PID="$CACHE_FISH_PID" XDG_RUNTIME_DIR="$XDG_RUNTIME_TEST" "$F" --timeout "$F_TIMEOUT" --cache-raw abc -f "$FILE_ROOT" 2>/dev/null | sed "s#^${FILE_ROOT}/##" | sort)"
 assert_eq "cache-raw output unchanged" "$cache_raw_out" "$want_contains"
 cache_raw_dirs_file="${CACHE_ROOT}/universal-last-dirs-${CACHE_FISH_PID}"
 cache_raw_files_file="${CACHE_ROOT}/universal-last-files-${CACHE_FISH_PID}"
@@ -383,12 +402,12 @@ cache_raw_saved_files="$(sed "s#^${FILE_ROOT}/##" "$cache_raw_files_file" | sort
 assert_eq "cache-raw writes files cache" "$cache_raw_saved_files" "$want_contains"
 cache_raw_saved_dirs_from_file="$(sort "$cache_raw_dirs_file")"
 assert_eq "cache-raw writes parent dir for file search" "$cache_raw_saved_dirs_from_file" "${FILE_ROOT}/"
-USER="$CACHE_USER" FISH_PID="$CACHE_FISH_PID" "$F" --timeout "$F_TIMEOUT" --cache-raw abc -d "$DIR_ROOT" >/dev/null 2>&1
+USER="$CACHE_USER" FISH_PID="$CACHE_FISH_PID" XDG_RUNTIME_DIR="$XDG_RUNTIME_TEST" "$F" --timeout "$F_TIMEOUT" --cache-raw abc -d "$DIR_ROOT" >/dev/null 2>&1
 cache_raw_saved_dirs="$(sort "$cache_raw_dirs_file")"
 want_cache_raw_dirs=$(printf '%s\n' "${DIR_ROOT}/" "${DIR_ROOT}/abc/" "${DIR_ROOT}/abcx/" "${DIR_ROOT}/xabc/" "${DIR_ROOT}/xabcx/" | sort)
 assert_eq "cache-raw writes dirs cache (matches + parent)" "$cache_raw_saved_dirs" "$want_cache_raw_dirs"
 assert_eq "cache-raw files cache empty for dir search" "$(cat "$cache_raw_files_file")" ""
-rm -rf "$CACHE_ROOT"
+/usr/bin/rm -rf -- "$CACHE_ROOT"
 cache_legacy_err="$("$F" --timeout "$F_TIMEOUT" --cache abc "$FILE_ROOT" 2>&1 >/dev/null || true)"
 assert_contains "legacy cache flag errors" "$cache_legacy_err" "--cache was renamed to --cache-raw"
 
@@ -405,11 +424,14 @@ assert_eq "hidden flag includes hidden entries" "$(list_rel "$VISIBLE_ROOT" '*hi
 IGNORE_ROOT="${TMP_BASE}/ignore_root"
 mkdir -p "$IGNORE_ROOT"
 touch "${IGNORE_ROOT}/ignore_me" "${IGNORE_ROOT}/keep_me"
-printf 'ignore_me\n' > "${IGNORE_ROOT}/.gitignore"
+mkdir -p "${IGNORE_ROOT}/nested"
+touch "${IGNORE_ROOT}/nested/inherited_ignore" "${IGNORE_ROOT}/nested/inherited_keep"
+printf 'ignore_me\ninherited_ignore\n' > "${IGNORE_ROOT}/.gitignore"
 git -C "$IGNORE_ROOT" init -q
 want_ignore_default='ignore_me'
 assert_eq "default bypasses gitignore" "$(list_rel "$IGNORE_ROOT" ignore_me -f)" "$want_ignore_default"
 assert_eq "ignore respects gitignore" "$(list_rel "$IGNORE_ROOT" ignore_me -f --ignore)" ""
+assert_eq "ignore rules are inherited by descendants" "$(list_rel "$IGNORE_ROOT" inherited_ignore -f --ignore)" ""
 
 # FOLLOW-LINKS MATRIX
 FOLLOW_ROOT="${TMP_BASE}/follow_root"
@@ -419,6 +441,12 @@ touch "${FOLLOW_EXTERNAL}/follow_only"
 ln -s "$FOLLOW_EXTERNAL" "${FOLLOW_ROOT}/linked_dir"
 assert_eq "no follow-links does not traverse symlinked dirs" "$(list_rel "$FOLLOW_ROOT" follow_only -f)" ""
 assert_eq "follow-links traverses symlinked dirs" "$(list_rel "$FOLLOW_ROOT" follow_only -f --follow-links)" "linked_dir/follow_only"
+FOLLOW_CYCLE_ROOT="${TMP_BASE}/follow_cycle_root"
+mkdir -p "${FOLLOW_CYCLE_ROOT}/a" "${FOLLOW_CYCLE_ROOT}/b"
+touch "${FOLLOW_CYCLE_ROOT}/a/cycle_marker"
+ln -s ../b "${FOLLOW_CYCLE_ROOT}/a/to_b"
+ln -s ../a "${FOLLOW_CYCLE_ROOT}/b/to_a"
+assert_eq "follow-links stops canonical directory cycles" "$(list_rel "$FOLLOW_CYCLE_ROOT" cycle_marker -f --follow-links)" $'a/cycle_marker\nb/to_a/cycle_marker'
 
 # RECURSION + SIZE SORT MATRIX (fast non-recursive size key for dirs)
 NONREC_SIZE_ROOT="${TMP_BASE}/nonrec_size_root"

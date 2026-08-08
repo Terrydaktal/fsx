@@ -6,7 +6,32 @@ Build:
 
 ```bash
 cargo build --release
+cargo build --release --features watcher --bin unearthd
 ```
+
+The default release build produces the short-lived `unearth` client without watcher-only code.
+Build `unearthd` with the `watcher` feature when installing the live index service.
+
+## Source structure
+
+`src/app.rs` is the small composition root. The responsibility boundaries are:
+
+- `src/app/model.rs`: shared data types and time conversion helpers.
+- `src/app/cli.rs`: argument parsing, help text, and binary entry-point dispatch.
+- `src/app/patterns.rs`: wildcard, regex, quote, and implicit-path parsing.
+- `src/app/filesystem.rs`: recursive walking, mount detection, NTFS sizing, and thread policy.
+- `src/app/presentation.rs`: sizes, sorting, colors, hyperlinks, highlighting, and output transforms.
+- `src/app/search.rs`: live filesystem search orchestration.
+- `src/app/index/storage.rs`: SQLite, pooled-path storage, manifests, and sidecars.
+- `src/app/index/refresh.rs`: scans, fingerprints, diffs, refreshes, and purge operations.
+- `src/app/index/query.rs`: indexed/recent queries and result streaming.
+- `src/app/index/protocol.rs`: the private `unearthd` Unix-socket protocol.
+- `src/app/index/snapshot.rs`: the legacy per-query snapshot cache compatibility layer.
+- `src/app/watcher.rs`: the feature-gated fanotify/inotify event state machine and metrics.
+- `tests/live_watcher.sh`: temporary-tree integration and event-flood test for live updates.
+
+The default client does not compile the watcher subsystem. `unearthd` is built with the
+`watcher` feature and owns the shared live index.
 
 ## Indexed fast-start snapshots
 
@@ -47,8 +72,15 @@ The live index uses the same pooled SQLite database; it does not create a second
 Friz-specific cache. Start it in the foreground with one or more roots:
 
 ```bash
-unearth --watch /home /media
+unearthd /home /media
 ```
+
+`unearthd` is the dedicated long-running index owner. It stays in the foreground and should be
+run under a supervisor such as the user service in `systemd/unearthd.service`. The legacy
+`unearth --watch ...` form remains accepted for compatibility.
+
+When a clean watcher covers the requested root, `--full` searches automatically query the daemon's
+Unix socket. If no daemon covers the root, Unearth falls back to its normal filesystem scan.
 
 Unearth starts the event backend before the initial scan so changes made during that scan are not
 lost. It prefers fanotify file-handle events when the kernel permits filesystem marks. Without the
@@ -85,12 +117,30 @@ unearth --watch-status
 Collect one-second resource samples for a watcher with:
 
 ```bash
-unearth --watch --watch-metrics "$HOME/.cache/unearth/home-metrics.tsv" "$HOME"
+unearthd --watch-metrics "$HOME/.cache/unearth/home-metrics.tsv" "$HOME"
 ```
 
 The TSV contains current RSS and virtual memory, cumulative user/system CPU time, interval CPU
 percentage, thread count, event counters, and scan/database timings. It is truncated when the
 watcher starts and flushed after every sample, so it can be inspected while the watcher runs.
+
+Run the repeatable live-watcher integration test against a temporary tree:
+
+```bash
+tests/live_watcher.sh
+UNEARTH_LIVE_STRESS_COUNT=100000 UNEARTH_LIVE_OVERFLOW_COUNT=50000 tests/live_watcher.sh
+UNEARTH_LIVE_CANCEL_COUNT=20000 tests/live_watcher.sh
+```
+
+The test verifies initial indexing, newly-created directory trees, rename and recursive removal,
+the selected fanotify/inotify backend, and metrics output. If `UNEARTH_LIVE_OVERFLOW_COUNT` is
+larger than the kernel inotify queue, it pauses the daemon while flooding a pre-watched directory
+and verifies recorded overflow recovery. `UNEARTH_LIVE_CANCEL_COUNT` creates a large startup tree,
+terminates the daemon during startup, and verifies that it exits cleanly. An unprivileged run
+normally exercises the inotify fallback; fanotify selection requires the permissions available to
+the daemon. Mounted drive add/remove testing should be performed separately on a disposable test
+mount because it requires mount privileges and the watcher polls mount coverage rather than creating
+mounts itself.
 
 For a compact summary of a completed report:
 
@@ -106,13 +156,27 @@ Run from this repo:
 
 ```bash
 ./target/release/unearth --help
+./target/release/unearthd --help
 ```
 
 Install to your PATH:
 
 ```bash
 ln -sfn "$PWD/target/release/unearth" ~/.local/bin/unearth
+ln -sfn "$PWD/target/release/unearthd" ~/.local/bin/unearthd
 ```
+
+Install the optional user service to start the home watcher with the user session:
+
+```bash
+mkdir -p ~/.config/systemd/user
+ln -sfn "$PWD/systemd/unearthd.service" ~/.config/systemd/user/unearthd.service
+systemctl --user daemon-reload
+systemctl --user enable --now unearthd.service
+```
+
+The service can be inspected with `systemctl --user status unearthd` and the indexed state can be
+queried independently with `unearth --watch-status`.
 
 ```
 A parallel recursive file searcher
@@ -307,10 +371,9 @@ Options:
       directory paths. Existing databases build these indexes once on the first
       indexed query after upgrading, which increases that same database's size.
   --watch ROOT ...
-      Perform an initial scan and continuously update the pooled database from
-      fanotify filesystem or recursive inotify events. Runs in the foreground,
-      records heartbeat/recovery state, and replaces an existing live watcher
-      for the same root after asking it to stop gracefully.
+      Compatibility alias for the separate unearthd daemon. Perform an initial
+      scan and continuously update the pooled database from fanotify filesystem
+      or recursive inotify events.
   --watch-status
       Print persisted watcher backend, state, generation, and recovery status.
   --watch-metrics FILE

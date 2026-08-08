@@ -1,16 +1,20 @@
 use super::*;
 use crossbeam_channel::{bounded, Receiver, Sender};
-use jwalk::{Parallelism, WalkDir};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{CString, OsStr};
+use std::fs::{self, File};
+use std::io::{self, BufWriter, Write};
 use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicU64;
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use rayon::ThreadPoolBuilder;
 
 const EVENT_CREATE: i64 = 1;
 const EVENT_MODIFY: i64 = 2;
@@ -436,6 +440,13 @@ enum Action {
     Overflow,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IndexedPathState {
+    Missing,
+    NonDirectory,
+    Directory,
+}
+
 #[derive(Clone, Debug)]
 struct FsEvent {
     action: Action,
@@ -445,6 +456,7 @@ struct FsEvent {
     actor: Actor,
     event_kind: i64,
     at: i64,
+    scanned_entries: Option<Arc<Vec<ScannedIndexEntry>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -452,6 +464,9 @@ struct RootState {
     key: String,
     path: PathBuf,
 }
+
+type InitialScans = HashMap<String, Vec<ScannedIndexEntry>>;
+type StartedBackend = (Receiver<FsEvent>, String, Option<String>, InitialScans);
 
 #[derive(Clone, Debug)]
 struct WatcherOwner {
@@ -497,7 +512,7 @@ fn owner_is_alive(pid: Option<i64>, boot_id: Option<&str>, starttime: Option<i64
 }
 
 fn stop_existing_watchers(roots: &[RootState]) -> Result<(), String> {
-    let conn = open_index_db()?;
+    let conn = open_index_db_writer()?;
     let current = current_owner();
     let mut owners = Vec::new();
     for root in roots {
@@ -565,7 +580,7 @@ fn stop_existing_watchers(roots: &[RootState]) -> Result<(), String> {
 fn claim_watch_states(roots: &[RootState]) -> Result<(), String> {
     stop_existing_watchers(roots)?;
     let owner = current_owner();
-    let conn = open_index_db()?;
+    let conn = open_index_db_writer()?;
     let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
     for root in roots {
         let existing: Option<ExistingOwner> = tx
@@ -625,7 +640,9 @@ fn heartbeat_states(
     let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
     for root in roots {
         tx.execute(
-            "UPDATE watch_state SET backend=?2, heartbeat=?3, watcher_pid=?4
+            "UPDATE watch_state SET backend=?2, heartbeat=?3, watcher_pid=?4,
+                 status=CASE WHEN dirty=0 THEN 'running' ELSE status END,
+                 online=1, error=CASE WHEN dirty=0 THEN NULL ELSE error END
              WHERE root=?1 AND owner_boot_id=?5 AND owner_starttime=?6",
             params![
                 root.key,
@@ -643,14 +660,24 @@ fn heartbeat_states(
 
 fn shutdown_states(roots: &[RootState]) {
     let owner = current_owner();
-    if let Ok(conn) = open_index_db() {
+    if let Ok(conn) = open_index_db_writer() {
         for root in roots {
             let _ = conn.execute(
-                "UPDATE watch_state SET status='stopped', online=0, dirty=0,
-                 error=NULL WHERE root=?1 AND owner_boot_id=?2 AND owner_starttime=?3",
+                "UPDATE watch_state SET status='stopped', online=0, dirty=0
+                 WHERE root=?1 AND owner_boot_id=?2 AND owner_starttime=?3",
                 params![root.key, owner.boot_id, owner.starttime],
             );
         }
+    }
+}
+
+struct WatchStateGuard {
+    roots: Vec<RootState>,
+}
+
+impl Drop for WatchStateGuard {
+    fn drop(&mut self) {
+        shutdown_states(&self.roots);
     }
 }
 
@@ -668,31 +695,10 @@ fn periodic_reconcile_interval_from(value: Option<&str>) -> Option<Duration> {
         .and_then(|seconds| (seconds > 0).then_some(Duration::from_secs(seconds)))
 }
 
-pub(crate) fn covers_root(conn: &Connection, root_key: &str) -> Result<bool, String> {
-    refresh_dead_watchers(conn)?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT root FROM watch_state
-             WHERE status = 'running' AND dirty = 0 AND online = 1",
-        )
-        .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(|e| e.to_string())?;
-    for row in rows {
-        let root = row.map_err(|e| e.to_string())?;
-        if root == root_key
-            || root == "/"
-            || root_key.starts_with(&format!("{}/", root.trim_end_matches('/')))
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
+#[allow(dead_code)]
 pub(crate) fn print_status() -> Result<(), String> {
-    let conn = open_index_db()?;
+    let _ = initialize_index_db()?;
+    let conn = open_index_db_writer()?;
     refresh_dead_watchers(&conn)?;
     let mut stmt = conn
         .prepare(
@@ -759,6 +765,7 @@ pub(crate) fn print_status() -> Result<(), String> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn refresh_dead_watchers(conn: &Connection) -> Result<(), String> {
     let mut stmt = conn
         .prepare(
@@ -801,6 +808,7 @@ pub(crate) fn run(opts: &Options) -> Result<(), String> {
     if opts.positional.is_empty() {
         return Err("--watch requires at least one directory root".to_string());
     }
+    let _ = initialize_index_db()?;
     let mut roots = Vec::new();
     for raw in &opts.positional {
         let path = fs::canonicalize(expand_home_path(raw))
@@ -816,6 +824,18 @@ pub(crate) fn run(opts: &Options) -> Result<(), String> {
     if roots.is_empty() {
         return Err("--watch did not receive a usable directory root".to_string());
     }
+    let worker_threads = if !opts.threads_explicit
+        && roots
+            .iter()
+            .all(|root| root_prefers_single_thread(&root.path))
+    {
+        1
+    } else {
+        opts.threads_override.max(1)
+    };
+    let _ = ThreadPoolBuilder::new()
+        .num_threads(worker_threads)
+        .build_global();
 
     #[cfg(unix)]
     {
@@ -824,13 +844,16 @@ pub(crate) fn run(opts: &Options) -> Result<(), String> {
     }
 
     claim_watch_states(&roots)?;
+    let _watch_state_guard = WatchStateGuard {
+        roots: roots.clone(),
+    };
+    let _query_server = start_query_server()?;
     let mut metrics_counters = None;
     let _metrics_logger = if let Some(path) = opts.watch_metrics.as_deref() {
         let counters = Arc::new(MetricsCounters::default());
         let logger = match MetricsLogger::start(Path::new(path), Arc::clone(&counters)) {
             Ok(logger) => logger,
             Err(error) => {
-                shutdown_states(&roots);
                 return Err(error);
             }
         };
@@ -839,7 +862,7 @@ pub(crate) fn run(opts: &Options) -> Result<(), String> {
     } else {
         None
     };
-    let (events, backend, backend_error) = match start_backend(&roots) {
+    let (events, backend, backend_error, mut initial_scans) = match start_backend(&roots, opts) {
         Ok(result) => result,
         Err(error) => {
             for root in &roots {
@@ -852,14 +875,25 @@ pub(crate) fn run(opts: &Options) -> Result<(), String> {
         eprintln!("unearth: fanotify unavailable, using inotify: {}", error);
     }
     update_states(&roots, &backend, "starting", false, true, None, false)?;
-    let mut event_conn = open_index_db()?;
+    let mut event_conn = open_index_db_writer()?;
     let owner = current_owner();
     let mut db_caches = DbCaches::default();
 
     let mut initial_error = None;
     for root in &roots {
+        if WATCH_STOP.load(Ordering::Relaxed) {
+            return Err("watcher interrupted during initial index scan".to_string());
+        }
         let started = Instant::now();
-        let result = refresh_index_root(&root.key, opts);
+        let result = if let Some(entries) = initial_scans.remove(&root.key) {
+            if WATCH_STOP.load(Ordering::Relaxed) {
+                Err("watcher interrupted during initial index scan".to_string())
+            } else {
+                refresh_index_root_from_scan(&root.key, entries)
+            }
+        } else {
+            refresh_index_root_cancellable(&root.key, opts, Some(&WATCH_STOP))
+        };
         metric_add(
             metrics_counters
                 .as_deref()
@@ -876,21 +910,25 @@ pub(crate) fn run(opts: &Options) -> Result<(), String> {
             initial_error = Some(format!("{}: {}", root.key, error));
             update_state_error(&root.key, &backend, &error)?;
         } else {
-            mark_reconciled(&root.key, &backend)?;
+            mark_initial_reconciled(&root.key, &backend)?;
         }
     }
     if let Some(error) = initial_error {
         return Err(format!("initial live index scan failed: {}", error));
     }
-    let mut startup_events = Vec::new();
-    while let Ok(event) = events.try_recv() {
-        startup_events.push(event);
-        if startup_events.len() >= WATCH_BATCH_MAX {
-            break;
-        }
+    if WATCH_STOP.load(Ordering::Relaxed) {
+        return Err("watcher interrupted during initial index scan".to_string());
     }
-    if !startup_events.is_empty() {
-        if let Err(error) = process_batch(
+    while let Ok(first) = events.recv_timeout(Duration::from_millis(10)) {
+        let mut startup_events = vec![first];
+        while startup_events.len() < WATCH_BATCH_MAX {
+            match events.try_recv() {
+                Ok(event) => startup_events.push(event),
+                Err(crossbeam_channel::TryRecvError::Empty)
+                | Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+            }
+        }
+        if let Err(error) = process_batch_reliably(
             &roots,
             &backend,
             opts,
@@ -905,6 +943,11 @@ pub(crate) fn run(opts: &Options) -> Result<(), String> {
             return Err(format!("initial live event replay failed: {error}"));
         }
     }
+    if WATCH_STOP.load(Ordering::Relaxed) {
+        return Err("watcher interrupted during initial event replay".to_string());
+    }
+    drop(initial_scans);
+    purge_unused_allocator_pages();
     update_states(&roots, &backend, "running", false, true, None, false)?;
     eprintln!(
         "unearth: live index watching {} root{} with {}",
@@ -961,8 +1004,11 @@ pub(crate) fn run(opts: &Options) -> Result<(), String> {
             Ok(event) => event,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                shutdown_states(&roots);
-                return Err("live watcher backend stopped".to_string());
+                let error = "live watcher backend stopped".to_string();
+                for root in &roots {
+                    let _ = update_state_error(&root.key, &backend, &error);
+                }
+                return Err(error);
             }
         };
         let mut batch = vec![first];
@@ -978,7 +1024,7 @@ pub(crate) fn run(opts: &Options) -> Result<(), String> {
                 | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             }
         }
-        if let Err(error) = process_batch(
+        if let Err(error) = process_batch_reliably(
             &roots,
             &backend,
             opts,
@@ -987,15 +1033,81 @@ pub(crate) fn run(opts: &Options) -> Result<(), String> {
             &mut db_caches,
             metrics_counters.as_deref(),
         ) {
-            eprintln!("unearth: live event batch failed: {error}; retaining watcher");
+            eprintln!("unearth: live event recovery failed: {error}; stopping watcher");
             for root in &roots {
                 let _ = update_state_error(&root.key, &backend, &error);
             }
-            thread::sleep(Duration::from_millis(250));
+            return Err(error);
         }
     }
-    shutdown_states(&roots);
     Ok(())
+}
+
+fn process_batch_reliably(
+    roots: &[RootState],
+    backend: &str,
+    opts: &Options,
+    batch: Vec<FsEvent>,
+    conn: &mut Connection,
+    db_caches: &mut DbCaches,
+    metrics: Option<&MetricsCounters>,
+) -> Result<(), String> {
+    let global_overflow = batch
+        .iter()
+        .any(|event| event.action == Action::Overflow && event.path == Path::new("/"));
+    let affected_roots = roots
+        .iter()
+        .filter(|root| {
+            global_overflow
+                || batch.iter().any(|event| {
+                    path_in_root(&root.key, &event.path)
+                        || event
+                            .old_path
+                            .as_deref()
+                            .is_some_and(|path| path_in_root(&root.key, path))
+                })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    match process_batch(roots, backend, opts, batch, conn, db_caches, metrics) {
+        Ok(()) => Ok(()),
+        Err(batch_error) => {
+            // A complete scan is the source of truth after any partial commit,
+            // database error, unresolved event, or failed subtree reconciliation.
+            let mut recovery_errors = Vec::new();
+            for root in &affected_roots {
+                let _ = update_state_error(&root.key, backend, &batch_error);
+                db_caches.clear();
+                let started = Instant::now();
+                let result = refresh_index_root_cancellable(&root.key, opts, Some(&WATCH_STOP));
+                metric_add(metrics.map(|metrics| &metrics.refreshes), 1);
+                metric_elapsed(metrics.map(|metrics| &metrics.refresh_nanos), started);
+                db_caches.clear();
+                match result {
+                    Ok(()) => {
+                        if let Err(error) = mark_reconciled(&root.key, backend) {
+                            recovery_errors.push(format!("{}: {error}", root.key));
+                        }
+                    }
+                    Err(error) => {
+                        let _ = update_state_error(&root.key, backend, &error);
+                        recovery_errors.push(format!("{}: {error}", root.key));
+                    }
+                }
+            }
+            if recovery_errors.is_empty() {
+                eprintln!(
+                    "unearth: recovered failed live event batch with a full index refresh: {batch_error}"
+                );
+                Ok(())
+            } else {
+                Err(format!(
+                    "{batch_error}; full recovery failed for {}",
+                    recovery_errors.join("; ")
+                ))
+            }
+        }
+    }
 }
 
 fn now_nanos() -> i64 {
@@ -1036,7 +1148,7 @@ fn update_states(
     reconcile: bool,
 ) -> Result<(), String> {
     let owner = current_owner();
-    let conn = open_index_db()?;
+    let conn = open_index_db_writer()?;
     let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
     let now = now_seconds();
     for root in roots {
@@ -1073,7 +1185,7 @@ fn update_states(
 
 fn update_state_error(root: &str, backend: &str, error: &str) -> Result<(), String> {
     let owner = current_owner();
-    let conn = open_index_db()?;
+    let conn = open_index_db_writer()?;
     conn.execute(
         "INSERT INTO watch_state(root, backend, status, generation, dirty, online,
                                  watcher_pid, error, owner_boot_id, owner_starttime, heartbeat)
@@ -1097,14 +1209,22 @@ fn update_state_error(root: &str, backend: &str, error: &str) -> Result<(), Stri
 }
 
 fn mark_reconciled(root: &str, backend: &str) -> Result<(), String> {
+    mark_reconciled_status(root, backend, "running")
+}
+
+fn mark_initial_reconciled(root: &str, backend: &str) -> Result<(), String> {
+    mark_reconciled_status(root, backend, "starting")
+}
+
+fn mark_reconciled_status(root: &str, backend: &str, status: &str) -> Result<(), String> {
     let owner = current_owner();
-    let conn = open_index_db()?;
+    let conn = open_index_db_writer()?;
     conn.execute(
         "INSERT INTO watch_state(root, backend, status, generation, last_reconcile,
                                  dirty, online, watcher_pid, error,
                                  owner_boot_id, owner_starttime, heartbeat)
-         VALUES (?1, ?2, 'running', 0, ?3, 0, 1, ?4, NULL, ?5, ?6, ?3)
-         ON CONFLICT(root) DO UPDATE SET backend=excluded.backend, status='running',
+         VALUES (?1, ?2, ?3, 0, ?4, 0, 1, ?5, NULL, ?6, ?7, ?4)
+         ON CONFLICT(root) DO UPDATE SET backend=excluded.backend, status=excluded.status,
              last_reconcile=excluded.last_reconcile, dirty=0, online=1,
              watcher_pid=excluded.watcher_pid, error=NULL,
              owner_boot_id=excluded.owner_boot_id, owner_starttime=excluded.owner_starttime,
@@ -1112,6 +1232,7 @@ fn mark_reconciled(root: &str, backend: &str) -> Result<(), String> {
         params![
             root,
             backend,
+            status,
             now_seconds(),
             owner.pid,
             owner.boot_id,
@@ -1143,20 +1264,23 @@ fn process_batch(
     metric_add(metrics.map(|metrics| &metrics.batches), 1);
     let mut full_refresh = HashSet::<String>::new();
     let mut reconcile = HashSet::<PathBuf>::new();
-    let mut touched_roots = HashSet::<String>::new();
+    let mut reconcile_scans = HashMap::<PathBuf, Arc<Vec<ScannedIndexEntry>>>::new();
+    let mut recovery_roots = HashSet::<String>::new();
     let db_started = Instant::now();
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|e| e.to_string())?;
     let now = now_seconds();
     for event in &batch {
-        let root = matching_root(roots, &event.path);
-        if root.is_none() && event.action != Action::Overflow {
-            continue;
-        }
-        if root.is_none() && event.action == Action::Overflow {
+        let new_root = matching_root(roots, &event.path);
+        let old_root = event
+            .old_path
+            .as_deref()
+            .and_then(|path| matching_root(roots, path));
+        if new_root.is_none() && old_root.is_none() && event.action == Action::Overflow {
             for root in roots {
                 full_refresh.insert(root.key.clone());
+                recovery_roots.insert(root.key.clone());
                 tx.execute(
                     "UPDATE watch_state SET dirty=1, status='recovering', last_event=?2,
                      generation=generation+1 WHERE root=?1",
@@ -1166,27 +1290,127 @@ fn process_batch(
             }
             continue;
         }
-        let Some(root) = root else {
-            continue;
-        };
-        for candidate in roots {
-            if path_in_root(&candidate.key, &event.path) {
-                touched_roots.insert(candidate.key.clone());
+        if event.action == Action::Move {
+            metric_add(metrics.map(|metrics| &metrics.moves), 1);
+            let mut changed_roots = HashSet::new();
+            let old_key = event.old_path.as_deref().map(normalize_index_dir);
+            let new_key = normalize_index_dir(&event.path);
+            let old_is_indexed = old_root
+                .zip(old_key.as_deref())
+                .is_some_and(|(root, path)| !is_root_index_excluded_path(&root.key, path));
+            let new_is_indexed =
+                new_root.is_some_and(|root| !is_root_index_excluded_path(&root.key, &new_key));
+            if event.is_dir
+                && old_is_indexed
+                && new_is_indexed
+                && move_indexed_directory(
+                    &tx,
+                    event.old_path.as_deref().unwrap(),
+                    &event.path,
+                    &event.actor,
+                    event.event_kind,
+                    db_caches,
+                )?
+            {
+                for (root, path) in [
+                    (old_root.unwrap(), event.old_path.as_deref().unwrap()),
+                    (new_root.unwrap(), event.path.as_path()),
+                ] {
+                    upsert_parent_directory(
+                        &tx,
+                        root,
+                        path,
+                        &event.actor,
+                        event.event_kind,
+                        db_caches,
+                    )?;
+                    changed_roots.insert(root.key.clone());
+                }
+                for root in changed_roots {
+                    touch_state(&tx, &root, event.at)?;
+                }
+                continue;
             }
-            if let Some(old_path) = event.old_path.as_deref() {
-                if path_in_root(&candidate.key, old_path) {
-                    touched_roots.insert(candidate.key.clone());
+            if let (Some(old_path), Some(root)) = (event.old_path.as_deref(), old_root) {
+                if old_is_indexed {
+                    remove_path(&tx, old_path, event.is_dir, db_caches)?;
+                    upsert_parent_directory(
+                        &tx,
+                        root,
+                        old_path,
+                        &event.actor,
+                        event.event_kind,
+                        db_caches,
+                    )?;
+                    changed_roots.insert(root.key.clone());
                 }
             }
+            if let Some(root) = new_root {
+                if new_is_indexed {
+                    let state = upsert_path(
+                        &tx,
+                        &event.path,
+                        event.is_dir,
+                        &event.actor,
+                        event.event_kind,
+                        db_caches,
+                    )?;
+                    if state == IndexedPathState::Directory {
+                        reconcile.insert(event.path.clone());
+                        if let Some(entries) = event.scanned_entries.as_ref() {
+                            reconcile_scans.insert(event.path.clone(), Arc::clone(entries));
+                        }
+                    }
+                    upsert_parent_directory(
+                        &tx,
+                        root,
+                        &event.path,
+                        &event.actor,
+                        event.event_kind,
+                        db_caches,
+                    )?;
+                    changed_roots.insert(root.key.clone());
+                }
+            }
+            for root in changed_roots {
+                touch_state(&tx, &root, event.at)?;
+            }
+            continue;
         }
+        let Some(root) = new_root else {
+            continue;
+        };
         if is_root_index_excluded_path(&root.key, &normalize_index_dir(&event.path)) {
             continue;
         }
         match event.action {
             Action::Overflow => {
                 metric_add(metrics.map(|metrics| &metrics.overflows), 1);
+                recovery_roots.insert(root.key.clone());
                 if event.path != Path::new("/") && event.path != root.path {
-                    reconcile.insert(event.path.clone());
+                    if fs::symlink_metadata(&event.path).is_ok() {
+                        match upsert_path(
+                            &tx,
+                            &event.path,
+                            event.is_dir,
+                            &event.actor,
+                            EVENT_RECONCILE,
+                            db_caches,
+                        )? {
+                            IndexedPathState::Directory => {
+                                reconcile.insert(event.path.clone());
+                            }
+                            IndexedPathState::Missing | IndexedPathState::NonDirectory => {}
+                        }
+                    }
+                    upsert_parent_directory(
+                        &tx,
+                        root,
+                        &event.path,
+                        &event.actor,
+                        EVENT_RECONCILE,
+                        db_caches,
+                    )?;
                 } else {
                     full_refresh.insert(root.key.clone());
                 }
@@ -1199,12 +1423,58 @@ fn process_batch(
             }
             Action::Reconcile => {
                 metric_add(metrics.map(|metrics| &metrics.reconciles), 1);
-                reconcile.insert(event.path.clone());
-                touched_roots.insert(root.key.clone());
+                recovery_roots.insert(root.key.clone());
+                tx.execute(
+                    "UPDATE watch_state SET dirty=1, status='recovering', last_event=?2,
+                     generation=generation+1 WHERE root=?1",
+                    params![root.key, now],
+                )
+                .map_err(|e| e.to_string())?;
+                let state = if event.path == root.path {
+                    match fs::symlink_metadata(&event.path) {
+                        Ok(metadata) if metadata.file_type().is_dir() => {
+                            IndexedPathState::Directory
+                        }
+                        Ok(_) => IndexedPathState::NonDirectory,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            IndexedPathState::Missing
+                        }
+                        Err(error) => return Err(error.to_string()),
+                    }
+                } else {
+                    upsert_path(
+                        &tx,
+                        &event.path,
+                        event.is_dir,
+                        &event.actor,
+                        EVENT_RECONCILE,
+                        db_caches,
+                    )?
+                };
+                if state == IndexedPathState::Directory {
+                    reconcile.insert(event.path.clone());
+                    if let Some(entries) = event.scanned_entries.as_ref() {
+                        reconcile_scans.insert(event.path.clone(), Arc::clone(entries));
+                    }
+                } else if event.path == root.path {
+                    full_refresh.insert(root.key.clone());
+                    recovery_roots.insert(root.key.clone());
+                }
+                if event.path != root.path {
+                    upsert_parent_directory(
+                        &tx,
+                        root,
+                        &event.path,
+                        &event.actor,
+                        EVENT_RECONCILE,
+                        db_caches,
+                    )?;
+                }
+                touch_state(&tx, &root.key, event.at)?;
             }
             Action::Upsert => {
                 metric_add(metrics.map(|metrics| &metrics.upserts), 1);
-                upsert_path(
+                let _ = upsert_path(
                     &tx,
                     &event.path,
                     event.is_dir,
@@ -1212,70 +1482,112 @@ fn process_batch(
                     event.event_kind,
                     db_caches,
                 )?;
+                if event.event_kind == EVENT_CREATE {
+                    upsert_parent_directory(
+                        &tx,
+                        root,
+                        &event.path,
+                        &event.actor,
+                        event.event_kind,
+                        db_caches,
+                    )?;
+                }
                 touch_state(&tx, &root.key, event.at)?;
-                touched_roots.insert(root.key.clone());
             }
             Action::Remove => {
                 metric_add(metrics.map(|metrics| &metrics.removes), 1);
                 remove_path(&tx, &event.path, event.is_dir, db_caches)?;
-                touch_state(&tx, &root.key, event.at)?;
-                touched_roots.insert(root.key.clone());
-            }
-            Action::Move => {
-                metric_add(metrics.map(|metrics| &metrics.moves), 1);
-                if let Some(old_path) = event.old_path.as_deref() {
-                    remove_path(&tx, old_path, event.is_dir, db_caches)?;
-                }
-                upsert_path(
+                upsert_parent_directory(
                     &tx,
+                    root,
                     &event.path,
-                    event.is_dir,
                     &event.actor,
                     event.event_kind,
                     db_caches,
                 )?;
-                if event.is_dir {
-                    reconcile.insert(event.path.clone());
-                }
                 touch_state(&tx, &root.key, event.at)?;
-                touched_roots.insert(root.key.clone());
             }
+            Action::Move => unreachable!(),
         }
     }
     tx.commit().map_err(|e| e.to_string())?;
     metric_add(metrics.map(|metrics| &metrics.db_transactions), 1);
     metric_elapsed(metrics.map(|metrics| &metrics.db_nanos), db_started);
+    invalidate_stale_reconcile_scans(&batch, &mut reconcile_scans);
+    drop(batch);
     reconcile.retain(|path| !full_refresh.iter().any(|root| path_in_root(root, path)));
     for path in collapse_reconcile_paths(reconcile) {
-        if path.is_dir() {
-            let started = Instant::now();
-            let result = reconcile_subtree(&path, opts, db_caches);
-            metric_add(metrics.map(|metrics| &metrics.subtree_scans), 1);
-            metric_elapsed(metrics.map(|metrics| &metrics.subtree_scan_nanos), started);
-            if let Err(error) = result {
-                if let Some(root) = matching_root(roots, &path) {
-                    update_state_error(&root.key, backend, &error)?;
-                    full_refresh.insert(root.key.clone());
-                }
-            } else if let Some(root) = matching_root(roots, &path) {
-                mark_reconciled(&root.key, backend)?;
+        let started = Instant::now();
+        let result = if let Some(entries) = reconcile_scans.remove(&path) {
+            let entries = match Arc::try_unwrap(entries) {
+                Ok(entries) => entries,
+                Err(entries) => entries.as_ref().clone(),
+            };
+            reconcile_subtree_from_entries(&path, entries, db_caches)
+        } else {
+            reconcile_subtree(&path, opts, db_caches)
+        };
+        metric_add(metrics.map(|metrics| &metrics.subtree_scans), 1);
+        metric_elapsed(metrics.map(|metrics| &metrics.subtree_scan_nanos), started);
+        if let Err(error) = result {
+            if let Some(root) = matching_root(roots, &path) {
+                update_state_error(&root.key, backend, &error)?;
+                recovery_roots.insert(root.key.clone());
+                full_refresh.insert(root.key.clone());
             }
         }
     }
+    let mut failed_roots = Vec::new();
     for root in full_refresh {
         db_caches.clear();
         let started = Instant::now();
-        let result = refresh_index_root(&root, opts);
+        let result = refresh_index_root_cancellable(&root, opts, Some(&WATCH_STOP));
         db_caches.clear();
         metric_add(metrics.map(|metrics| &metrics.refreshes), 1);
         metric_elapsed(metrics.map(|metrics| &metrics.refresh_nanos), started);
         if let Err(error) = result {
             update_state_error(&root, backend, &error)?;
+            failed_roots.push((root, error));
         } else {
             mark_reconciled(&root, backend)?;
         }
     }
+    for root in recovery_roots {
+        if !failed_roots.iter().any(|(failed, _)| failed == &root) {
+            mark_reconciled(&root, backend)?;
+        }
+    }
+    if !failed_roots.is_empty() {
+        return Err(format!(
+            "watch recovery failed for {}",
+            failed_roots
+                .into_iter()
+                .map(|(root, error)| format!("{root}: {error}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
     Ok(())
+}
+
+fn invalidate_stale_reconcile_scans(
+    batch: &[FsEvent],
+    reconcile_scans: &mut HashMap<PathBuf, Arc<Vec<ScannedIndexEntry>>>,
+) {
+    let scanned_paths: Vec<(PathBuf, String)> = reconcile_scans
+        .keys()
+        .map(|path| (path.clone(), normalize_index_dir(path)))
+        .collect();
+    for (scanned_path, scanned_key) in scanned_paths {
+        if batch.iter().any(|event| {
+            (event.path != scanned_path && path_in_root(&scanned_key, &event.path))
+                || event.old_path.as_deref().is_some_and(|old_path| {
+                    old_path != scanned_path && path_in_root(&scanned_key, old_path)
+                })
+        }) {
+            reconcile_scans.remove(&scanned_path);
+        }
+    }
 }
 
 fn coalesce_batch(batch: Vec<FsEvent>) -> Vec<FsEvent> {
@@ -1283,6 +1595,10 @@ fn coalesce_batch(batch: Vec<FsEvent>) -> Vec<FsEvent> {
     let mut positions = HashMap::<PathBuf, usize>::new();
     for event in batch {
         if matches!(event.action, Action::Move) {
+            // A rename is an ordering barrier because it changes two paths.
+            // Coalescing later events across it can resurrect the old name or
+            // discard an update to the new name.
+            positions.clear();
             result.push(event);
             continue;
         }
@@ -1290,12 +1606,25 @@ fn coalesce_batch(batch: Vec<FsEvent>) -> Vec<FsEvent> {
         if let Some(index) = positions.get(&path).copied() {
             let previous = &result[index];
             let replace = match (previous.action, event.action) {
+                (Action::Overflow, _) => false,
+                (_, Action::Overflow) => true,
+                (Action::Reconcile, Action::Upsert) if previous.scanned_entries.is_some() => true,
                 (Action::Reconcile, Action::Upsert) => false,
                 (_, Action::Reconcile) => true,
                 _ => true,
             };
             if replace {
-                result[index] = event;
+                if previous.action == Action::Reconcile
+                    && previous.scanned_entries.is_some()
+                    && event.action == Action::Upsert
+                {
+                    let mut fallback = event;
+                    fallback.action = Action::Reconcile;
+                    fallback.event_kind = EVENT_RECONCILE;
+                    result[index] = fallback;
+                } else {
+                    result[index] = event;
+                }
             }
         } else {
             positions.insert(path, result.len());
@@ -1307,7 +1636,12 @@ fn coalesce_batch(batch: Vec<FsEvent>) -> Vec<FsEvent> {
 
 fn collapse_reconcile_paths(paths: HashSet<PathBuf>) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = paths.into_iter().collect();
-    paths.sort_by_key(|path| path.components().count());
+    paths.sort_by(|left, right| {
+        left.components()
+            .count()
+            .cmp(&right.components().count())
+            .then_with(|| left.cmp(right))
+    });
     let mut collapsed = Vec::with_capacity(paths.len());
     'candidate: for path in paths {
         if collapsed
@@ -1324,7 +1658,7 @@ fn collapse_reconcile_paths(paths: HashSet<PathBuf>) -> Vec<PathBuf> {
 fn touch_state(tx: &Transaction<'_>, root: &str, at: i64) -> Result<(), String> {
     tx.prepare_cached(
         "UPDATE watch_state SET last_event=?2, generation=generation+1,
-         status='running', dirty=0, online=1, error=NULL WHERE root=?1",
+         online=1 WHERE root=?1",
     )
     .map_err(|e| e.to_string())?
     .execute(params![root, at / 1_000_000_000])
@@ -1442,13 +1776,13 @@ fn upsert_path(
     actor: &Actor,
     event_kind: i64,
     caches: &mut DbCaches,
-) -> Result<(), String> {
+) -> Result<IndexedPathState, String> {
     let path = normalize_index_dir(raw_path);
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             remove_path(tx, raw_path, is_dir_hint, caches)?;
-            return Ok(());
+            return Ok(IndexedPathState::Missing);
         }
         Err(error) => return Err(error.to_string()),
     };
@@ -1512,6 +1846,32 @@ fn upsert_path(
     if is_dir {
         ensure_dir_cached(tx, &path, caches)?;
     }
+    Ok(if is_dir {
+        IndexedPathState::Directory
+    } else {
+        IndexedPathState::NonDirectory
+    })
+}
+
+fn upsert_parent_directory(
+    tx: &Transaction<'_>,
+    root: &RootState,
+    path: &Path,
+    actor: &Actor,
+    event_kind: i64,
+    caches: &mut DbCaches,
+) -> Result<(), String> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    if parent == root.path || !path_in_root(&root.key, parent) {
+        return Ok(());
+    }
+    let parent_key = normalize_index_dir(parent);
+    if is_root_index_excluded_path(&root.key, &parent_key) {
+        return Ok(());
+    }
+    let _ = upsert_path(tx, parent, true, actor, event_kind, caches)?;
     Ok(())
 }
 
@@ -1562,27 +1922,33 @@ fn remove_path(
         }
         id
     };
-    let escaped_path = sql_like_escape(&path);
-    let subtree_pattern = format!("{escaped_path}/%");
+    let subtree_prefix = index_path_prefix(&path);
+    let subtree_end = format!("{}0", subtree_prefix.trim_end_matches('/'));
     let is_dir = is_dir_hint || caches.dirs.contains_key(&path) || {
-        tx.prepare_cached("SELECT COUNT(*) FROM dirs WHERE path=?1 OR path LIKE ?2 ESCAPE '\\'")
+        tx.prepare_cached("SELECT EXISTS(SELECT 1 FROM dirs WHERE path=?1)")
             .map_err(|e| e.to_string())?
-            .query_row(params![path, &subtree_pattern], |row| row.get::<_, i64>(0))
+            .query_row([&path], |row| row.get::<_, i64>(0))
             .map_err(|e| e.to_string())?
             > 0
     };
     if is_dir {
         tx.prepare_cached(
             "DELETE FROM entries WHERE dir_id IN
-             (SELECT id FROM dirs WHERE path=?1 OR path LIKE ?2 ESCAPE '\\')
-             OR (dir_id=?3 AND name_id=?4)",
+             (SELECT id FROM dirs WHERE path=?1 OR (path>=?2 AND path<?3))
+             OR (dir_id=?4 AND name_id=?5)",
         )
         .map_err(|e| e.to_string())?
-        .execute(params![path, &subtree_pattern, parent_id, name_id])
+        .execute(params![
+            path,
+            subtree_prefix,
+            subtree_end,
+            parent_id,
+            name_id
+        ])
         .map_err(|e| e.to_string())?;
-        tx.prepare_cached("DELETE FROM dirs WHERE path=?1 OR path LIKE ?2 ESCAPE '\\'")
+        tx.prepare_cached("DELETE FROM dirs WHERE path=?1 OR (path>=?2 AND path<?3)")
             .map_err(|e| e.to_string())?
-            .execute(params![path, &subtree_pattern])
+            .execute(params![path, subtree_prefix, subtree_end])
             .map_err(|e| e.to_string())?;
         caches.invalidate_dirs_below(&path);
     } else if let (Some(parent_id), Some(name_id)) = (parent_id, name_id) {
@@ -1594,10 +1960,108 @@ fn remove_path(
     Ok(())
 }
 
+fn move_indexed_directory(
+    tx: &Transaction<'_>,
+    old_path: &Path,
+    new_path: &Path,
+    actor: &Actor,
+    event_kind: i64,
+    caches: &mut DbCaches,
+) -> Result<bool, String> {
+    let old = normalize_index_dir(old_path);
+    let new = normalize_index_dir(new_path);
+    if old == "/" || old == new {
+        return Ok(false);
+    }
+    if !fs::symlink_metadata(new_path)
+        .map(|metadata| metadata.file_type().is_dir())
+        .unwrap_or(false)
+    {
+        return Ok(false);
+    }
+    let indexed: bool = tx
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM dirs WHERE path=?1)")
+        .map_err(|e| e.to_string())?
+        .query_row([&old], |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    if !indexed {
+        return Ok(false);
+    }
+
+    // A filesystem rename preserves every descendant. Rewrite the pooled
+    // directory prefix instead of deleting and restating the whole subtree.
+    remove_path(tx, new_path, true, caches)?;
+    remove_exact_entry(tx, &old, caches)?;
+    let old_prefix = index_path_prefix(&old);
+    let old_end = format!("{}0", old_prefix.trim_end_matches('/'));
+    tx.prepare_cached(
+        "UPDATE dirs
+         SET path=CASE WHEN path=?1 THEN ?2
+                       ELSE ?2 || substr(path, length(?1) + 1) END
+         WHERE path=?1 OR (path>=?3 AND path<?4)",
+    )
+    .map_err(|e| e.to_string())?
+    .execute(params![old, new, old_prefix, old_end])
+    .map_err(|e| e.to_string())?;
+    caches.invalidate_dirs_below(&old);
+    caches.invalidate_dirs_below(&new);
+    Ok(upsert_path(tx, new_path, true, actor, event_kind, caches)? == IndexedPathState::Directory)
+}
+
+fn remove_exact_entry(
+    tx: &Transaction<'_>,
+    path: &str,
+    caches: &mut DbCaches,
+) -> Result<(), String> {
+    let path = Path::new(path);
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let Some(name) = path.file_name() else {
+        return Ok(());
+    };
+    let parent = normalize_index_dir(parent);
+    let name = name.to_string_lossy();
+    tx.prepare_cached(
+        "DELETE FROM entries
+         WHERE dir_id=(SELECT id FROM dirs WHERE path=?1)
+           AND name_id=(SELECT id FROM strings WHERE value=?2)",
+    )
+    .map_err(|e| e.to_string())?
+    .execute(params![parent, name.as_ref()])
+    .map_err(|e| e.to_string())?;
+    caches.invalidate_dirs_below(path.to_string_lossy().as_ref());
+    Ok(())
+}
+
 fn reconcile_subtree(path: &Path, opts: &Options, caches: &mut DbCaches) -> Result<(), String> {
     let path = path.to_path_buf();
-    if !path.is_dir() {
-        return Ok(());
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.to_string()),
+    };
+    if !metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.file_type().is_dir())
+    {
+        let mut conn = open_index_db_writer()?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        if metadata.is_some() {
+            let _ = upsert_path(
+                &tx,
+                &path,
+                false,
+                &Actor::reconcile(),
+                EVENT_RECONCILE,
+                caches,
+            )?;
+        } else {
+            remove_path(&tx, &path, true, caches)?;
+        }
+        return tx.commit().map_err(|e| e.to_string());
     }
     let root_key = normalize_index_dir(&path);
     let threads = if root_prefers_single_thread(&path) {
@@ -1605,8 +2069,17 @@ fn reconcile_subtree(path: &Path, opts: &Options, caches: &mut DbCaches) -> Resu
     } else {
         opts.threads_override.max(1)
     };
-    let entries = scan_index_root(&path, &root_key, threads)?;
-    let mut conn = open_index_db()?;
+    let entries = scan_index_root_cancellable(&path, &root_key, threads, Some(&WATCH_STOP))?;
+    reconcile_subtree_from_entries(&path, entries, caches)
+}
+
+fn reconcile_subtree_from_entries(
+    path: &Path,
+    entries: Vec<ScannedIndexEntry>,
+    caches: &mut DbCaches,
+) -> Result<(), String> {
+    let root_key = normalize_index_dir(path);
+    let mut conn = open_index_db_writer()?;
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|e| e.to_string())?;
@@ -1631,20 +2104,18 @@ fn reconcile_subtree(path: &Path, opts: &Options, caches: &mut DbCaches) -> Resu
         let path = PathBuf::from(entry.path);
         let metadata = fs::symlink_metadata(&path).ok();
         if metadata.is_some() {
-            upsert_path(&tx, &path, entry.kind == 1, &actor, EVENT_RECONCILE, caches)?;
+            let _ = upsert_path(&tx, &path, entry.kind == 1, &actor, EVENT_RECONCILE, caches)?;
         }
     }
     tx.commit().map_err(|e| e.to_string())
 }
 
-fn start_backend(
-    roots: &[RootState],
-) -> Result<(Receiver<FsEvent>, String, Option<String>), String> {
+fn start_backend(roots: &[RootState], opts: &Options) -> Result<StartedBackend, String> {
     match start_fanotify(roots) {
-        Ok((rx, name)) => Ok((rx, name, None)),
+        Ok((rx, name)) => Ok((rx, name, None, HashMap::new())),
         Err(fanotify_error) => {
-            let rx = start_inotify(roots)?;
-            Ok((rx, "inotify".to_string(), Some(fanotify_error)))
+            let (rx, scans) = start_inotify(roots, opts)?;
+            Ok((rx, "inotify".to_string(), Some(fanotify_error), scans))
         }
     }
 }
@@ -1664,12 +2135,25 @@ fn event(action: Action, path: PathBuf, is_dir: bool, _backend: &str, actor: Act
             Action::Overflow => EVENT_OVERFLOW,
         },
         at: now_nanos(),
+        scanned_entries: None,
     }
 }
 
 fn classify_actor(pid: i32) -> Actor {
     if pid <= 0 {
         return Actor::unknown();
+    }
+    static ACTOR_CACHE: OnceLock<Mutex<HashMap<(i32, i64), Actor>>> = OnceLock::new();
+    let starttime = process_starttime(i64::from(pid)).unwrap_or_default();
+    if starttime != 0 {
+        if let Ok(cache) = ACTOR_CACHE
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+        {
+            if let Some(actor) = cache.get(&(pid, starttime)) {
+                return actor.clone();
+            }
+        }
     }
     let proc_root = PathBuf::from(format!("/proc/{pid}"));
     let executable = fs::read_link(proc_root.join("exe"))
@@ -1706,16 +2190,33 @@ fn classify_actor(pid: i32) -> Actor {
     } else {
         "application"
     };
-    Actor {
+    let actor = Actor {
         executable,
         classification: classification.to_string(),
         uid,
         pid: Some(i64::from(pid)),
+    };
+    if starttime != 0 {
+        if let Ok(mut cache) = ACTOR_CACHE
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+        {
+            cache.insert((pid, starttime), actor.clone());
+            if cache.len() > 4096 {
+                cache.retain(|(cached_pid, cached_start), _| {
+                    process_starttime(i64::from(*cached_pid)) == Some(*cached_start)
+                });
+            }
+        }
     }
+    actor
 }
 
 #[cfg(target_os = "linux")]
-fn start_inotify(roots: &[RootState]) -> Result<Receiver<FsEvent>, String> {
+fn start_inotify(
+    roots: &[RootState],
+    opts: &Options,
+) -> Result<(Receiver<FsEvent>, InitialScans), String> {
     let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error().to_string());
@@ -1726,30 +2227,54 @@ fn start_inotify(roots: &[RootState]) -> Result<Receiver<FsEvent>, String> {
         paths: HashMap::new(),
         path_to_wd: BTreeMap::new(),
         pending_moves: HashMap::new(),
+        pending_self_moves: HashMap::new(),
+        recently_rebased: HashMap::new(),
         mounted: roots
             .iter()
             .flat_map(|root| mount_candidates(&root.path))
             .collect(),
         last_mount_check: std::time::Instant::now(),
     };
+    let mut scans = HashMap::new();
     for root in roots {
-        if let Err(error) = watcher.add_recursive(&root.path) {
-            unsafe {
-                libc::close(fd);
-            }
-            return Err(error);
+        if WATCH_STOP.load(Ordering::Relaxed) {
+            return Err("watcher interrupted during initial watch scan".to_string());
         }
+        match watcher.add_recursive_collect(&root.path) {
+            Ok(entries) => {
+                scans.insert(root.key.clone(), entries);
+            }
+            Err(error) => {
+                return Err(error);
+            }
+        }
+    }
+    for root in roots {
+        if let Some(entries) = scans.get_mut(&root.key) {
+            let threads = if root_prefers_single_thread(&root.path) {
+                1
+            } else {
+                opts.threads_override.max(1)
+            };
+            populate_scanned_index_metadata_cancellable(entries, threads, Some(&WATCH_STOP))?;
+        }
+    }
+    if WATCH_STOP.load(Ordering::Relaxed) {
+        return Err("watcher interrupted during initial metadata scan".to_string());
     }
     let (tx, rx) = bounded(WATCH_CHANNEL_CAPACITY);
     thread::Builder::new()
         .name("unearth-inotify".to_string())
         .spawn(move || watcher.run(tx))
         .map_err(|e| e.to_string())?;
-    Ok(rx)
+    Ok((rx, scans))
 }
 
 #[cfg(not(target_os = "linux"))]
-fn start_inotify(_roots: &[RootState]) -> Result<Receiver<FsEvent>, String> {
+fn start_inotify(
+    _roots: &[RootState],
+    _opts: &Options,
+) -> Result<(Receiver<FsEvent>, InitialScans), String> {
     Err("inotify is only available on Linux".to_string())
 }
 
@@ -1765,9 +2290,11 @@ struct PendingMove {
 struct InotifyWatcher {
     fd: RawFd,
     roots: Vec<RootState>,
-    paths: HashMap<i32, PathBuf>,
-    path_to_wd: BTreeMap<PathBuf, i32>,
+    paths: HashMap<i32, Arc<Path>>,
+    path_to_wd: BTreeMap<Arc<Path>, i32>,
     pending_moves: HashMap<u32, PendingMove>,
+    pending_self_moves: HashMap<i32, (PathBuf, std::time::Instant)>,
+    recently_rebased: HashMap<i32, std::time::Instant>,
     mounted: HashSet<PathBuf>,
     last_mount_check: std::time::Instant,
 }
@@ -1817,6 +2344,26 @@ impl InotifyWatcher {
                 ));
             }
         }
+        let expired_self_moves: Vec<i32> = self
+            .pending_self_moves
+            .iter()
+            .filter_map(|(wd, (_, seen_at))| {
+                (now.duration_since(*seen_at) >= PENDING_MOVE_TIMEOUT).then_some(*wd)
+            })
+            .collect();
+        for wd in expired_self_moves {
+            if let Some((path, _)) = self.pending_self_moves.remove(&wd) {
+                let _ = tx.send(event(
+                    Action::Overflow,
+                    path,
+                    true,
+                    "inotify",
+                    Actor::unknown(),
+                ));
+            }
+        }
+        self.recently_rebased
+            .retain(|_, seen_at| now.duration_since(*seen_at) < PENDING_MOVE_TIMEOUT);
     }
 
     fn add_watch(&mut self, path: &Path) -> Result<(), String> {
@@ -1826,6 +2373,7 @@ impl InotifyWatcher {
             | libc::IN_DELETE
             | libc::IN_MOVED_FROM
             | libc::IN_MOVED_TO
+            | libc::IN_MODIFY
             | libc::IN_CLOSE_WRITE
             | libc::IN_ATTRIB
             | libc::IN_DELETE_SELF
@@ -1851,51 +2399,108 @@ impl InotifyWatcher {
                 error
             ));
         }
-        self.paths.insert(wd, path.to_path_buf());
-        self.path_to_wd.insert(path.to_path_buf(), wd);
+        let shared_path = Arc::<Path>::from(path);
+        if let Some(previous_path) = self.paths.insert(wd, Arc::clone(&shared_path)) {
+            if previous_path.as_ref() != path {
+                self.path_to_wd.remove(&previous_path);
+            }
+        }
+        if let Some(previous_wd) = self.path_to_wd.insert(shared_path, wd) {
+            if previous_wd != wd {
+                self.paths.remove(&previous_wd);
+            }
+        }
         Ok(())
     }
 
     fn add_recursive(&mut self, root: &Path) -> Result<(), String> {
+        self.walk_recursive(root, false, None).map(|_| ())
+    }
+
+    fn add_recursive_collect(&mut self, root: &Path) -> Result<Vec<ScannedIndexEntry>, String> {
+        self.walk_recursive(root, true, Some(&WATCH_STOP))
+    }
+
+    fn walk_recursive(
+        &mut self,
+        root: &Path,
+        collect_entries: bool,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Vec<ScannedIndexEntry>, String> {
         let root_key = normalize_index_dir(root);
-        for entry in WalkDir::new(root)
-            .skip_hidden(false)
-            .parallelism(Parallelism::Serial)
-            .process_read_dir({
-                let root_key = root_key.clone();
-                move |_depth, _path, _state, children| {
-                    for entry in children.iter_mut().flatten() {
-                        if let Some(child_path) = entry.read_children_path.as_ref() {
-                            if is_root_index_prune_child(&root_key, child_path.as_ref()) {
-                                entry.read_children_path = None;
-                            }
-                        }
-                    }
+        let scan_root = root.to_path_buf();
+        let mut scanned = Vec::new();
+        let mut pending = vec![scan_root.clone()];
+        while let Some(directory) = pending.pop() {
+            if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                return Err("watcher interrupted during initial watch scan".to_string());
+            }
+            let directory_key = normalize_index_dir(&directory);
+            let Some(excluded) = matching_root(&self.roots, &directory)
+                .map(|matched| is_root_index_excluded_path(&matched.key, &directory_key))
+            else {
+                continue;
+            };
+            if excluded {
+                continue;
+            }
+
+            // Install coverage before enumerating children. Anything created
+            // after read_dir begins is then either scanned or queued by inotify.
+            self.add_watch(&directory)?;
+            let children = match fs::read_dir(&directory) {
+                Ok(children) => children,
+                Err(error) if transient_watch_path_error(&error) => continue,
+                Err(error) => return Err(format!("cannot read {}: {error}", directory.display())),
+            };
+            for child in children {
+                if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                    return Err("watcher interrupted during initial watch scan".to_string());
                 }
-            })
-            .into_iter()
-        {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) if error.io_error().is_some_and(transient_watch_path_error) => {
+                let child = match child {
+                    Ok(child) => child,
+                    Err(error) if transient_watch_path_error(&error) => continue,
+                    Err(error) => return Err(error.to_string()),
+                };
+                let path = child.path();
+                if is_root_index_prune_child(&root_key, &path) {
                     continue;
                 }
-                Err(error) => return Err(error.to_string()),
-            };
-            let path = entry.path();
-            if !entry.file_type().is_dir() {
-                continue;
+                let path_key = normalize_index_dir(&path);
+                let Some(excluded) = matching_root(&self.roots, &path)
+                    .map(|matched| is_root_index_excluded_path(&matched.key, &path_key))
+                else {
+                    continue;
+                };
+                if excluded {
+                    continue;
+                }
+                let file_type = match child.file_type() {
+                    Ok(file_type) => file_type,
+                    Err(error) if transient_watch_path_error(&error) => continue,
+                    Err(error) => return Err(error.to_string()),
+                };
+                if file_type.is_dir() {
+                    pending.push(path.clone());
+                }
+                if collect_entries && path != scan_root && path.file_name().is_some() {
+                    scanned.push(ScannedIndexEntry {
+                        path: path_key,
+                        kind: if file_type.is_dir() {
+                            1
+                        } else if file_type.is_symlink() {
+                            2
+                        } else {
+                            0
+                        },
+                        mtime: None,
+                        size: None,
+                        activity: None,
+                    });
+                }
             }
-            let path_key = normalize_index_dir(&path);
-            let Some(root) = matching_root(&self.roots, &path) else {
-                continue;
-            };
-            if is_root_index_excluded_path(&root.key, &path_key) {
-                continue;
-            }
-            self.add_watch(&path)?;
         }
-        Ok(())
+        Ok(scanned)
     }
 
     fn remove_watches_below(&mut self, path: &Path) {
@@ -1905,6 +2510,8 @@ impl InotifyWatcher {
             .filter_map(|(wd, watched)| watched.starts_with(path).then_some(*wd))
             .collect();
         for wd in doomed {
+            self.pending_self_moves.remove(&wd);
+            self.recently_rebased.remove(&wd);
             if let Some(watched) = self.paths.remove(&wd) {
                 self.path_to_wd.remove(&watched);
             }
@@ -1914,29 +2521,32 @@ impl InotifyWatcher {
         }
     }
 
-    fn update_watches_after_move(&mut self, old: &Path, new: &Path) {
+    fn update_watches_after_move(&mut self, old: &Path, new: &Path) -> bool {
         let upper = old.join("\u{10ffff}");
-        let moved: Vec<(i32, PathBuf, PathBuf)> = self
+        let moved: Vec<(i32, Arc<Path>, Arc<Path>)> = self
             .path_to_wd
-            .range(old.to_path_buf()..upper)
+            .range(Arc::<Path>::from(old)..Arc::<Path>::from(upper))
             .filter_map(|(path, wd)| {
                 path.strip_prefix(old)
                     .ok()
-                    .map(|suffix| (*wd, path.clone(), new.join(suffix)))
+                    .map(|suffix| (*wd, Arc::clone(path), Arc::<Path>::from(new.join(suffix))))
             })
             .collect();
+        let had_watch_coverage = !moved.is_empty();
+        let now = std::time::Instant::now();
         for (wd, old_path, new_path) in moved {
+            self.pending_self_moves.remove(&wd);
+            self.recently_rebased.insert(wd, now);
             self.path_to_wd.remove(&old_path);
-            self.path_to_wd.insert(new_path.clone(), wd);
-            if let Some(path) = self.paths.get_mut(&wd) {
-                *path = new_path;
-            }
+            self.path_to_wd.insert(Arc::clone(&new_path), wd);
+            self.paths.insert(wd, new_path);
         }
+        had_watch_coverage
     }
 
-    fn poll_mounts(&mut self, tx: &Sender<FsEvent>) {
+    fn poll_mounts(&mut self, tx: &Sender<FsEvent>) -> Result<(), String> {
         if self.last_mount_check.elapsed() < WATCH_MOUNT_CHECK_INTERVAL {
-            return;
+            return Ok(());
         }
         let current: HashSet<PathBuf> = self
             .roots
@@ -1945,33 +2555,39 @@ impl InotifyWatcher {
             .collect();
         let added: Vec<PathBuf> = current.difference(&self.mounted).cloned().collect();
         let removed: Vec<PathBuf> = self.mounted.difference(&current).cloned().collect();
+        let mut failed_adds = HashSet::new();
         for mount in added {
-            match self.add_recursive(&mount) {
-                Ok(()) => {
-                    let _ = tx.send(event(
+            match self.add_recursive_collect(&mount) {
+                Ok(entries) => {
+                    let mut reconcile = event(
                         Action::Reconcile,
-                        mount,
+                        mount.clone(),
                         true,
                         "inotify",
                         Actor::unknown(),
-                    ));
+                    );
+                    reconcile.scanned_entries = Some(Arc::new(entries));
+                    let _ = tx.send(reconcile);
                 }
                 Err(error) => {
-                    eprintln!(
-                        "unearth: cannot watch newly mounted {}: {error}",
-                        mount.display()
-                    );
+                    self.remove_watches_below(&mount);
+                    failed_adds.insert(mount.clone());
                     let _ = tx.send(event(
                         Action::Overflow,
-                        mount,
+                        mount.clone(),
                         true,
                         "inotify",
                         Actor::unknown(),
                     ));
+                    eprintln!(
+                        "unearth: cannot watch newly mounted {}; will retry: {error}",
+                        mount.display()
+                    );
                 }
             }
         }
         for mount in removed {
+            self.remove_watches_below(&mount);
             let _ = tx.send(event(
                 Action::Overflow,
                 mount,
@@ -1980,15 +2596,26 @@ impl InotifyWatcher {
                 Actor::unknown(),
             ));
         }
-        self.mounted = current;
+        self.mounted = current.difference(&failed_adds).cloned().collect();
         self.last_mount_check = std::time::Instant::now();
+        Ok(())
     }
 
     fn run(mut self, tx: Sender<FsEvent>) {
         let mut buffer = vec![0u8; 1024 * 1024];
-        loop {
+        'watch: loop {
             self.expire_pending_moves(&tx);
-            self.poll_mounts(&tx);
+            if let Err(error) = self.poll_mounts(&tx) {
+                let _ = tx.send(event(
+                    Action::Overflow,
+                    PathBuf::from("/"),
+                    true,
+                    "inotify",
+                    Actor::unknown(),
+                ));
+                eprintln!("unearth: inotify mount coverage failed: {error}");
+                break;
+            }
             let read = unsafe { libc::read(self.fd, buffer.as_mut_ptr().cast(), buffer.len()) };
             if read < 0 {
                 let error = std::io::Error::last_os_error();
@@ -2042,11 +2669,11 @@ impl InotifyWatcher {
                 }
                 let base = self.paths.get(&wd).cloned();
                 if mask & libc::IN_IGNORED != 0 {
+                    self.pending_self_moves.remove(&wd);
+                    self.recently_rebased.remove(&wd);
                     if let Some(ignored) = self.paths.remove(&wd) {
                         self.path_to_wd.remove(&ignored);
                     }
-                    offset += record_len;
-                    continue;
                 }
                 let name = buffer[offset + 16..offset + record_len]
                     .split(|byte| *byte == 0)
@@ -2054,7 +2681,7 @@ impl InotifyWatcher {
                     .unwrap_or_default();
                 let path = base.map(|base| {
                     if name.is_empty() {
-                        base
+                        base.to_path_buf()
                     } else {
                         base.join(OsStr::from_bytes(name))
                     }
@@ -2067,15 +2694,94 @@ impl InotifyWatcher {
                         "inotify",
                         Actor::unknown(),
                     ));
+                    let roots = self.roots.clone();
+                    for root in roots {
+                        if let Err(error) = self.add_recursive(&root.path) {
+                            eprintln!(
+                                "unearth: cannot restore watch coverage after queue overflow: {error}"
+                            );
+                            break 'watch;
+                        }
+                    }
+                    // The first recovery marks the index dirty while watches are
+                    // rebuilt; this second one closes the reconstruction window.
+                    let _ = tx.send(event(
+                        Action::Overflow,
+                        PathBuf::from("/"),
+                        true,
+                        "inotify",
+                        Actor::unknown(),
+                    ));
+                    offset += record_len;
+                    continue;
+                }
+                let actionable_mask = libc::IN_CREATE
+                    | libc::IN_DELETE
+                    | libc::IN_MOVED_FROM
+                    | libc::IN_MOVED_TO
+                    | libc::IN_MODIFY
+                    | libc::IN_CLOSE_WRITE
+                    | libc::IN_ATTRIB
+                    | libc::IN_DELETE_SELF
+                    | libc::IN_MOVE_SELF
+                    | libc::IN_UNMOUNT;
+                if mask & libc::IN_IGNORED != 0 && mask & actionable_mask == 0 {
+                    if let Some(path) = path.as_deref() {
+                        if path.is_dir() {
+                            if let Err(error) = self.add_recursive(path) {
+                                let _ = tx.send(event(
+                                    Action::Overflow,
+                                    path.to_path_buf(),
+                                    true,
+                                    "inotify",
+                                    Actor::unknown(),
+                                ));
+                                eprintln!(
+                                    "unearth: cannot restore unexpectedly removed watch for {}: {error}",
+                                    path.display()
+                                );
+                                break 'watch;
+                            }
+                        }
+                        let _ = tx.send(event(
+                            Action::Reconcile,
+                            path.to_path_buf(),
+                            true,
+                            "inotify",
+                            Actor::unknown(),
+                        ));
+                    }
                     offset += record_len;
                     continue;
                 }
                 let Some(path) = path else {
+                    if mask & actionable_mask != 0 {
+                        let _ = tx.send(event(
+                            Action::Overflow,
+                            PathBuf::from("/"),
+                            true,
+                            "inotify",
+                            Actor::unknown(),
+                        ));
+                    }
                     offset += record_len;
                     continue;
                 };
                 let is_dir = mask & libc::IN_ISDIR != 0;
-                if mask & libc::IN_MOVED_FROM != 0 {
+                if mask & (libc::IN_UNMOUNT | libc::IN_DELETE_SELF) != 0 {
+                    let _ = tx.send(event(
+                        Action::Overflow,
+                        path,
+                        true,
+                        "inotify",
+                        Actor::unknown(),
+                    ));
+                } else if mask & libc::IN_MOVE_SELF != 0 {
+                    if self.recently_rebased.remove(&wd).is_none() {
+                        self.pending_self_moves
+                            .insert(wd, (path, std::time::Instant::now()));
+                    }
+                } else if mask & libc::IN_MOVED_FROM != 0 {
                     if cookie != 0 {
                         self.pending_moves.insert(
                             cookie,
@@ -2096,7 +2802,32 @@ impl InotifyWatcher {
                     }
                 } else if mask & libc::IN_MOVED_TO != 0 {
                     if let Some(old) = self.pending_moves.remove(&cookie) {
-                        self.update_watches_after_move(&old.path, &path);
+                        let destination_is_watched =
+                            matching_root(&self.roots, &path).is_some_and(|root| {
+                                !is_root_index_excluded_path(&root.key, &normalize_index_dir(&path))
+                            });
+                        if destination_is_watched {
+                            let watch_coverage_rebased =
+                                self.update_watches_after_move(&old.path, &path);
+                            if (is_dir || old.is_dir) && !watch_coverage_rebased {
+                                if let Err(error) = self.add_recursive(&path) {
+                                    let _ = tx.send(event(
+                                        Action::Overflow,
+                                        path.clone(),
+                                        true,
+                                        "inotify",
+                                        Actor::unknown(),
+                                    ));
+                                    eprintln!(
+                                        "unearth: cannot cover moved directory {}: {error}",
+                                        path.display()
+                                    );
+                                    break 'watch;
+                                }
+                            }
+                        } else if old.is_dir {
+                            self.remove_watches_below(&old.path);
+                        }
                         let mut moved = event(
                             Action::Move,
                             path.clone(),
@@ -2107,16 +2838,42 @@ impl InotifyWatcher {
                         moved.old_path = Some(old.path);
                         let _ = tx.send(moved);
                     } else {
-                        if let Err(error) = self.add_recursive(&path) {
-                            eprintln!("unearth: cannot watch moved-in {}: {error}", path.display());
+                        if is_dir {
+                            let entries = match self.add_recursive_collect(&path) {
+                                Ok(entries) => entries,
+                                Err(error) => {
+                                    let _ = tx.send(event(
+                                        Action::Overflow,
+                                        path.clone(),
+                                        true,
+                                        "inotify",
+                                        Actor::unknown(),
+                                    ));
+                                    eprintln!(
+                                        "unearth: cannot watch moved-in {}: {error}",
+                                        path.display()
+                                    );
+                                    break 'watch;
+                                }
+                            };
+                            let mut reconcile = event(
+                                Action::Reconcile,
+                                path.clone(),
+                                true,
+                                "inotify",
+                                Actor::unknown(),
+                            );
+                            reconcile.scanned_entries = Some(Arc::new(entries));
+                            let _ = tx.send(reconcile);
+                        } else {
+                            let _ = tx.send(event(
+                                Action::Reconcile,
+                                path.clone(),
+                                is_dir,
+                                "inotify",
+                                Actor::unknown(),
+                            ));
                         }
-                        let _ = tx.send(event(
-                            Action::Reconcile,
-                            path.clone(),
-                            is_dir,
-                            "inotify",
-                            Actor::unknown(),
-                        ));
                         if !is_dir {
                             let _ = tx.send(event(
                                 Action::Upsert,
@@ -2129,29 +2886,45 @@ impl InotifyWatcher {
                     }
                 } else if mask & libc::IN_CREATE != 0 {
                     if is_dir {
-                        if let Err(error) = self.add_recursive(&path) {
-                            eprintln!(
-                                "unearth: cannot watch new directory {}: {error}",
-                                path.display()
-                            );
-                        }
-                        // Install the watch before reconciling so children created
-                        // immediately after mkdir cannot be missed.
-                        let _ = tx.send(event(
+                        let entries = match self.add_recursive_collect(&path) {
+                            Ok(entries) => entries,
+                            Err(error) => {
+                                let _ = tx.send(event(
+                                    Action::Overflow,
+                                    path.clone(),
+                                    true,
+                                    "inotify",
+                                    Actor::unknown(),
+                                ));
+                                eprintln!(
+                                    "unearth: cannot watch new directory {}: {error}",
+                                    path.display()
+                                );
+                                break 'watch;
+                            }
+                        };
+                        // The watch walk also discovers the initial subtree. Reuse
+                        // those entries during reconciliation instead of walking it
+                        // a second time; later child events invalidate this snapshot.
+                        let mut reconcile = event(
                             Action::Reconcile,
                             path.clone(),
                             true,
                             "inotify",
                             Actor::unknown(),
+                        );
+                        reconcile.scanned_entries = Some(Arc::new(entries));
+                        let _ = tx.send(reconcile);
+                    }
+                    if !is_dir {
+                        let _ = tx.send(event(
+                            Action::Upsert,
+                            path,
+                            is_dir,
+                            "inotify",
+                            Actor::unknown(),
                         ));
                     }
-                    let _ = tx.send(event(
-                        Action::Upsert,
-                        path,
-                        is_dir,
-                        "inotify",
-                        Actor::unknown(),
-                    ));
                 } else if mask & libc::IN_DELETE != 0 {
                     if is_dir {
                         self.remove_watches_below(&path);
@@ -2163,38 +2936,52 @@ impl InotifyWatcher {
                         "inotify",
                         Actor::unknown(),
                     ));
-                } else if mask & libc::IN_UNMOUNT != 0 {
-                    let _ = tx.send(event(
-                        Action::Overflow,
-                        path,
-                        true,
-                        "inotify",
-                        Actor::unknown(),
-                    ));
-                } else if mask & libc::IN_CLOSE_WRITE != 0 {
+                } else if mask & (libc::IN_MODIFY | libc::IN_CLOSE_WRITE) != 0 {
                     let mut changed =
                         event(Action::Upsert, path, is_dir, "inotify", Actor::unknown());
                     changed.event_kind = EVENT_MODIFY;
                     let _ = tx.send(changed);
                 } else if mask & libc::IN_ATTRIB != 0 {
+                    if is_dir {
+                        if let Err(error) = self.add_recursive(&path) {
+                            let _ = tx.send(event(
+                                Action::Overflow,
+                                path.clone(),
+                                true,
+                                "inotify",
+                                Actor::unknown(),
+                            ));
+                            eprintln!(
+                                "unearth: cannot restore directory coverage for {}: {error}",
+                                path.display()
+                            );
+                            break 'watch;
+                        }
+                    }
                     let mut changed =
                         event(Action::Upsert, path, is_dir, "inotify", Actor::unknown());
                     changed.event_kind = EVENT_ATTRIB;
                     let _ = tx.send(changed);
-                } else if mask & (libc::IN_DELETE_SELF | libc::IN_MOVE_SELF) != 0 {
-                    let _ = tx.send(event(
-                        Action::Overflow,
-                        path,
-                        is_dir,
-                        "inotify",
-                        Actor::unknown(),
-                    ));
                 }
                 offset += record_len;
             }
         }
+        let fd = self.fd;
+        self.fd = -1;
         unsafe {
-            libc::close(self.fd);
+            libc::close(fd);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for InotifyWatcher {
+    fn drop(&mut self) {
+        if self.fd >= 0 {
+            unsafe {
+                libc::close(self.fd);
+            }
+            self.fd = -1;
         }
     }
 }
@@ -2217,7 +3004,7 @@ fn start_fanotify(roots: &[RootState]) -> Result<(Receiver<FsEvent>, String), St
     if fd < 0 {
         return Err(std::io::Error::last_os_error().to_string());
     }
-    let mut mounts = Vec::new();
+    let mut mounts: Vec<MountHandle> = Vec::new();
     let mut marked = HashSet::new();
     let mut mount_ids = HashMap::new();
     for root in roots {
@@ -2226,8 +3013,22 @@ fn start_fanotify(roots: &[RootState]) -> Result<(Receiver<FsEvent>, String), St
             if !marked.insert(mount.clone()) {
                 continue;
             }
-            let Some(c_path) = CString::new(mount.as_os_str().as_bytes()).ok() else {
-                continue;
+            let c_path = match CString::new(mount.as_os_str().as_bytes()) {
+                Ok(path) => path,
+                Err(_) => {
+                    for handle in mounts {
+                        unsafe {
+                            libc::close(handle.fd);
+                        }
+                    }
+                    unsafe {
+                        libc::close(fd);
+                    }
+                    return Err(format!(
+                        "cannot watch mount path containing NUL: {}",
+                        mount.display()
+                    ));
+                }
             };
             let result = unsafe {
                 libc::syscall(
@@ -2240,6 +3041,11 @@ fn start_fanotify(roots: &[RootState]) -> Result<(Receiver<FsEvent>, String), St
                 ) as i32
             };
             if result < 0 {
+                for handle in mounts {
+                    unsafe {
+                        libc::close(handle.fd);
+                    }
+                }
                 unsafe {
                     libc::close(fd);
                 }
@@ -2261,6 +3067,20 @@ fn start_fanotify(roots: &[RootState]) -> Result<(Receiver<FsEvent>, String), St
                     path: mount.clone(),
                 });
                 mount_ids.insert(mount.clone(), mount_identity(&mount));
+            } else {
+                let error = std::io::Error::last_os_error();
+                for handle in mounts {
+                    unsafe {
+                        libc::close(handle.fd);
+                    }
+                }
+                unsafe {
+                    libc::close(fd);
+                }
+                return Err(format!(
+                    "cannot open marked mount {}: {error}",
+                    mount.display()
+                ));
             }
         }
     }
@@ -2272,19 +3092,17 @@ fn start_fanotify(roots: &[RootState]) -> Result<(Receiver<FsEvent>, String), St
     }
     let (tx, rx) = bounded(WATCH_CHANNEL_CAPACITY);
     let roots = roots.to_vec();
+    let watcher = FanotifyWatcher {
+        fd,
+        roots,
+        mounts,
+        marked,
+        fsid_mounts: HashMap::new(),
+        mount_ids,
+    };
     thread::Builder::new()
         .name("unearth-fanotify".to_string())
-        .spawn(move || {
-            FanotifyWatcher {
-                fd,
-                roots,
-                mounts,
-                marked,
-                fsid_mounts: HashMap::new(),
-                mount_ids,
-            }
-            .run(tx)
-        })
+        .spawn(move || watcher.run(tx))
         .map_err(|e| e.to_string())?;
     Ok((rx, "fanotify".to_string()))
 }
@@ -2299,6 +3117,7 @@ fn fanotify_event_mask() -> u64 {
         | libc::FAN_MODIFY
         | libc::FAN_CLOSE_WRITE
         | libc::FAN_ATTRIB
+        | libc::FAN_FS_ERROR
         | libc::FAN_DELETE_SELF
         | libc::FAN_MOVE_SELF
         | libc::FAN_EVENT_ON_CHILD
@@ -2324,7 +3143,7 @@ struct FanotifyWatcher {
 
 #[cfg(target_os = "linux")]
 impl FanotifyWatcher {
-    fn add_new_mounts(&mut self, tx: &Sender<FsEvent>) {
+    fn add_new_mounts(&mut self, tx: &Sender<FsEvent>) -> Result<(), String> {
         let current_ids: HashMap<PathBuf, Option<u64>> = self
             .roots
             .iter()
@@ -2362,6 +3181,13 @@ impl FanotifyWatcher {
             self.marked.remove(&mount);
             self.fsid_mounts.clear();
             self.mount_ids.remove(&mount);
+            let _ = tx.send(event(
+                Action::Overflow,
+                mount,
+                true,
+                "fanotify",
+                Actor::unknown(),
+            ));
         }
         for root in &self.roots {
             for mount in mount_candidates(&root.path) {
@@ -2370,8 +3196,22 @@ impl FanotifyWatcher {
                 {
                     continue;
                 }
-                let Some(c_path) = CString::new(mount.as_os_str().as_bytes()).ok() else {
-                    continue;
+                let c_path = match CString::new(mount.as_os_str().as_bytes()) {
+                    Ok(path) => path,
+                    Err(_) => {
+                        let _ = tx.send(event(
+                            Action::Overflow,
+                            mount.clone(),
+                            true,
+                            "fanotify",
+                            Actor::unknown(),
+                        ));
+                        eprintln!(
+                            "unearth: cannot watch mount path containing NUL {}; will retry",
+                            mount.display()
+                        );
+                        continue;
+                    }
                 };
                 let result = unsafe {
                     libc::syscall(
@@ -2384,10 +3224,17 @@ impl FanotifyWatcher {
                     ) as i32
                 };
                 if result < 0 {
+                    let error = std::io::Error::last_os_error();
+                    let _ = tx.send(event(
+                        Action::Overflow,
+                        mount.clone(),
+                        true,
+                        "fanotify",
+                        Actor::unknown(),
+                    ));
                     eprintln!(
-                        "unearth: cannot mark newly mounted {}: {}",
-                        mount.display(),
-                        std::io::Error::last_os_error()
+                        "unearth: cannot mark newly mounted {}; will retry: {error}",
+                        mount.display()
                     );
                     continue;
                 }
@@ -2414,14 +3261,32 @@ impl FanotifyWatcher {
                         Actor::unknown(),
                     ));
                 } else {
+                    let error = std::io::Error::last_os_error();
+                    unsafe {
+                        libc::syscall(
+                            libc::SYS_fanotify_mark,
+                            self.fd,
+                            (libc::FAN_MARK_REMOVE | libc::FAN_MARK_FILESYSTEM) as libc::c_uint,
+                            fanotify_event_mask() as libc::c_ulong,
+                            libc::AT_FDCWD,
+                            c_path.as_ptr(),
+                        );
+                    }
+                    let _ = tx.send(event(
+                        Action::Overflow,
+                        mount.clone(),
+                        true,
+                        "fanotify",
+                        Actor::unknown(),
+                    ));
                     eprintln!(
-                        "unearth: cannot open newly mounted {}: {}",
-                        mount.display(),
-                        std::io::Error::last_os_error()
+                        "unearth: cannot open newly mounted {}; will retry: {error}",
+                        mount.display()
                     );
                 }
             }
         }
+        Ok(())
     }
 
     fn resolve_handle(&mut self, record: &[u8]) -> Option<PathBuf> {
@@ -2548,9 +3413,19 @@ impl FanotifyWatcher {
     fn run(mut self, tx: Sender<FsEvent>) {
         let mut buffer = vec![0u8; 1024 * 1024];
         let mut last_mount_check = std::time::Instant::now();
-        loop {
+        'watch: loop {
             if last_mount_check.elapsed() >= WATCH_MOUNT_CHECK_INTERVAL {
-                self.add_new_mounts(&tx);
+                if let Err(error) = self.add_new_mounts(&tx) {
+                    let _ = tx.send(event(
+                        Action::Overflow,
+                        PathBuf::from("/"),
+                        true,
+                        "fanotify",
+                        Actor::unknown(),
+                    ));
+                    eprintln!("unearth: fanotify mount coverage failed: {error}");
+                    break;
+                }
                 last_mount_check = std::time::Instant::now();
             }
             let read = unsafe { libc::read(self.fd, buffer.as_mut_ptr().cast(), buffer.len()) };
@@ -2566,7 +3441,7 @@ impl FanotifyWatcher {
                             Actor::unknown(),
                         ));
                         eprintln!("unearth: fanotify wait failed: {error}");
-                        break;
+                        break 'watch;
                     }
                     continue;
                 }
@@ -2624,7 +3499,20 @@ impl FanotifyWatcher {
                 }
                 let mask = u64::from_ne_bytes(buffer[offset + 8..offset + 16].try_into().unwrap());
                 let pid = i32::from_ne_bytes(buffer[offset + 20..offset + 24].try_into().unwrap());
-                if mask & libc::FAN_Q_OVERFLOW != 0 {
+                if mask & (libc::FAN_Q_OVERFLOW | libc::FAN_FS_ERROR) != 0 {
+                    let _ = tx.send(event(
+                        Action::Overflow,
+                        PathBuf::from("/"),
+                        true,
+                        "fanotify",
+                        classify_actor(pid),
+                    ));
+                    if let Err(error) = self.add_new_mounts(&tx) {
+                        eprintln!(
+                            "unearth: cannot restore fanotify coverage after overflow: {error}"
+                        );
+                        break 'watch;
+                    }
                     let _ = tx.send(event(
                         Action::Overflow,
                         PathBuf::from("/"),
@@ -2716,13 +3604,32 @@ impl FanotifyWatcher {
                 offset += event_len;
             }
         }
-        for mount in self.mounts {
+        for mount in self.mounts.drain(..) {
             unsafe {
                 libc::close(mount.fd);
             }
         }
+        let fd = self.fd;
+        self.fd = -1;
         unsafe {
-            libc::close(self.fd);
+            libc::close(fd);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for FanotifyWatcher {
+    fn drop(&mut self) {
+        for mount in self.mounts.drain(..) {
+            unsafe {
+                libc::close(mount.fd);
+            }
+        }
+        if self.fd >= 0 {
+            unsafe {
+                libc::close(self.fd);
+            }
+            self.fd = -1;
         }
     }
 }
@@ -2737,7 +3644,49 @@ fn transient_watch_path_error(error: &std::io::Error) -> bool {
 
 #[cfg(target_os = "linux")]
 fn mount_identity(path: &Path) -> Option<u64> {
+    let target = normalize_index_dir(path);
+    if let Some(id) = cached_mount_identities().get(&target) {
+        return Some(*id);
+    }
     fs::metadata(path).ok().map(|metadata| metadata.dev())
+}
+
+#[cfg(target_os = "linux")]
+fn cached_mount_identities() -> HashMap<String, u64> {
+    type MountIdentityCache = Option<(Instant, HashMap<String, u64>)>;
+    static CACHE: OnceLock<Mutex<MountIdentityCache>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    let Ok(mut guard) = cache.lock() else {
+        return HashMap::new();
+    };
+    if let Some((created, identities)) = guard.as_ref() {
+        if created.elapsed() < Duration::from_secs(5) {
+            return identities.clone();
+        }
+    }
+    let mut identities = HashMap::new();
+    if let Ok(mountinfo) = fs::read_to_string("/proc/self/mountinfo") {
+        for line in mountinfo.lines() {
+            let mut fields = line.split_whitespace();
+            let Some(raw_id) = fields.next() else {
+                continue;
+            };
+            let _ = fields.next();
+            let _ = fields.next();
+            let _ = fields.next();
+            let Some(raw_mount) = fields.next() else {
+                continue;
+            };
+            if let Ok(id) = raw_id.parse() {
+                identities.insert(
+                    normalize_index_dir(Path::new(&unescape_proc_mount_field(raw_mount))),
+                    id,
+                );
+            }
+        }
+    }
+    *guard = Some((Instant::now(), identities.clone()));
+    identities
 }
 
 #[cfg(target_os = "linux")]
@@ -2774,6 +3723,78 @@ fn mount_candidates(root: &Path) -> Vec<PathBuf> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inotify_directory_move_reuses_pooled_watch_paths() {
+        let old = PathBuf::from("/tmp/unearth-watch-old");
+        let child = old.join("child");
+        let new = PathBuf::from("/tmp/unearth-watch-new");
+        let old_shared = Arc::<Path>::from(old.as_path());
+        let child_shared = Arc::<Path>::from(child.as_path());
+        let mut watcher = InotifyWatcher {
+            fd: -1,
+            roots: Vec::new(),
+            paths: HashMap::from([(1, Arc::clone(&old_shared)), (2, Arc::clone(&child_shared))]),
+            path_to_wd: BTreeMap::from([(old_shared, 1), (child_shared, 2)]),
+            pending_moves: HashMap::new(),
+            pending_self_moves: HashMap::from([
+                (1, (old.clone(), std::time::Instant::now())),
+                (2, (child, std::time::Instant::now())),
+            ]),
+            recently_rebased: HashMap::new(),
+            mounted: HashSet::new(),
+            last_mount_check: std::time::Instant::now(),
+        };
+
+        assert!(watcher.update_watches_after_move(&old, &new));
+        for (wd, expected) in [(1, new.clone()), (2, new.join("child"))] {
+            let shared = watcher.paths.get(&wd).unwrap();
+            assert_eq!(shared.as_ref(), expected);
+            assert_eq!(watcher.path_to_wd.get(shared), Some(&wd));
+            assert_eq!(Arc::strong_count(shared), 2);
+            assert!(!watcher.pending_self_moves.contains_key(&wd));
+            assert!(watcher.recently_rebased.contains_key(&wd));
+        }
+    }
+
+    fn live_entry_test_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE strings (
+                 id INTEGER PRIMARY KEY,
+                 value TEXT NOT NULL UNIQUE
+             );
+             CREATE TABLE dirs (
+                 id INTEGER PRIMARY KEY,
+                 path TEXT NOT NULL UNIQUE
+             );
+             CREATE TABLE actors (
+                 id INTEGER PRIMARY KEY,
+                 executable TEXT NOT NULL UNIQUE,
+                 classification TEXT NOT NULL,
+                 first_seen INTEGER NOT NULL,
+                 last_seen INTEGER NOT NULL
+             );
+             CREATE TABLE entries (
+                 id INTEGER PRIMARY KEY,
+                 dir_id INTEGER NOT NULL,
+                 name_id INTEGER NOT NULL,
+                 kind INTEGER NOT NULL,
+                 mtime INTEGER,
+                 size INTEGER,
+                 activity INTEGER,
+                 event_kind INTEGER,
+                 actor_id INTEGER,
+                 actor_uid INTEGER,
+                 actor_pid INTEGER,
+                 event_at INTEGER,
+                 UNIQUE(dir_id, name_id, kind)
+             );",
+        )
+        .unwrap();
+        conn
+    }
+
     #[test]
     fn coalescing_preserves_reconcile_over_later_upsert() {
         let path = PathBuf::from("/tmp/unearth-watch-test");
@@ -2794,6 +3815,196 @@ mod tests {
     }
 
     #[test]
+    fn pre_scanned_reconcile_is_invalidated_by_child_event() {
+        let root = PathBuf::from("/tmp/unearth-watch-test");
+        let child = root.join("child");
+        let mut reconcile = event(
+            Action::Reconcile,
+            root.clone(),
+            true,
+            "test",
+            Actor::unknown(),
+        );
+        reconcile.scanned_entries = Some(Arc::new(Vec::new()));
+        let batch = vec![
+            reconcile,
+            event(Action::Upsert, child, false, "test", Actor::unknown()),
+        ];
+        let mut scans = HashMap::from([(root, Arc::new(Vec::new()))]);
+
+        invalidate_stale_reconcile_scans(&batch, &mut scans);
+
+        assert!(scans.is_empty());
+    }
+
+    #[test]
+    fn coalescing_never_discards_overflow_recovery() {
+        let path = PathBuf::from("/tmp/unearth-watch-test");
+        let batch = vec![
+            event(
+                Action::Overflow,
+                path.clone(),
+                true,
+                "test",
+                Actor::unknown(),
+            ),
+            event(Action::Upsert, path, true, "test", Actor::unknown()),
+        ];
+        let result = coalesce_batch(batch);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].action, Action::Overflow);
+    }
+
+    #[test]
+    fn coalescing_does_not_reorder_events_across_moves() {
+        let old = PathBuf::from("/tmp/unearth-watch-old");
+        let new = PathBuf::from("/tmp/unearth-watch-new");
+        let mut moved = event(Action::Move, new.clone(), false, "test", Actor::unknown());
+        moved.old_path = Some(old.clone());
+        let batch = vec![
+            event(Action::Upsert, old, false, "test", Actor::unknown()),
+            moved,
+            event(Action::Upsert, new, false, "test", Actor::unknown()),
+        ];
+        let result = coalesce_batch(batch);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].action, Action::Upsert);
+        assert_eq!(result[1].action, Action::Move);
+        assert_eq!(result[2].action, Action::Upsert);
+    }
+
+    #[test]
+    fn upsert_state_converges_an_empty_directory_and_its_deletion() {
+        let path = std::env::temp_dir().join(format!(
+            "unearth-empty-dir-{}-{}",
+            std::process::id(),
+            now_nanos()
+        ));
+        fs::create_dir(&path).unwrap();
+        let mut conn = live_entry_test_db();
+        let mut caches = DbCaches::default();
+        let tx = conn.transaction().unwrap();
+        let state = upsert_path(
+            &tx,
+            &path,
+            true,
+            &Actor::reconcile(),
+            EVENT_RECONCILE,
+            &mut caches,
+        )
+        .unwrap();
+        assert_eq!(state, IndexedPathState::Directory);
+        tx.commit().unwrap();
+        let indexed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entries e
+                 JOIN dirs d ON d.id=e.dir_id
+                 JOIN strings s ON s.id=e.name_id
+                 WHERE d.path || '/' || s.value=?1 AND e.kind=1",
+                [normalize_index_dir(&path)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 1);
+
+        fs::remove_dir(&path).unwrap();
+        let tx = conn.transaction().unwrap();
+        let state = upsert_path(
+            &tx,
+            &path,
+            true,
+            &Actor::reconcile(),
+            EVENT_RECONCILE,
+            &mut caches,
+        )
+        .unwrap();
+        assert_eq!(state, IndexedPathState::Missing);
+        tx.commit().unwrap();
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn indexed_directory_move_rewrites_descendants_without_a_rescan() {
+        let base = std::env::temp_dir().join(format!(
+            "unearth-move-dir-{}-{}",
+            std::process::id(),
+            now_nanos()
+        ));
+        let old = base.join("old");
+        let child = old.join("child");
+        let file = child.join("file.txt");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(&file, b"test").unwrap();
+        let mut conn = live_entry_test_db();
+        let mut caches = DbCaches::default();
+        {
+            let tx = conn.transaction().unwrap();
+            for (path, is_dir) in [(&old, true), (&child, true), (&file, false)] {
+                upsert_path(
+                    &tx,
+                    path,
+                    is_dir,
+                    &Actor::unknown(),
+                    EVENT_CREATE,
+                    &mut caches,
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        let new = base.join("new");
+        fs::rename(&old, &new).unwrap();
+        let tx = conn.transaction().unwrap();
+        assert!(move_indexed_directory(
+            &tx,
+            &old,
+            &new,
+            &Actor::unknown(),
+            EVENT_MOVE,
+            &mut caches,
+        )
+        .unwrap());
+        tx.commit().unwrap();
+
+        let old_key = normalize_index_dir(&old);
+        let new_key = normalize_index_dir(&new);
+        let old_prefix = index_path_prefix(&old_key);
+        let new_prefix = index_path_prefix(&new_key);
+        let old_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dirs WHERE path=?1 OR path LIKE ?2",
+                params![old_key, format!("{old_prefix}%")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_count, 0);
+        let new_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dirs WHERE path=?1 OR path LIKE ?2",
+                params![new_key, format!("{new_prefix}%")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_count, 2);
+        let file_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entries e
+                 JOIN dirs d ON d.id=e.dir_id
+                 JOIN strings s ON s.id=e.name_id
+                 WHERE d.path=?1 AND s.value='file.txt' AND e.kind=0",
+                [normalize_index_dir(&new.join("child"))],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(file_count, 1);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn reconciliation_collapses_nested_paths_to_the_oldest_ancestor() {
         let paths = HashSet::from([
             PathBuf::from("/home/user/project"),
@@ -2805,8 +4016,8 @@ mod tests {
         assert_eq!(
             result,
             vec![
-                PathBuf::from("/home/user/project"),
-                PathBuf::from("/home/user/other")
+                PathBuf::from("/home/user/other"),
+                PathBuf::from("/home/user/project")
             ]
         );
     }
