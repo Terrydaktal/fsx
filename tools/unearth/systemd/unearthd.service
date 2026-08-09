@@ -1,0 +1,11 @@
+[Unit]
+Description=Unearth live filesystem index daemon
+After=local-fs.target
+
+[Service]
+ExecStart=%h/.local/bin/unearthd %h
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=default.target
