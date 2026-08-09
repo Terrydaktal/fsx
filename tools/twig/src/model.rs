@@ -1,0 +1,33 @@
+use std::fs;
+use std::path::PathBuf;
+
+pub(crate) struct EntryInfo {
+    pub(crate) display_name: String,
+    pub(crate) render_name: String,
+    pub(crate) actual_path: PathBuf,
+    pub(crate) metadata: fs::Metadata,
+    pub(crate) is_symlink: bool,
+    pub(crate) is_dir: bool,
+    pub(crate) is_target_dir: bool,
+    pub(crate) is_hidden: bool,
+    pub(crate) logical_size_str: String,
+    pub(crate) true_size_str: String,
+    pub(crate) dir_count_str: String,
+    pub(crate) file_count_str: String,
+    pub(crate) user_str: String,
+    pub(crate) group_str: String,
+    pub(crate) time_str: String,
+    pub(crate) final_size: u64,
+    pub(crate) dir_count: u64,
+    pub(crate) file_count: u64,
+    pub(crate) sort_mtime: i64,
+    pub(crate) size_sort_name: String,
+    pub(crate) type_rank: u8,
+    pub(crate) count_sort_key: u64,
+    pub(crate) symlink_target: Option<PathBuf>,
+    pub(crate) target_metadata: Option<fs::Metadata>,
+    pub(crate) broken_symlink: bool,
+    pub(crate) git_status: Option<(char, char)>,
+    pub(crate) repo_status: Option<char>,
+    pub(crate) repo_remote_status: Option<char>,
+}
