@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || realpath -- "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)"
+BIN="$SCRIPT_DIR/target/release/copy-rs"
+
+rust_source_is_newer() {
+	find "$SCRIPT_DIR/src" -type f -name '*.rs' -newer "$BIN" -print -quit | grep -q .
+}
+
+if [[ ! -x "$BIN" || "$SCRIPT_DIR/Cargo.toml" -nt "$BIN" || "$SCRIPT_DIR/Cargo.lock" -nt "$BIN" || "$SCRIPT_DIR/.cargo/config.toml" -nt "$BIN" ]] || rust_source_is_newer; then
+	cargo build --release --quiet --manifest-path "$SCRIPT_DIR/Cargo.toml"
+fi
+
+exec "$BIN" "$@"

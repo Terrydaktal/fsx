@@ -1,0 +1,25 @@
+[package]
+name = "copy-rs"
+version = "0.2.4"
+edition = "2021"
+
+[dependencies]
+filetime = "0.2"
+jemallocator = "0.5"
+jwalk = "0.8"
+nix = { version = "0.29", default-features = false, features = ["fs"] }
+rayon = "1.10"
+regex = "1"
+rustc-hash = "2"
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+incremental = false
+debug = 0
+debug-assertions = false
+overflow-checks = false
