@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/fsx",
+    "tools/tree",
+    "tools/twig",
+    "tools/unearth",
+    "tools/fsxd",
+   "tools/copy",
+]
+
+[workspace.dependencies]
+fsx = { path = "crates/fsx" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+strip = "symbols"
+incremental = false
+debug = 0
+debug-assertions = false
+overflow-checks = true

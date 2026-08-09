@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Test workspace
+        run: cargo test --workspace --all-targets --all-features
+      - name: Clippy
+        # The legacy tools intentionally retain a few layout-oriented and
+        # type-complexity patterns; keep CI informative without making those
+        # non-safety lints block builds.
+        run: cargo clippy --workspace --all-targets --all-features -- -W clippy::all
+      - name: Release build
+        run: cargo build --workspace --all-targets --all-features --release
+
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check shell scripts
+        run: shellcheck tools/copy/copy

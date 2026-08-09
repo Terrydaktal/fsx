@@ -1,0 +1,9 @@
+[package]
+name = "fsxd"
+license = "MIT"
+version = "0.1.0"
+edition = "2021"
+description = "Shared filesystem index daemon for the fsx tools"
+
+[dependencies]
+unearth = { path = "../unearth", features = ["watcher"] }

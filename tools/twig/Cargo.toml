@@ -1,0 +1,17 @@
+[package]
+name = "twig"
+license = "MIT"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono = "0.4.44"
+clap = { version = "4.6.0", features = ["derive"] }
+fsx = { workspace = true, features = ["colors", "git", "index", "ntfs", "terminal"] }
+jemallocator = "0.5.4"
+jwalk = "0.8.1"
+libc = "0.2.183"
+lscolors = "0.21.0"
+ntfs = "0.4.0"
+nu-ansi-term = "0.50.3"
+rayon = "1.11.0"

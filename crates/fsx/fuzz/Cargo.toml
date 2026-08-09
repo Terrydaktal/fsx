@@ -1,0 +1,19 @@
+[package]
+name = "fsx-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+fsx = { path = "..", features = ["colors", "ignore", "terminal"] }
+
+[[bin]]
+name = "path_and_color_inputs"
+path = "fuzz_targets/path_and_color_inputs.rs"
+test = false
+doc = false
+bench = false

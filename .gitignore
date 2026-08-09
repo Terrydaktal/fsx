@@ -1,0 +1,17 @@
+/target/
+/tools/*/target/
+/crates/fsx/target/
+/tools/*/Cargo.lock
+/crates/fsx/Cargo.lock
+/tools/*/tree
+/tools/*/twig
+/tools/*/unearth
+/tools/*/unearthd
+/tools/*/fsxd
+/tools/*/copy
+*.profraw
+__pycache__/
+.pytest_cache/
+.DS_Store
+*.swp
+*.swo

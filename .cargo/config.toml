@@ -1,0 +1,2 @@
+# Keep release binaries portable. Developers can opt into local CPU tuning with
+# RUSTFLAGS='-C target-cpu=native' for machine-specific benchmarks.

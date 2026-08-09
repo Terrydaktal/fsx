@@ -1,0 +1,11 @@
+[Unit]
+Description=fsx live filesystem index daemon
+After=local-fs.target
+
+[Service]
+ExecStart=%h/.local/bin/fsxd %h
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=default.target

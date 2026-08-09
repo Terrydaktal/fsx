@@ -1,0 +1,17 @@
+[package]
+name = "tree"
+license = "MIT"
+version = "0.2.9"
+edition = "2024"
+
+[dependencies]
+chrono = "0.4.44"
+clap = { version = "4.6.0", features = ["derive"] }
+fsx = { workspace = true, features = ["colors", "git", "ignore", "terminal"] }
+dashmap = { version = "6.1.0", features = ["rayon"] }
+is-terminal = "0.4.17"
+jwalk = "0.8.1"
+lscolors = "0.21.0"
+rayon = "1.11.0"
+rustc-hash = "2.1.1"
+jemallocator = "0.5.4"
