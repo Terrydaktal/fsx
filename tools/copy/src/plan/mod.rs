@@ -9,10 +9,11 @@ pub(crate) use policy::{
     sync_regular_file_change,
 };
 pub(crate) use resolve::{
-    can_fast_rename_same_fs, create_destination_parents, destination_available_bytes,
+    can_fast_rename_same_fs, create_destination_parents_path, destination_available_bytes,
     endpoint_to_rsync, enrich_remote_spec, existing_probe_path, parse_remote_spec,
-    realpath_allow_missing, resolve_destination_for_dir, resolve_destination_for_file,
-    resolve_source, to_real_path,
+    realpath_allow_missing, resolve_destination_for_dir, resolve_destination_for_dir_path,
+    resolve_destination_for_file, resolve_destination_for_file_path, resolve_source,
+    resolve_source_path, to_real_path, to_real_path_os,
 };
 pub(crate) use scanner::{
     build_destination_index, count_tree_any, map_dir_dest, map_dir_dest_path, normalize_rel,

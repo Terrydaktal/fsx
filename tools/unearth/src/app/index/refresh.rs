@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(unix)]
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone, Copy)]
@@ -8,16 +10,25 @@ pub(crate) struct PendingIndexEntry {
     pub(crate) kind: i64,
     pub(crate) mtime: Option<i64>,
     pub(crate) size: Option<i64>,
+    pub(crate) allocated_size: Option<i64>,
     pub(crate) activity: Option<i64>,
+    pub(crate) device: Option<i64>,
+    pub(crate) inode: Option<i64>,
+    pub(crate) link_count: Option<i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ScannedIndexEntry {
     pub(crate) path: String,
+    pub(crate) raw_path: PathBuf,
     pub(crate) kind: i64,
     pub(crate) mtime: Option<i64>,
     pub(crate) size: Option<i64>,
+    pub(crate) allocated_size: Option<i64>,
     pub(crate) activity: Option<i64>,
+    pub(crate) device: Option<i64>,
+    pub(crate) inode: Option<i64>,
+    pub(crate) link_count: Option<i64>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -28,7 +39,11 @@ pub(crate) struct ExistingIndexEntry<'a> {
     pub(crate) kind: i64,
     pub(crate) mtime: Option<i64>,
     pub(crate) size: Option<i64>,
+    pub(crate) allocated_size: Option<i64>,
     pub(crate) activity: Option<i64>,
+    pub(crate) device: Option<i64>,
+    pub(crate) inode: Option<i64>,
+    pub(crate) link_count: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -92,10 +107,15 @@ pub(crate) fn scan_index_root_cancellable(
             };
             Some(Ok(ScannedIndexEntry {
                 path,
+                raw_path: entry.path().to_path_buf(),
                 kind,
                 mtime: None,
                 size: None,
+                allocated_size: None,
                 activity: None,
+                device: None,
+                inode: None,
+                link_count: None,
             }))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -116,10 +136,31 @@ pub(crate) fn populate_scanned_index_metadata_cancellable(
         if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
             return;
         }
-        let metadata = fs::symlink_metadata(&entry.path).ok();
+        let metadata = fs::symlink_metadata(&entry.raw_path).ok();
         entry.mtime = metadata.as_ref().and_then(metadata_mtime_nanos);
         entry.size = metadata.as_ref().and_then(metadata_size_i64);
+        entry.allocated_size = metadata
+            .as_ref()
+            .and_then(|metadata| i64::try_from(::fsx::metadata::allocated_size(metadata)).ok());
         entry.activity = metadata.as_ref().and_then(metadata_activity_nanos);
+        entry.link_count = metadata
+            .as_ref()
+            .and_then(|metadata| i64::try_from(metadata.nlink()).ok());
+        if entry.kind != 1
+            && metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.nlink() > 1)
+        {
+            entry.device = metadata
+                .as_ref()
+                .and_then(|metadata| i64::try_from(metadata.dev()).ok());
+            entry.inode = metadata
+                .as_ref()
+                .and_then(|metadata| i64::try_from(metadata.ino()).ok());
+        } else {
+            entry.device = None;
+            entry.inode = None;
+        }
     };
     if threads == 1 {
         entries.iter_mut().for_each(populate);
@@ -273,24 +314,33 @@ pub(crate) fn insert_index_entries(
     entries: &[PendingIndexEntry],
 ) -> Result<(), String> {
     for batch in entries.chunks(INDEX_INSERT_BATCH_SIZE) {
-        let values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?)", batch.len())
+        let values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", batch.len())
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "INSERT INTO entries(dir_id, name_id, kind, mtime, size, activity) VALUES {values}
+            "INSERT INTO entries(dir_id, name_id, kind, mtime, size, allocated_size, activity,
+                                 device, inode, link_count) VALUES {values}
              ON CONFLICT(dir_id, name_id, kind) DO UPDATE SET
                  mtime=excluded.mtime,
                  size=excluded.size,
-                 activity=excluded.activity"
+                 allocated_size=excluded.allocated_size,
+                 activity=excluded.activity,
+                 device=excluded.device,
+                 inode=excluded.inode,
+                 link_count=excluded.link_count"
         );
-        let mut params = Vec::<rusqlite::types::Value>::with_capacity(batch.len() * 6);
+        let mut params = Vec::<rusqlite::types::Value>::with_capacity(batch.len() * 10);
         for entry in batch {
             params.push(entry.dir_id.into());
             params.push(entry.name_id.into());
             params.push(entry.kind.into());
             params.push(entry.mtime.into());
             params.push(entry.size.into());
+            params.push(entry.allocated_size.into());
             params.push(entry.activity.into());
+            params.push(entry.device.into());
+            params.push(entry.inode.into());
+            params.push(entry.link_count.into());
         }
         tx.prepare_cached(&sql)
             .map_err(|e| e.to_string())?
@@ -308,7 +358,8 @@ pub(crate) fn load_existing_index_entries(
 ) -> Result<Vec<ExistingIndexEntry<'static>>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT e.dir_id, e.name_id, d.path, s.value, e.kind, e.mtime, e.size, e.activity
+            "SELECT e.dir_id, e.name_id, d.path, s.value, e.kind, e.mtime, e.size,
+                    e.allocated_size, e.activity, e.device, e.inode, e.link_count
                  FROM dirs d
              CROSS JOIN entries e INDEXED BY idx_entries_dir ON e.dir_id = d.id
              JOIN strings s ON e.name_id = s.id
@@ -324,7 +375,11 @@ pub(crate) fn load_existing_index_entries(
             let kind = row.get(4)?;
             let mtime = row.get(5)?;
             let size = row.get(6)?;
-            let activity = row.get(7)?;
+            let allocated_size = row.get(7)?;
+            let activity = row.get(8)?;
+            let device = row.get(9)?;
+            let inode = row.get(10)?;
+            let link_count = row.get(11)?;
             let path = if dir == "/" {
                 format!("/{name}")
             } else {
@@ -337,7 +392,11 @@ pub(crate) fn load_existing_index_entries(
                 kind,
                 mtime,
                 size,
+                allocated_size,
                 activity,
+                device,
+                inode,
+                link_count,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -388,7 +447,11 @@ pub(crate) fn diff_index_entries(
             CmpOrdering::Equal => {
                 if scanned[scan_idx].mtime != existing[existing_idx].mtime
                     || scanned[scan_idx].size != existing[existing_idx].size
+                    || scanned[scan_idx].allocated_size != existing[existing_idx].allocated_size
                     || scanned[scan_idx].activity != existing[existing_idx].activity
+                    || scanned[scan_idx].device != existing[existing_idx].device
+                    || scanned[scan_idx].inode != existing[existing_idx].inode
+                    || scanned[scan_idx].link_count != existing[existing_idx].link_count
                 {
                     updated.push((existing_idx, scan_idx));
                 }
@@ -433,8 +496,9 @@ pub(crate) fn update_index_entries_metadata(
     let mut stmt = tx
         .prepare_cached(
             "UPDATE entries
-             SET mtime = ?1, size = ?2, activity = ?3
-             WHERE dir_id = ?4 AND name_id = ?5 AND kind = ?6",
+             SET mtime = ?1, size = ?2, allocated_size = ?3, activity = ?4,
+                 device = ?5, inode = ?6, link_count = ?7
+             WHERE dir_id = ?8 AND name_id = ?9 AND kind = ?10",
         )
         .map_err(|e| e.to_string())?;
     for &(existing_idx, scanned_idx) in updates {
@@ -443,7 +507,11 @@ pub(crate) fn update_index_entries_metadata(
         stmt.execute(params![
             new.mtime,
             new.size,
+            new.allocated_size,
             new.activity,
+            new.device,
+            new.inode,
+            new.link_count,
             old.dir_id,
             old.name_id,
             old.kind,
@@ -463,7 +531,11 @@ pub(crate) fn apply_index_metadata_updates(
         let new = &scanned[scanned_idx];
         old.mtime = new.mtime;
         old.size = new.size;
+        old.allocated_size = new.allocated_size;
         old.activity = new.activity;
+        old.device = new.device;
+        old.inode = new.inode;
+        old.link_count = new.link_count;
     }
 }
 
@@ -509,7 +581,11 @@ pub(crate) fn write_manifest_from_existing(
                 kind: entry.kind,
                 mtime: entry.mtime,
                 size: entry.size,
+                allocated_size: entry.allocated_size,
                 activity: entry.activity,
+                device: entry.device,
+                inode: entry.inode,
+                link_count: entry.link_count,
             },
             &entry.path,
         )?;
@@ -577,7 +653,11 @@ pub(crate) fn write_incremental_manifest(
                 kind: entry.kind,
                 mtime: entry.mtime,
                 size: entry.size,
+                allocated_size: entry.allocated_size,
                 activity: entry.activity,
+                device: entry.device,
+                inode: entry.inode,
+                link_count: entry.link_count,
             },
             &scanned_entry.path,
         )?;
@@ -745,11 +825,17 @@ pub(crate) fn index_sidecars_are_current(root_key: &str, fingerprint: &str) -> b
 }
 
 pub(crate) fn normalize_index_dir(path: &Path) -> String {
-    let mut out = path.to_string_lossy().to_string();
+    let mut out = fsx::encode_lossless_path(path);
     while out.len() > 1 && out.ends_with('/') {
         out.pop();
     }
     out
+}
+
+fn split_index_entry_path(path: &str) -> Option<(&str, &str)> {
+    let (parent, name) = path.rsplit_once('/')?;
+    let parent = if parent.is_empty() { "/" } else { parent };
+    (!name.is_empty()).then_some((parent, name))
 }
 
 pub(crate) fn normalize_lexical_path(path: &Path) -> PathBuf {
@@ -774,8 +860,8 @@ pub(crate) fn normalize_lexical_path(path: &Path) -> PathBuf {
     }
 }
 
-pub(crate) fn normalize_index_root_arg(root_raw: &str) -> Result<String, String> {
-    let expanded = PathBuf::from(expand_home_path(root_raw));
+pub(crate) fn normalize_index_root_path(root_raw: &Path) -> Result<String, String> {
+    let expanded = expand_home_path_os(root_raw);
     if let Ok(canonical) = fs::canonicalize(&expanded) {
         return Ok(normalize_index_dir(&canonical));
     }
@@ -787,6 +873,32 @@ pub(crate) fn normalize_index_root_arg(root_raw: &str) -> Result<String, String>
             .join(expanded)
     };
     Ok(normalize_index_dir(&normalize_lexical_path(&absolute)))
+}
+
+fn expand_home_path_os(path: &Path) -> PathBuf {
+    let Some(home) = env::var_os("HOME") else {
+        return path.to_path_buf();
+    };
+    #[cfg(unix)]
+    let bytes = path.as_os_str().as_bytes();
+    #[cfg(not(unix))]
+    let bytes = path.to_string_lossy().as_bytes();
+    if bytes == b"~" {
+        return PathBuf::from(home);
+    }
+    if let Some(rest) = bytes.strip_prefix(b"~/") {
+        #[cfg(unix)]
+        {
+            let mut expanded = PathBuf::from(home);
+            expanded.push(std::ffi::OsString::from_vec(rest.to_vec()));
+            return expanded;
+        }
+        #[cfg(not(unix))]
+        {
+            return PathBuf::from(home).join(String::from_utf8_lossy(rest).as_ref());
+        }
+    }
+    path.to_path_buf()
 }
 
 pub(crate) fn sql_like_escape(value: &str) -> String {
@@ -1003,7 +1115,11 @@ pub(crate) fn is_root_index_excluded_path(root_key: &str, path: &str) -> bool {
 }
 
 pub(crate) fn purge_index_root(root_raw: &str) -> Result<(), String> {
-    let root_key = normalize_index_root_arg(root_raw)?;
+    purge_index_root_path(Path::new(&expand_home_path(root_raw)))
+}
+
+pub(crate) fn purge_index_root_path(root_raw: &Path) -> Result<(), String> {
+    let root_key = normalize_index_root_path(root_raw)?;
     let root_prefix = index_path_prefix(&root_key);
     let root_prefix_end = format!("{}0", root_prefix.trim_end_matches('/'));
     let mut conn = initialize_index_db()?;
@@ -1108,16 +1224,28 @@ pub(crate) fn refresh_index_root(root_raw: &str, opts: &Options) -> Result<(), S
     refresh_index_root_cancellable(root_raw, opts, None)
 }
 
+pub(crate) fn refresh_index_root_path(root_raw: &Path, opts: &Options) -> Result<(), String> {
+    refresh_index_root_path_cancellable(root_raw, opts, None)
+}
+
 pub(crate) fn refresh_index_root_cancellable(
     root_raw: &str,
     opts: &Options,
     cancel: Option<&'static AtomicBool>,
 ) -> Result<(), String> {
-    let root = fs::canonicalize(expand_home_path(root_raw)).map_err(|e| e.to_string())?;
+    refresh_index_root_path_cancellable(Path::new(&expand_home_path(root_raw)), opts, cancel)
+}
+
+fn refresh_index_root_path_cancellable(
+    root_raw: &Path,
+    opts: &Options,
+    cancel: Option<&'static AtomicBool>,
+) -> Result<(), String> {
+    let root = fs::canonicalize(expand_home_path_os(root_raw)).map_err(|e| e.to_string())?;
     if !root.is_dir() {
         return Err(format!(
             "--index-refresh target '{}' is not a directory",
-            root_raw
+            root_raw.display()
         ));
     }
     let root_key = normalize_index_dir(&root);
@@ -1223,28 +1351,16 @@ pub(crate) fn refresh_index_root_from_scan(
 
         for &index in &added_entry_indices {
             let scanned = &scanned_entries[index];
-            let path = Path::new(&scanned.path);
-            let Some(name) = path
-                .file_name()
-                .map(|name| name.to_string_lossy().to_string())
-            else {
+            let Some((parent_key, name)) = split_index_entry_path(&scanned.path) else {
                 continue;
             };
-            let Some(parent) = path.parent() else {
-                continue;
-            };
-            let parent_key = normalize_index_dir(parent);
-            let parent_id = get_or_insert_index_id(
-                &mut select_dir,
-                &mut insert_dir,
-                &mut dir_ids,
-                &parent_key,
-            )?;
+            let parent_id =
+                get_or_insert_index_id(&mut select_dir, &mut insert_dir, &mut dir_ids, parent_key)?;
             let name_id = get_or_insert_index_id(
                 &mut select_string,
                 &mut insert_string,
                 &mut string_ids,
-                &name,
+                name,
             )?;
             let pending = PendingIndexEntry {
                 dir_id: parent_id,
@@ -1252,7 +1368,11 @@ pub(crate) fn refresh_index_root_from_scan(
                 kind: scanned.kind,
                 mtime: scanned.mtime,
                 size: scanned.size,
+                allocated_size: scanned.allocated_size,
                 activity: scanned.activity,
+                device: scanned.device,
+                inode: scanned.inode,
+                link_count: scanned.link_count,
             };
             pending_entries.push(pending);
             added_entries.insert(index, pending);
@@ -1388,28 +1508,16 @@ pub(crate) fn refresh_index_root_from_scan(
         get_or_insert_index_id(&mut select_dir, &mut insert_dir, &mut dir_ids, root_key)?;
         let mut pending_entries = Vec::with_capacity(scanned_entries.len());
         for scanned in &scanned_entries {
-            let path = Path::new(&scanned.path);
-            let Some(name) = path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-            else {
+            let Some((parent_key, name)) = split_index_entry_path(&scanned.path) else {
                 continue;
             };
-            let Some(parent) = path.parent() else {
-                continue;
-            };
-            let parent_key = normalize_index_dir(parent);
-            let parent_id = get_or_insert_index_id(
-                &mut select_dir,
-                &mut insert_dir,
-                &mut dir_ids,
-                &parent_key,
-            )?;
+            let parent_id =
+                get_or_insert_index_id(&mut select_dir, &mut insert_dir, &mut dir_ids, parent_key)?;
             let name_id = get_or_insert_index_id(
                 &mut select_string,
                 &mut insert_string,
                 &mut string_ids,
-                &name,
+                name,
             )?;
             if scanned.kind == 1 {
                 get_or_insert_index_id(
@@ -1425,7 +1533,11 @@ pub(crate) fn refresh_index_root_from_scan(
                 kind: scanned.kind,
                 mtime: scanned.mtime,
                 size: scanned.size,
+                allocated_size: scanned.allocated_size,
                 activity: scanned.activity,
+                device: scanned.device,
+                inode: scanned.inode,
+                link_count: scanned.link_count,
             });
         }
         drop(select_dir);
@@ -1473,9 +1585,7 @@ pub(crate) fn refresh_index_root_from_scan(
     let string_values = scanned_entries
         .iter()
         .filter_map(|scanned| {
-            Path::new(&scanned.path)
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
+            split_index_entry_path(&scanned.path).map(|(_, name)| name.to_owned())
         })
         .collect::<std::collections::HashSet<_>>();
     let mut string_ids = load_existing_string_ids(&tx, &string_values)?;
@@ -1497,22 +1607,17 @@ pub(crate) fn refresh_index_root_from_scan(
     let mut pending_entries = Vec::<PendingIndexEntry>::new();
 
     for scanned in &scanned_entries {
-        let path = Path::new(&scanned.path);
         let path_key = &scanned.path;
-        let Some(name) = path.file_name().map(|n| n.to_string_lossy().to_string()) else {
+        let Some((parent_key, name)) = split_index_entry_path(path_key) else {
             continue;
         };
-        let Some(parent) = path.parent() else {
-            continue;
-        };
-        let parent_key = normalize_index_dir(parent);
         let parent_id =
-            ensure_index_id(&mut insert_dir, &mut dir_ids, &mut next_dir_id, &parent_key)?;
+            ensure_index_id(&mut insert_dir, &mut dir_ids, &mut next_dir_id, parent_key)?;
         let name_id = ensure_index_id(
             &mut insert_string,
             &mut string_ids,
             &mut next_string_id,
-            &name,
+            name,
         )?;
         let kind = scanned.kind;
         pending_entries.push(PendingIndexEntry {
@@ -1521,7 +1626,11 @@ pub(crate) fn refresh_index_root_from_scan(
             kind,
             mtime: scanned.mtime,
             size: scanned.size,
+            allocated_size: scanned.allocated_size,
             activity: scanned.activity,
+            device: scanned.device,
+            inode: scanned.inode,
+            link_count: scanned.link_count,
         });
         if kind == 1 {
             ensure_index_id(&mut insert_dir, &mut dir_ids, &mut next_dir_id, path_key)?;

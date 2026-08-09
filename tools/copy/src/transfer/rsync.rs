@@ -13,12 +13,16 @@ use regex::Regex;
 use std::io::Read;
 use std::io::{self, BufRead};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 pub(crate) fn parse_progress2_bytes(line: &str) -> Option<u64> {
-    let re = Regex::new(r"^\s*([0-9][0-9,]*(?:\.[0-9]+)?)([kKmMgGtTpPeE]?)\s+[0-9]{1,3}%").ok()?;
+    static PROGRESS_RE: OnceLock<Regex> = OnceLock::new();
+    let re = PROGRESS_RE.get_or_init(|| {
+        Regex::new(r"^\s*([0-9][0-9,]*(?:\.[0-9]+)?)([kKmMgGtTpPeE]?)\s+[0-9]{1,3}%")
+            .expect("progress regex is static and valid")
+    });
     let caps = re.captures(line)?;
     let num_txt = caps.get(1)?.as_str().replace(',', "");
     let unit = caps
@@ -39,7 +43,7 @@ pub(crate) fn parse_progress2_bytes(line: &str) -> Option<u64> {
     Some(val as u64)
 }
 
-pub(crate) fn handle_rsync_stream_line(tx: &mpsc::Sender<RsyncStreamEvent>, line: &str) {
+pub(crate) fn handle_rsync_stream_line(tx: &mpsc::SyncSender<RsyncStreamEvent>, line: &str) {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return;
@@ -53,7 +57,7 @@ pub(crate) fn handle_rsync_stream_line(tx: &mpsc::Sender<RsyncStreamEvent>, line
 
 pub(crate) fn spawn_rsync_stdout_reader(
     stdout: impl Read + Send + 'static,
-    tx: mpsc::Sender<RsyncStreamEvent>,
+    tx: mpsc::SyncSender<RsyncStreamEvent>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let reader = io::BufReader::new(stdout);
@@ -73,7 +77,7 @@ pub(crate) fn spawn_rsync_stdout_reader(
 
 pub(crate) fn spawn_rsync_stderr_reader(
     stderr: impl Read + Send + 'static,
-    tx: mpsc::Sender<RsyncStreamEvent>,
+    tx: mpsc::SyncSender<RsyncStreamEvent>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut reader = io::BufReader::new(stderr);
@@ -188,7 +192,7 @@ pub(crate) fn run_rsync_transfer(
     let mut last_io_rates = TransferProgressRates::default();
     let mut eta_estimator = TransferEtaEstimator::default();
 
-    let (event_tx, event_rx) = mpsc::channel::<RsyncStreamEvent>();
+    let (event_tx, event_rx) = mpsc::sync_channel::<RsyncStreamEvent>(256);
     let stdout_handle = child
         .stdout
         .take()
@@ -212,7 +216,7 @@ pub(crate) fn run_rsync_transfer(
                     finish_progress_render_state();
                     progress_line_active = false;
                 }
-                println!("{line}");
+                println!("{}", fsx::terminal::escape_terminal_text(&line));
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {}
@@ -267,7 +271,7 @@ pub(crate) fn run_rsync_transfer(
                             finish_progress_render_state();
                             progress_line_active = false;
                         }
-                        println!("{line}");
+                        println!("{}", fsx::terminal::escape_terminal_text(&line));
                     }
                 }
             }
@@ -411,7 +415,7 @@ mod tests {
     use std::sync::mpsc;
     #[test]
     fn handle_rsync_stream_line_emits_progress_event() {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(8);
         handle_rsync_stream_line(&tx, "   1,024  10%   1.00MB/s    0:00:00");
         match rx.recv().expect("event") {
             RsyncStreamEvent::Progress(bytes) => assert_eq!(bytes, 1024),
@@ -421,7 +425,7 @@ mod tests {
 
     #[test]
     fn handle_rsync_stream_line_emits_text_event() {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(8);
         handle_rsync_stream_line(&tx, "building file list ...");
         match rx.recv().expect("event") {
             RsyncStreamEvent::Text(line) => assert_eq!(line, "building file list ..."),

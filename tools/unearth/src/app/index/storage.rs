@@ -1,23 +1,10 @@
 use super::*;
 pub(crate) fn snapshot_cache_dir() -> Option<PathBuf> {
-    if let Ok(dir) = env::var("XDG_CACHE_HOME") {
-        return Some(PathBuf::from(dir).join("unearth").join("snapshots"));
-    }
-    env::var("HOME").ok().map(|home| {
-        PathBuf::from(home)
-            .join(".cache")
-            .join("unearth")
-            .join("snapshots")
-    })
+    fsx::index::cache_dir().map(|dir| dir.join("snapshots"))
 }
 
 pub(crate) fn unearth_cache_dir() -> Option<PathBuf> {
-    if let Ok(dir) = env::var("XDG_CACHE_HOME") {
-        return Some(PathBuf::from(dir).join("unearth"));
-    }
-    env::var("HOME")
-        .ok()
-        .map(|home| PathBuf::from(home).join(".cache").join("unearth"))
+    fsx::index::cache_dir()
 }
 
 pub(crate) fn unearth_internal_index_paths() -> &'static [(String, String)] {
@@ -50,11 +37,19 @@ pub(crate) fn is_unearth_internal_index_path(path: &str) -> bool {
 }
 
 pub(crate) fn index_db_path() -> Option<PathBuf> {
-    Some(unearth_cache_dir()?.join("index").join("unearth.db"))
+    fsx::index::database_path()
+}
+
+pub(crate) fn legacy_index_db_path() -> Option<PathBuf> {
+    fsx::index::legacy_database_path()
 }
 
 pub(crate) fn query_socket_path() -> Option<PathBuf> {
-    Some(unearth_cache_dir()?.join("index").join(QUERY_SOCKET_NAME))
+    Some(
+        fsx::index::cache_dir()?
+            .join("index")
+            .join(QUERY_SOCKET_NAME),
+    )
 }
 
 pub(crate) fn watch_state_covers_root(conn: &Connection, root_key: &str) -> Result<bool, String> {
@@ -388,7 +383,11 @@ pub(crate) fn parse_index_manifest<'a>(
         cursor += 1;
         let mtime = decode_optional_i64(read_i64_bytes(bytes, &mut cursor)?);
         let size = decode_optional_i64(read_i64_bytes(bytes, &mut cursor)?);
+        let allocated_size = decode_optional_i64(read_i64_bytes(bytes, &mut cursor)?);
         let activity = decode_optional_i64(read_i64_bytes(bytes, &mut cursor)?);
+        let device = decode_optional_i64(read_i64_bytes(bytes, &mut cursor)?);
+        let inode = decode_optional_i64(read_i64_bytes(bytes, &mut cursor)?);
+        let link_count = decode_optional_i64(read_i64_bytes(bytes, &mut cursor)?);
         let path = read_string_bytes(bytes, &mut cursor)?;
         entries.push(ExistingIndexEntry {
             dir_id,
@@ -397,7 +396,11 @@ pub(crate) fn parse_index_manifest<'a>(
             kind,
             mtime,
             size,
+            allocated_size,
             activity,
+            device,
+            inode,
+            link_count,
         });
     }
     if cursor != bytes.len() {
@@ -452,7 +455,19 @@ pub(crate) fn write_index_manifest_record(
         .write_all(&encode_optional_i64(entry.size).to_le_bytes())
         .map_err(|e| e.to_string())?;
     writer
+        .write_all(&encode_optional_i64(entry.allocated_size).to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    writer
         .write_all(&encode_optional_i64(entry.activity).to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    writer
+        .write_all(&encode_optional_i64(entry.device).to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    writer
+        .write_all(&encode_optional_i64(entry.inode).to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    writer
+        .write_all(&encode_optional_i64(entry.link_count).to_le_bytes())
         .map_err(|e| e.to_string())?;
     write_len_prefixed(writer, path)
 }
@@ -475,7 +490,7 @@ pub(crate) fn write_index_snapshot_from_db(
     root_key: &str,
 ) -> Result<(), String> {
     let snapshot_path = index_snapshot_path(root_key)
-        .ok_or_else(|| "unable to resolve the unearth cache directory".to_string())?;
+        .ok_or_else(|| "unable to resolve the fsx cache directory".to_string())?;
     let parent = snapshot_path
         .parent()
         .ok_or_else(|| "invalid index snapshot path".to_string())?;
@@ -576,7 +591,11 @@ pub(crate) fn write_index_snapshot_from_db(
 }
 
 pub(crate) fn rebuild_index_snapshot(root_raw: &str) -> Result<(), String> {
-    let root_key = normalize_index_root_arg(root_raw)?;
+    rebuild_index_snapshot_path(Path::new(&expand_home_path(root_raw)))
+}
+
+pub(crate) fn rebuild_index_snapshot_path(root_raw: &Path) -> Result<(), String> {
+    let root_key = normalize_index_root_path(root_raw)?;
     let conn = open_index_db_for_search()?;
     if !index_root_is_known(&conn, &root_key)? {
         return Err(format!(
@@ -610,8 +629,7 @@ pub(crate) fn write_stamp(path: &Path) {
 }
 
 pub(crate) fn initialize_index_db() -> Result<Connection, String> {
-    let path =
-        index_db_path().ok_or_else(|| "Could not determine unearth cache dir".to_string())?;
+    let path = index_db_path().ok_or_else(|| "Could not determine fsx cache dir".to_string())?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
@@ -621,6 +639,7 @@ pub(crate) fn initialize_index_db() -> Result<Connection, String> {
                 .map_err(|e| e.to_string())?;
         }
     }
+    migrate_legacy_index(&path)?;
     let conn = Connection::open(&path).map_err(|e| e.to_string())?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
     conn.busy_timeout(Duration::from_secs(30))
@@ -646,8 +665,17 @@ pub(crate) fn initialize_index_db() -> Result<Connection, String> {
             kind INTEGER NOT NULL,
             mtime INTEGER,
             size INTEGER,
+            allocated_size INTEGER,
             activity INTEGER,
             UNIQUE(dir_id, name_id, kind)
+        );
+        CREATE TABLE IF NOT EXISTS dir_stats (
+            dir_id INTEGER PRIMARY KEY,
+            allocated_size INTEGER NOT NULL DEFAULT 0,
+            files INTEGER NOT NULL DEFAULT 0,
+            dirs INTEGER NOT NULL DEFAULT 0,
+            missing_sizes INTEGER NOT NULL DEFAULT 0,
+            missing_hardlink_metadata INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS indexed_roots (
             root TEXT PRIMARY KEY,
@@ -729,9 +757,18 @@ pub(crate) fn initialize_index_db() -> Result<Connection, String> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
     drop(stmt);
-    if !columns.iter().any(|column| column == "activity") {
-        conn.execute("ALTER TABLE entries ADD COLUMN activity INTEGER", [])
-            .map_err(|e| e.to_string())?;
+    for column in [
+        "activity INTEGER",
+        "allocated_size INTEGER",
+        "device INTEGER",
+        "inode INTEGER",
+        "link_count INTEGER",
+    ] {
+        let name = column.split_whitespace().next().unwrap_or_default();
+        if !columns.iter().any(|existing| existing == name) {
+            conn.execute(&format!("ALTER TABLE entries ADD COLUMN {column}"), [])
+                .map_err(|e| e.to_string())?;
+        }
     }
     for column in [
         "event_kind INTEGER",
@@ -751,6 +788,109 @@ pub(crate) fn initialize_index_db() -> Result<Connection, String> {
         [],
     )
     .map_err(|e| e.to_string())?;
+    conn.execute_batch(
+        "
+        DROP INDEX IF EXISTS idx_entries_hardlink_dir;
+        CREATE INDEX IF NOT EXISTS idx_entries_hardlink_candidates
+            ON entries(dir_id, device, inode, allocated_size)
+            WHERE link_count > 1 AND kind <> 1;
+        CREATE TRIGGER IF NOT EXISTS entries_stats_ai AFTER INSERT ON entries BEGIN
+            INSERT INTO dir_stats(
+                dir_id, allocated_size, files, dirs, missing_sizes,
+                missing_hardlink_metadata
+            ) VALUES (
+                new.dir_id,
+                COALESCE(new.allocated_size, 0),
+                CASE WHEN new.kind <> 1 THEN 1 ELSE 0 END,
+                CASE WHEN new.kind = 1 THEN 1 ELSE 0 END,
+                CASE WHEN new.allocated_size IS NULL THEN 1 ELSE 0 END,
+                CASE WHEN new.link_count IS NULL THEN 1 ELSE 0 END
+            ) ON CONFLICT(dir_id) DO UPDATE SET
+                allocated_size = dir_stats.allocated_size + excluded.allocated_size,
+                files = dir_stats.files + excluded.files,
+                dirs = dir_stats.dirs + excluded.dirs,
+                missing_sizes = dir_stats.missing_sizes + excluded.missing_sizes,
+                missing_hardlink_metadata = dir_stats.missing_hardlink_metadata
+                    + excluded.missing_hardlink_metadata;
+        END;
+        CREATE TRIGGER IF NOT EXISTS entries_stats_ad AFTER DELETE ON entries BEGIN
+            UPDATE dir_stats SET
+                allocated_size = allocated_size - COALESCE(old.allocated_size, 0),
+                files = files - CASE WHEN old.kind <> 1 THEN 1 ELSE 0 END,
+                dirs = dirs - CASE WHEN old.kind = 1 THEN 1 ELSE 0 END,
+                missing_sizes = missing_sizes
+                    - CASE WHEN old.allocated_size IS NULL THEN 1 ELSE 0 END,
+                missing_hardlink_metadata = missing_hardlink_metadata
+                    - CASE WHEN old.link_count IS NULL THEN 1 ELSE 0 END
+            WHERE dir_id = old.dir_id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS entries_stats_au
+        AFTER UPDATE OF dir_id, kind, allocated_size, link_count ON entries BEGIN
+            UPDATE dir_stats SET
+                allocated_size = allocated_size - COALESCE(old.allocated_size, 0),
+                files = files - CASE WHEN old.kind <> 1 THEN 1 ELSE 0 END,
+                dirs = dirs - CASE WHEN old.kind = 1 THEN 1 ELSE 0 END,
+                missing_sizes = missing_sizes
+                    - CASE WHEN old.allocated_size IS NULL THEN 1 ELSE 0 END,
+                missing_hardlink_metadata = missing_hardlink_metadata
+                    - CASE WHEN old.link_count IS NULL THEN 1 ELSE 0 END
+            WHERE dir_id = old.dir_id;
+            INSERT INTO dir_stats(
+                dir_id, allocated_size, files, dirs, missing_sizes,
+                missing_hardlink_metadata
+            ) VALUES (
+                new.dir_id,
+                COALESCE(new.allocated_size, 0),
+                CASE WHEN new.kind <> 1 THEN 1 ELSE 0 END,
+                CASE WHEN new.kind = 1 THEN 1 ELSE 0 END,
+                CASE WHEN new.allocated_size IS NULL THEN 1 ELSE 0 END,
+                CASE WHEN new.link_count IS NULL THEN 1 ELSE 0 END
+            ) ON CONFLICT(dir_id) DO UPDATE SET
+                allocated_size = dir_stats.allocated_size + excluded.allocated_size,
+                files = dir_stats.files + excluded.files,
+                dirs = dir_stats.dirs + excluded.dirs,
+                missing_sizes = dir_stats.missing_sizes + excluded.missing_sizes,
+                missing_hardlink_metadata = dir_stats.missing_hardlink_metadata
+                    + excluded.missing_hardlink_metadata;
+        END;
+        CREATE TRIGGER IF NOT EXISTS dirs_stats_ad AFTER DELETE ON dirs BEGIN
+            DELETE FROM dir_stats WHERE dir_id = old.id;
+        END;
+        ",
+    )
+    .map_err(|e| e.to_string())?;
+    let direct_stats_version = conn
+        .query_row(
+            "SELECT value FROM index_meta WHERE key = 'dir_stats_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap_or_default();
+    if direct_stats_version != "1" {
+        conn.execute_batch(
+            "
+            BEGIN IMMEDIATE;
+            DELETE FROM dir_stats;
+            INSERT INTO dir_stats(
+                dir_id, allocated_size, files, dirs, missing_sizes,
+                missing_hardlink_metadata
+            )
+            SELECT
+                dir_id,
+                COALESCE(SUM(COALESCE(allocated_size, 0)), 0),
+                COALESCE(SUM(CASE WHEN kind <> 1 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN kind = 1 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN allocated_size IS NULL THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN link_count IS NULL THEN 1 ELSE 0 END), 0)
+            FROM entries
+            GROUP BY dir_id;
+            INSERT OR REPLACE INTO index_meta(key, value)
+            VALUES ('dir_stats_version', '1');
+            COMMIT;
+            ",
+        )
+        .map_err(|e| e.to_string())?;
+    }
     let mut stmt = conn
         .prepare("PRAGMA table_info(watch_state)")
         .map_err(|e| e.to_string())?;
@@ -784,7 +924,7 @@ pub(crate) fn initialize_index_db() -> Result<Connection, String> {
         DROP INDEX IF EXISTS idx_dirs_path;
         CREATE INDEX IF NOT EXISTS idx_entries_dir_kind_activity
             ON entries(dir_id, kind, activity DESC);
-        PRAGMA user_version = 2;
+        PRAGMA user_version = 4;
         ",
     )
     .map_err(|e| e.to_string())?;
@@ -797,8 +937,8 @@ pub(crate) fn open_index_db_writer() -> Result<Connection, String> {
 }
 
 pub(crate) fn open_index_db_readonly() -> Result<Connection, String> {
-    let path =
-        index_db_path().ok_or_else(|| "Could not determine unearth cache dir".to_string())?;
+    let path = fsx::index::database_read_path()
+        .ok_or_else(|| "Could not determine fsx cache dir".to_string())?;
     let conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
@@ -814,6 +954,54 @@ pub(crate) fn open_index_db_readonly() -> Result<Connection, String> {
     )
     .map_err(|e| e.to_string())?;
     Ok(conn)
+}
+
+fn migrate_legacy_index(path: &Path) -> Result<(), String> {
+    if path.is_file() {
+        return Ok(());
+    }
+    let Some(legacy) = legacy_index_db_path().filter(|candidate| candidate.is_file()) else {
+        return Ok(());
+    };
+    let parent = path
+        .parent()
+        .ok_or_else(|| "canonical index has no parent directory".to_string())?;
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let temporary = path.with_file_name(format!(
+        ".{}.migration-{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("fsx"),
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&temporary);
+    let legacy_conn = Connection::open_with_flags(
+        &legacy,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|error| format!("could not open legacy index {}: {error}", legacy.display()))?;
+    legacy_conn
+        .execute("VACUUM INTO ?1", [&temporary.to_string_lossy().to_string()])
+        .map_err(|error| format!("could not snapshot legacy index: {error}"))?;
+    drop(legacy_conn);
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())?;
+    drop(file);
+    fs::rename(&temporary, path).map_err(|error| {
+        let _ = fs::remove_file(&temporary);
+        format!(
+            "could not publish migrated index {}: {error}",
+            path.display()
+        )
+    })?;
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("could not sync migrated index directory: {error}"))?;
+    Ok(())
 }
 
 pub(crate) fn open_index_db_for_search() -> Result<Connection, String> {

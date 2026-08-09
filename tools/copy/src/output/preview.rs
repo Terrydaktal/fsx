@@ -306,20 +306,21 @@ pub(crate) fn select_level_entries<'a>(
 }
 
 pub(crate) fn format_entry(entry: &LevelEntry, row_kind: Option<&str>) -> String {
+    let name = fsx::terminal::escape_terminal_text(&entry.name);
     let suffix = if entry.is_dir { "/" } else { "" };
     if row_kind == Some("replaced_old") {
-        return format!("{FAIL}{}{} (old){ENDC}", entry.name, suffix);
+        return format!("{FAIL}{}{} (old){ENDC}", name, suffix);
     }
     if row_kind == Some("replaced_new") {
-        return format!("{OKGREEN}{}{} (new){ENDC}", entry.name, suffix);
+        return format!("{OKGREEN}{}{} (new){ENDC}", name, suffix);
     }
     match entry.state.as_str() {
-        "removed" => format!("{FAIL}{}{} (removed){ENDC}", entry.name, suffix),
-        "added" => format!("{OKGREEN}{}{}{ENDC}", entry.name, suffix),
-        "modified" => format!("{WARNING}{}{}{ENDC}", entry.name, suffix),
-        "identical" => format!("{LIGHT_TEAL}{}{}{ENDC}", entry.name, suffix),
-        "uncollided" => format!("{WHITE}{}{}{ENDC}", entry.name, suffix),
-        _ => format!("{WHITE}{}{}{ENDC}", entry.name, suffix),
+        "removed" => format!("{FAIL}{}{} (removed){ENDC}", name, suffix),
+        "added" => format!("{OKGREEN}{}{}{ENDC}", name, suffix),
+        "modified" => format!("{WARNING}{}{}{ENDC}", name, suffix),
+        "identical" => format!("{LIGHT_TEAL}{}{}{ENDC}", name, suffix),
+        "uncollided" => format!("{WHITE}{}{}{ENDC}", name, suffix),
+        _ => format!("{WHITE}{}{}{ENDC}", name, suffix),
     }
 }
 

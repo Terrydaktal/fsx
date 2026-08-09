@@ -1,8 +1,9 @@
 use super::filesystem::effective_threads_override;
 use super::index::{
-    clean_watcher_covers_search, print_watch_status, purge_index_root, rebuild_index_snapshot,
-    refresh_index_root, run_indexed, run_recent_indexed, snapshot_cache_path, snapshot_lock_path,
-    spawn_snapshot_refresh, stream_snapshot_cache, write_snapshot_cache,
+    clean_watcher_covers_search, print_watch_status, purge_index_root, purge_index_root_path,
+    rebuild_index_snapshot, rebuild_index_snapshot_path, refresh_index_root,
+    refresh_index_root_path, run_indexed, run_recent_indexed, snapshot_cache_path,
+    snapshot_lock_path, spawn_snapshot_refresh, stream_snapshot_cache, write_snapshot_cache,
 };
 use super::model::{ColorWhen, DirStatsCache, Options, SortField, SortOrder};
 use super::patterns::contains_all_spec_from_opts;
@@ -14,12 +15,19 @@ use super::{SNAPSHOT_REFRESH_TIMEOUT, VERSION};
 use rayon::ThreadPoolBuilder;
 use std::collections::HashMap;
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, BufWriter, IsTerminal, Write};
+#[cfg(unix)]
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 #[cfg(not(feature = "watcher"))]
 use std::process::Command;
 use std::process::ExitCode;
 use std::time::Duration;
+
+fn is_broken_pipe_message(error: &str) -> bool {
+    error.to_ascii_lowercase().contains("broken pipe")
+}
 pub(crate) fn usage() -> String {
     let txt = r#"A parallel recursive file searcher (unearth)
 
@@ -112,7 +120,7 @@ Arguments:
     scans do not replace an existing snapshot. Background refreshes use a long
     timeout by default unless --timeout is passed explicitly.
   - --index queries the global pooled path database in
-    ~/.cache/unearth/index/unearth.db instead of walking the filesystem. It
+    ~/.cache/fsx/index/fsx.db instead of walking the filesystem. It
     returns current DB rows immediately and starts one background refresh when
     the root is missing or stale, unless a clean --watch owner covers it.
   - --index-if-watched queries that database only when a clean live watcher
@@ -148,7 +156,7 @@ Arguments:
   - --index-purge DIR removes indexed rows for DIR and all indexed children.
     Existing roots are canonicalized; missing roots are normalized lexically.
   - --watch ROOT ... is retained as a compatibility alias for starting the live index owner.
-    Prefer the separate `unearthd` executable. It performs
+    Prefer the separate `fsxd` executable. It performs
     an initial scan, then batches create/modify/delete/rename events into the same pooled SQLite
     database. fanotify is preferred when the kernel and permissions support filesystem file
     handles; inotify is used as the recursive fallback. The owner is exclusive per root; a new
@@ -212,7 +220,133 @@ pub(crate) fn parse_duration(t: &str) -> Result<Duration, String> {
 }
 
 pub(crate) fn parse_args() -> Result<Options, String> {
-    parse_args_from(env::args().skip(1))
+    // `args()` panics before we can report an error when a Unix operand is not
+    // valid UTF-8. Keep parsing total; filesystem paths are handled as bytes
+    // by the search layer where possible.
+    let raw_args: Vec<OsString> = env::args_os().skip(1).collect();
+    let mut options = parse_args_from(
+        raw_args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned()),
+    )?;
+    let (path_override_os, positional_os) = raw_operands(&raw_args)?;
+    options.path_override_os = path_override_os;
+    options.positional_os = positional_os;
+    options.index_refresh_os = raw_option_value(&raw_args, "--index-refresh");
+    options.index_snapshot_os = raw_option_value(&raw_args, "--index-snapshot");
+    options.index_purge_os = raw_option_value(&raw_args, "--index-purge");
+    options.watch_metrics_os = raw_option_value(&raw_args, "--watch-metrics");
+    Ok(options)
+}
+
+fn raw_option_value(args: &[OsString], option: &str) -> Option<OsString> {
+    args.iter().enumerate().find_map(|(index, value)| {
+        if let Some(value) = inline_option_value(value, option) {
+            Some(value)
+        } else if value.to_str() == Some(option) {
+            args.get(index + 1).cloned()
+        } else {
+            None
+        }
+    })
+}
+
+fn inline_option_value(value: &OsString, option: &str) -> Option<OsString> {
+    #[cfg(unix)]
+    {
+        let prefix = format!("{option}=");
+        let bytes = value.as_os_str().as_bytes();
+        return bytes
+            .strip_prefix(prefix.as_bytes())
+            .map(|value| OsString::from_vec(value.to_vec()));
+    }
+    #[cfg(not(unix))]
+    {
+        value
+            .to_str()
+            .and_then(|value| value.strip_prefix(&format!("{option}=")))
+            .map(OsString::from)
+    }
+}
+
+fn raw_operands(args: &[OsString]) -> Result<(Option<OsString>, Vec<OsString>), String> {
+    let mut positional = Vec::new();
+    let mut path_override = None;
+    let mut i = 0usize;
+    let mut options_done = false;
+    while i < args.len() {
+        let raw = args[i].to_str();
+        if options_done {
+            positional.push(args[i].clone());
+            i += 1;
+            continue;
+        }
+        if raw == Some("--") {
+            options_done = true;
+            i += 1;
+            continue;
+        }
+        if let Some(value) = inline_option_value(&args[i], "--path") {
+            path_override = Some(value);
+            i += 1;
+            continue;
+        }
+        if [
+            "--timeout",
+            "--threads",
+            "--color",
+            "--sort",
+            "--limit",
+            "--recent",
+            "--index-refresh",
+            "--index-snapshot",
+            "--index-purge",
+            "--watch-metrics",
+        ]
+        .iter()
+        .any(|option| inline_option_value(&args[i], option).is_some())
+        {
+            i += 1;
+            continue;
+        }
+        match raw {
+            Some("--path") => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "--path requires a directory argument".to_string())?;
+                path_override = Some(value.clone());
+            }
+            Some(value) if value.starts_with("--path=") => {
+                path_override = Some(OsString::from(&value[7..]));
+            }
+            Some(value)
+                if matches!(
+                    value,
+                    "--timeout"
+                        | "--threads"
+                        | "--color"
+                        | "--sort"
+                        | "--limit"
+                        | "--recent"
+                        | "--index-refresh"
+                        | "--index-snapshot"
+                        | "--index-purge"
+                        | "--watch-metrics"
+                ) =>
+            {
+                i += if value == "--sort" { 2 } else { 1 };
+                if i >= args.len() {
+                    return Err(format!("{value} requires an argument"));
+                }
+            }
+            Some(value) if value.starts_with("--") => {}
+            Some(value) if value.starts_with('-') && value.len() > 1 => {}
+            _ => positional.push(args[i].clone()),
+        }
+        i += 1;
+    }
+    Ok((path_override, positional))
 }
 
 pub(crate) fn parse_args_from<I>(arguments: I) -> Result<Options, String>
@@ -252,6 +386,7 @@ where
         watch: false,
         watch_status: false,
         watch_metrics: None,
+        watch_metrics_os: None,
         absolute_paths: false,
         force_dir: false,
         force_file: false,
@@ -263,6 +398,11 @@ where
         contains_all: false,
         path_override: None,
         positional: Vec::new(),
+        path_override_os: None,
+        positional_os: Vec::new(),
+        index_refresh_os: None,
+        index_snapshot_os: None,
+        index_purge_os: None,
     };
 
     let mut i = 0usize;
@@ -674,7 +814,12 @@ pub(crate) fn cli_main() -> ExitCode {
         opts.timeout_dur = SNAPSHOT_REFRESH_TIMEOUT;
     }
     if let Some(root) = opts.index_refresh.as_deref() {
-        let result = refresh_index_root(root, &opts);
+        let result = opts
+            .index_refresh_os
+            .as_deref()
+            .map(std::path::Path::new)
+            .map(|path| refresh_index_root_path(path, &opts))
+            .unwrap_or_else(|| refresh_index_root(root, &opts));
         return match result {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -684,7 +829,13 @@ pub(crate) fn cli_main() -> ExitCode {
         };
     }
     if let Some(root) = opts.index_snapshot.as_deref() {
-        return match rebuild_index_snapshot(root) {
+        let result = opts
+            .index_snapshot_os
+            .as_deref()
+            .map(std::path::Path::new)
+            .map(rebuild_index_snapshot_path)
+            .unwrap_or_else(|| rebuild_index_snapshot(root));
+        return match result {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("{}", e);
@@ -693,7 +844,13 @@ pub(crate) fn cli_main() -> ExitCode {
         };
     }
     if let Some(root) = opts.index_purge.as_deref() {
-        return match purge_index_root(root) {
+        let result = opts
+            .index_purge_os
+            .as_deref()
+            .map(std::path::Path::new)
+            .map(purge_index_root_path)
+            .unwrap_or_else(|| purge_index_root(root));
+        return match result {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("{}", e);
@@ -736,6 +893,9 @@ pub(crate) fn cli_main() -> ExitCode {
         if let Some(path) = snapshot_path.as_deref() {
             if path.is_file() {
                 if let Err(e) = stream_snapshot_cache(path) {
+                    if e.kind() == io::ErrorKind::BrokenPipe {
+                        return ExitCode::SUCCESS;
+                    }
                     eprintln!("unearth: failed to read snapshot cache: {}", e);
                     return ExitCode::from(1);
                 }
@@ -813,11 +973,17 @@ pub(crate) fn cli_main() -> ExitCode {
                         .write_all(line.as_bytes())
                         .and_then(|_| lock.write_all(b"\n"))
                     {
+                        if error.kind() == io::ErrorKind::BrokenPipe {
+                            return ExitCode::SUCCESS;
+                        }
                         eprintln!("unearth: failed to write output: {error}");
                         return ExitCode::from(1);
                     }
                 }
                 if let Err(error) = lock.flush() {
+                    if error.kind() == io::ErrorKind::BrokenPipe {
+                        return ExitCode::SUCCESS;
+                    }
                     eprintln!("unearth: failed to flush output: {error}");
                     return ExitCode::from(1);
                 }
@@ -830,6 +996,9 @@ pub(crate) fn cli_main() -> ExitCode {
             }
         }
         Err(e) => {
+            if is_broken_pipe_message(&e) {
+                return ExitCode::SUCCESS;
+            }
             if !e.trim().is_empty() {
                 eprintln!("{}", e.trim());
             }
@@ -851,10 +1020,24 @@ pub(crate) fn run_watch(opts: &Options) -> ExitCode {
 
 #[cfg(not(feature = "watcher"))]
 pub(crate) fn run_compat_watch() -> ExitCode {
-    match Command::new("unearthd").args(env::args().skip(1)).status() {
+    let args = env::args_os().skip(1).collect::<Vec<_>>();
+    let daemon = env::var_os("FSX_DAEMON_BIN").unwrap_or_else(|| "fsxd".into());
+    match Command::new(&daemon).args(&args).status() {
         Ok(status) => ExitCode::from(status.code().unwrap_or(1).clamp(0, 255) as u8),
+        Err(error) if error.kind() == io::ErrorKind::NotFound && daemon != "unearthd" => {
+            match Command::new("unearthd").args(&args).status() {
+                Ok(status) => ExitCode::from(status.code().unwrap_or(1).clamp(0, 255) as u8),
+                Err(fallback_error) => {
+                    eprintln!(
+                        "unearth: cannot start fsxd or compatibility unearthd: {}",
+                        fallback_error
+                    );
+                    ExitCode::from(1)
+                }
+            }
+        }
         Err(error) => {
-            eprintln!("unearth: cannot start unearthd: {}", error);
+            eprintln!("unearth: cannot start fsxd: {}", error);
             ExitCode::from(1)
         }
     }
@@ -866,23 +1049,52 @@ pub(crate) fn run_watch(_opts: &Options) -> ExitCode {
 }
 
 pub(crate) fn daemon_usage() -> &'static str {
-    "Unearth live filesystem index daemon\n\nUsage:\n  unearthd [--threads N] [--watch-metrics FILE] ROOT ...\n\nOptions:\n  --threads N             Metadata worker count (default: 8)\n  --watch-metrics FILE   Write one-second resource metrics to FILE\n  --help                 Show this help\n  --version              Show the version\n\nThe daemon owns the pooled SQLite index and stays in the foreground. Run it\nunder systemd or another supervisor for automatic restart.\n"
+    "fsx live filesystem index daemon\n\nUsage:\n  fsxd [--threads N] [--watch-metrics FILE] ROOT ...\n\nOptions:\n  --threads N             Metadata worker count (default: 8)\n  --watch-metrics FILE   Write one-second resource metrics to FILE\n  --help                 Show this help\n  --version              Show the version\n\nThe daemon owns the shared fsx SQLite index and stays in the foreground. Run\nit under systemd or another supervisor for automatic restart. unearthd is\nretained as a compatibility entry point.\n"
 }
 
-pub(crate) fn daemon_main() -> ExitCode {
-    let raw_args: Vec<String> = env::args().skip(1).collect();
-    if raw_args.iter().any(|arg| arg == "--help" || arg == "-h") {
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inline_non_utf8_path_option_keeps_original_bytes() {
+        let value = OsString::from_vec(b"--path=/tmp/raw-\xff".to_vec());
+        let decoded = inline_option_value(&value, "--path").expect("inline option value");
+        assert_eq!(decoded.as_os_str().as_bytes(), b"/tmp/raw-\xff");
+
+        let (path, positional) = raw_operands(&[value]).expect("raw operands");
+        assert_eq!(
+            path.expect("path override").as_os_str().as_bytes(),
+            b"/tmp/raw-\xff"
+        );
+        assert!(positional.is_empty());
+    }
+}
+
+pub(crate) fn fsxd_main() -> ExitCode {
+    let raw_args: Vec<OsString> = env::args_os().skip(1).collect();
+    if raw_args
+        .iter()
+        .any(|arg| arg == OsStr::new("--help") || arg == OsStr::new("-h"))
+    {
         print!("{}", daemon_usage());
         return ExitCode::SUCCESS;
     }
-    if raw_args.iter().any(|arg| arg == "--version" || arg == "-V") {
-        println!("unearthd {}", VERSION);
+    if raw_args
+        .iter()
+        .any(|arg| arg == OsStr::new("--version") || arg == OsStr::new("-V"))
+    {
+        println!("fsxd {}", VERSION);
         return ExitCode::SUCCESS;
     }
     let mut arguments = Vec::with_capacity(raw_args.len() + 1);
-    arguments.push("--watch".to_string());
+    arguments.push(OsString::from("--watch"));
     arguments.extend(raw_args);
-    let opts = match parse_args_from(arguments) {
+    let mut opts = match parse_args_from(
+        arguments
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned()),
+    ) {
         Ok(opts) => opts,
         Err(error) => {
             if !error.is_empty() {
@@ -891,11 +1103,16 @@ pub(crate) fn daemon_main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    run_daemon(&opts)
+    if let Ok((path_override_os, positional_os)) = raw_operands(&arguments) {
+        opts.path_override_os = path_override_os;
+        opts.positional_os = positional_os;
+    }
+    opts.watch_metrics_os = raw_option_value(&arguments, "--watch-metrics");
+    run_fsxd(&opts)
 }
 
 #[cfg(feature = "watcher")]
-pub(crate) fn run_daemon(opts: &Options) -> ExitCode {
+pub(crate) fn run_fsxd(opts: &Options) -> ExitCode {
     match watcher::run(opts) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -906,7 +1123,7 @@ pub(crate) fn run_daemon(opts: &Options) -> ExitCode {
 }
 
 #[cfg(not(feature = "watcher"))]
-pub(crate) fn run_daemon(_opts: &Options) -> ExitCode {
-    eprintln!("unearthd was built without the watcher feature");
+pub(crate) fn run_fsxd(_opts: &Options) -> ExitCode {
+    eprintln!("fsxd was built without the watcher feature");
     ExitCode::from(1)
 }

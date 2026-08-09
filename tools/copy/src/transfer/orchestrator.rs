@@ -7,9 +7,10 @@ use super::cleanup::{
 };
 use super::command::run_command_capture;
 use super::copy_engine::{
-    copy_file_preserve_with_progress_buffer, copy_symlink, preserve_directory_times_tree,
-    remove_path_local_if_exists,
+    copy_file_preserve_with_progress_buffer, copy_symlink, interrupted,
+    preserve_directory_times_tree, remove_path_local_if_exists, verify_regular_file_pair,
 };
+use super::journal::TransferJournal;
 use super::rsync::run_rsync_transfer_sources;
 use super::telemetry::{counter_delta, device_io_deltas, proc_io_deltas, read_proc_io_counters};
 use crate::domain::{
@@ -27,7 +28,7 @@ use crate::output::{
 };
 use crate::plan::{
     build_destination_index, can_fast_rename_same_fs, pre_scan_file, realpath_allow_missing,
-    resolve_destination_for_dir, resolve_source, DestinationKind,
+    resolve_destination_for_dir_path, resolve_source_path, to_real_path_os, DestinationKind,
 };
 use crate::runtime::{
     acquire_file_write_permit, configure_rayon_threads_for_media, dev_media_kind,
@@ -37,9 +38,9 @@ use crate::runtime::{
 use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 use std::collections::HashSet;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, Write};
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -53,7 +54,9 @@ pub(crate) fn run_rust_file_batch(
     media: MediaKind,
     replace_dest_symlink: bool,
     requested_mode: TransferMode,
+    verify: bool,
 ) -> TransferOutcome {
+    super::copy_engine::install_interrupt_handler();
     let done = Arc::new(AtomicU64::new(0));
     let eta_progress = Arc::new(AtomicEtaProgress::default());
     let mut file_sizes = Vec::new();
@@ -169,9 +172,6 @@ pub(crate) fn run_rust_file_batch(
     let copy_result: Result<(), String> = items.par_iter().enumerate().try_for_each_init(
         Vec::new,
         |buffer, (item_index, (source, _, needs_copy))| {
-            if !*needs_copy {
-                return Ok(());
-            }
             if cancelled.load(Ordering::Relaxed) {
                 return Err("transfer cancelled after another worker failed".to_string());
             }
@@ -185,6 +185,13 @@ pub(crate) fn run_rust_file_batch(
                 )
             })?;
             let target = destination.join(name);
+            if !*needs_copy {
+                if verify && source_meta.is_file() {
+                    verify_regular_file_pair(source, &target)
+                        .map_err(|err| format!("verify file '{}': {err}", source.display()))?;
+                }
+                return Ok(());
+            }
             if source_meta.file_type().is_symlink() {
                 copy_symlink(source, &target)
                     .map_err(|err| format!("copy symlink '{}': {err}", source.display()))?;
@@ -210,6 +217,10 @@ pub(crate) fn run_rust_file_batch(
                 done.fetch_add(count, Ordering::Relaxed);
             })
             .map_err(|err| format!("copy file '{}': {err}", source.display()))?;
+            if verify {
+                verify_regular_file_pair(source, &target)
+                    .map_err(|err| format!("verify file '{}': {err}", source.display()))?;
+            }
             eta_progress.mark_file(size);
             if let Some(operation_index) = eta_item_indices[item_index] {
                 eta_workload.mark_operation(operation_index);
@@ -280,8 +291,8 @@ pub(crate) fn run_rust_file_batch(
 }
 pub(crate) fn run_multi_source_file_batch(
     requested_mode: TransferMode,
-    source_paths: &[String],
-    destination: &str,
+    source_paths: &[OsString],
+    destination: &OsStr,
     use_sudo: bool,
     preview_only: bool,
     is_move: bool,
@@ -289,9 +300,85 @@ pub(crate) fn run_multi_source_file_batch(
     showall: bool,
     replace_dest_symlink: bool,
     merge_collision_policy: MergeCollisionPolicy,
+    verify: bool,
 ) -> i32 {
+    if preview_only {
+        return run_multi_source_file_batch_inner(
+            requested_mode,
+            source_paths,
+            destination,
+            use_sudo,
+            preview_only,
+            is_move,
+            tree_trunc,
+            showall,
+            replace_dest_symlink,
+            merge_collision_policy,
+            verify,
+        );
+    }
+
+    let journal_sources = source_paths
+        .iter()
+        .map(|source| to_real_path_os(source.as_os_str()))
+        .collect::<Vec<_>>();
+    let journal_destination = to_real_path_os(destination);
+    let mut journal =
+        match TransferJournal::begin_many(&journal_sources, &journal_destination, requested_mode) {
+            Ok(mut journal) => {
+                if let Err(error) = journal.mark("transferring") {
+                    eprintln!("copy: cannot persist operation journal: {error}");
+                    return 1;
+                }
+                journal
+            }
+            Err(error) => {
+                eprintln!("copy: cannot create operation journal: {error}");
+                return 1;
+            }
+        };
+    let result = run_multi_source_file_batch_inner(
+        requested_mode,
+        source_paths,
+        destination,
+        use_sudo,
+        preview_only,
+        is_move,
+        tree_trunc,
+        showall,
+        replace_dest_symlink,
+        merge_collision_policy,
+        verify,
+    );
+    if result == 0 {
+        if let Err(error) = journal.mark("published") {
+            eprintln!("copy: transfer published but operation journal update failed: {error}");
+            return 1;
+        }
+        if let Err(error) = journal.complete() {
+            eprintln!("copy: transfer succeeded but operation journal cleanup failed: {error}");
+            return 1;
+        }
+    }
+    result
+}
+
+fn run_multi_source_file_batch_inner(
+    requested_mode: TransferMode,
+    source_paths: &[OsString],
+    destination: &OsStr,
+    use_sudo: bool,
+    preview_only: bool,
+    is_move: bool,
+    tree_trunc: usize,
+    showall: bool,
+    replace_dest_symlink: bool,
+    merge_collision_policy: MergeCollisionPolicy,
+    verify: bool,
+) -> i32 {
+    let destination_path = to_real_path_os(destination);
     let (dst_mnt, dst_obj_kind) =
-        match resolve_destination_for_dir(destination, requested_mode, false) {
+        match resolve_destination_for_dir_path(&destination_path, requested_mode, false) {
             Ok(v) => v,
             Err(code) => return code,
         };
@@ -320,10 +407,13 @@ pub(crate) fn run_multi_source_file_batch(
     let destination_index = build_destination_index(&dst_mnt);
 
     for source in source_paths {
-        let (src_mnt, src_obj_kind) = match resolve_source(source, requested_mode) {
-            Ok(v) => v,
-            Err(code) => return code,
-        };
+        let source_path = to_real_path_os(source);
+        let source_display = source.to_string_lossy();
+        let (src_mnt, src_obj_kind) =
+            match resolve_source_path(&source_path, requested_mode, &source_display) {
+                Ok(v) => v,
+                Err(code) => return code,
+            };
         if src_obj_kind != SrcObjKind::File {
             log(
                 requested_mode,
@@ -633,6 +723,7 @@ pub(crate) fn run_multi_source_file_batch(
             media,
             replace_dest_symlink,
             requested_mode,
+            verify,
         );
         transferred_bytes_total = transfer.bytes_done;
         transferred_elapsed_total_s = transfer.elapsed_s;
@@ -802,7 +893,23 @@ pub(crate) fn run_flush_command(target: &Path, use_sudo: bool) -> bool {
         Ok(file) => file,
         Err(_) => return false,
     };
-    unsafe { nix::libc::syncfs(file.as_raw_fd()) == 0 }
+    if file.sync_all().is_err() {
+        return false;
+    }
+    // A file's contents and its containing directory are separate durability
+    // domains. Flush both without forcing the whole filesystem with syncfs.
+    if file
+        .metadata()
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false)
+    {
+        if let Some(parent) = target.parent() {
+            return fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .is_ok();
+        }
+    }
+    true
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1163,6 +1270,14 @@ pub(crate) fn run_move_cleanup_phase(
     expected_files: u64,
     expected_bytes: u64,
 ) -> CleanupPhaseStats {
+    if interrupted() {
+        log(
+            mode,
+            "Cleanup skipped because the transfer was interrupted.",
+            LogLevel::Error,
+        );
+        return CleanupPhaseStats::default();
+    }
     log(mode, "Starting cleanup", LogLevel::Info);
     println!();
     reset_progress_render_state();

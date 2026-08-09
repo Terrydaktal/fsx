@@ -4,8 +4,12 @@ use super::local::{run_local_transfer, LocalTransferRequest};
 use crate::cli::parse_args;
 use crate::domain::{LogLevel, MergeCollisionPolicy, TransferMode};
 use crate::output::log;
-use crate::plan::{create_destination_parents, enrich_remote_spec, parse_remote_spec};
+use crate::plan::{
+    create_destination_parents_path, enrich_remote_spec, parse_remote_spec, to_real_path_os,
+};
 use crate::transfer::{run_multi_source_file_batch, run_remote_transfer_mode};
+use std::ffi::OsString;
+use std::path::PathBuf;
 
 pub(crate) fn run() -> i32 {
     let args = match parse_args() {
@@ -20,13 +24,13 @@ pub(crate) fn run() -> i32 {
     };
     let is_move = requested_mode == TransferMode::Move;
 
-    let batch_sources: Vec<String> = std::iter::once(args.source.clone())
+    let batch_sources: Vec<OsString> = std::iter::once(args.source.clone())
         .chain(args.extra.iter().cloned())
         .collect();
 
-    let source_input = args.source.clone();
-    let mut source = source_input.clone();
-    let destination = args.destination.clone();
+    let source_input_os = args.source.clone();
+    let mut source_os = source_input_os.clone();
+    let destination_os = args.destination.clone();
     let use_sudo = args.sudo;
     let preview_lite = args.preview_lite;
     let preview_only = args.preview_only || preview_lite;
@@ -35,15 +39,29 @@ pub(crate) fn run() -> i32 {
     let force_requested = args.contents_only;
     let mut source_glob_contents = false;
 
-    if source.ends_with("/*") {
-        source.pop();
+    if PathBuf::from(&source_os)
+        .file_name()
+        .is_some_and(|name| name == "*")
+    {
+        let mut source_path = PathBuf::from(&source_os);
+        source_path.pop();
+        source_os = source_path.into_os_string();
         source_glob_contents = true;
     }
 
+    let source_input = source_input_os.to_string_lossy().into_owned();
+    let source = source_os.to_string_lossy().into_owned();
+    let destination = destination_os.to_string_lossy().into_owned();
+    let source_path = to_real_path_os(&source_os);
+    let destination_path = to_real_path_os(&destination_os);
+
     let force = force_requested || source_glob_contents;
     let contents_mode_requested = force_requested || source_glob_contents;
-    let source_remote = parse_remote_spec(&source);
-    let destination_remote = parse_remote_spec(&destination).map(enrich_remote_spec);
+    let source_remote = source_os.to_str().and_then(parse_remote_spec);
+    let destination_remote = destination_os
+        .to_str()
+        .and_then(parse_remote_spec)
+        .map(enrich_remote_spec);
 
     if args.create_destination_parents && (source_remote.is_some() || destination_remote.is_some())
     {
@@ -61,6 +79,15 @@ pub(crate) fn run() -> i32 {
         log(
             requested_mode,
             "Collision and symlink replacement flags are only supported with the local Rust backend.",
+            LogLevel::Error,
+        );
+        return 1;
+    }
+
+    if args.verify && (use_sudo || source_remote.is_some() || destination_remote.is_some()) {
+        log(
+            requested_mode,
+            "--verify is only supported with the local Rust backend; remote and --sudo transfers use rsync.",
             LogLevel::Error,
         );
         return 1;
@@ -120,14 +147,14 @@ pub(crate) fn run() -> i32 {
             return 1;
         }
         if args.create_destination_parents {
-            if let Err(code) = create_destination_parents(&args.destination, requested_mode) {
+            if let Err(code) = create_destination_parents_path(&destination_path, requested_mode) {
                 return code;
             }
         }
         return run_multi_source_file_batch(
             requested_mode,
             &batch_sources,
-            &args.destination,
+            &destination_os,
             args.sudo,
             args.preview_only || args.preview_lite,
             is_move,
@@ -135,6 +162,7 @@ pub(crate) fn run() -> i32 {
             args.showall,
             args.replace_dest_symlink,
             args.merge_collision_policy,
+            args.verify,
         );
     }
 
@@ -157,9 +185,10 @@ pub(crate) fn run() -> i32 {
 
     run_local_transfer(LocalTransferRequest {
         args: &args,
-        source_input: &source_input,
-        source: &source,
-        destination: &destination,
+        source: &source_path,
+        destination: &destination_path,
+        source_input_display: &source_input,
+        destination_display: &destination,
         requested_mode,
         preview_only,
         contents_mode_requested,

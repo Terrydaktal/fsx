@@ -4,6 +4,7 @@ use crate::domain::{DstObjKind, Endpoint, LogLevel, RemoteSpec, SrcObjKind, Tran
 use crate::output::log;
 use nix::sys::statvfs::statvfs;
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::os::unix::fs::MetadataExt;
@@ -70,51 +71,7 @@ pub(crate) fn expand_user(value: &str) -> String {
 }
 
 pub(crate) fn realpath_allow_missing(input: &Path) -> PathBuf {
-    let abs = if input.is_absolute() {
-        input.to_path_buf()
-    } else {
-        env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("/"))
-            .join(input)
-    };
-
-    // Resolve ancestors, but preserve the final symlink as an object to copy
-    // rather than silently turning `copy link destination` into `copy target`.
-    if let Ok(meta) = fs::symlink_metadata(&abs) {
-        if meta.file_type().is_symlink() {
-            let name = abs.file_name().map(PathBuf::from);
-            let parent = abs.parent().unwrap_or_else(|| Path::new("."));
-            let mut resolved = fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
-            if let Some(name) = name {
-                resolved.push(name);
-            }
-            return resolved;
-        }
-        return fs::canonicalize(&abs).unwrap_or(abs);
-    }
-
-    let mut tail: Vec<PathBuf> = Vec::new();
-    let mut cur = abs.clone();
-    while fs::symlink_metadata(&cur).is_err() {
-        if let Some(name) = cur.file_name() {
-            tail.push(PathBuf::from(name));
-        }
-        if let Some(parent) = cur.parent() {
-            cur = parent.to_path_buf();
-        } else {
-            break;
-        }
-    }
-
-    let mut resolved = if fs::symlink_metadata(&cur).is_ok() {
-        fs::canonicalize(&cur).unwrap_or(cur)
-    } else {
-        cur
-    };
-    for part in tail.iter().rev() {
-        resolved.push(part);
-    }
-    resolved
+    fsx::path::realpath_preserve_final_symlink(input)
 }
 
 pub(crate) fn to_real_path(value: &str) -> PathBuf {
@@ -122,7 +79,33 @@ pub(crate) fn to_real_path(value: &str) -> PathBuf {
     realpath_allow_missing(Path::new(&expanded))
 }
 
+pub(crate) fn to_real_path_os(value: &OsStr) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let bytes = value.as_bytes();
+        if bytes == b"~" {
+            if let Some(home) = env::var_os("HOME") {
+                return realpath_allow_missing(Path::new(&home));
+            }
+        } else if let Some(rest) = bytes.strip_prefix(b"~/") {
+            if let Some(home) = env::var_os("HOME") {
+                let mut expanded = home.into_vec();
+                expanded.push(b'/');
+                expanded.extend_from_slice(rest);
+                return realpath_allow_missing(Path::new(&OsString::from_vec(expanded)));
+            }
+        }
+    }
+    realpath_allow_missing(Path::new(value))
+}
+
 pub(crate) fn parse_remote_spec(value: &str) -> Option<RemoteSpec> {
+    // Existing local paths win over scp-style parsing. This matters for valid
+    // filenames such as `snapshot:2026` and avoids treating them as hosts.
+    if fs::symlink_metadata(value).is_ok() {
+        return None;
+    }
     if value.contains("://") {
         return None;
     }
@@ -282,13 +265,21 @@ pub(crate) fn resolve_source(
     value: &str,
     mode: TransferMode,
 ) -> Result<(PathBuf, SrcObjKind), i32> {
-    let p = to_real_path(value);
+    resolve_source_path(&to_real_path(value), mode, value)
+}
+
+pub(crate) fn resolve_source_path(
+    value: &Path,
+    mode: TransferMode,
+    display_value: &str,
+) -> Result<(PathBuf, SrcObjKind), i32> {
+    let p = realpath_allow_missing(value);
     let metadata = match fs::symlink_metadata(&p) {
         Ok(metadata) => metadata,
         Err(_) => {
             log(
                 mode,
-                &format!("Source path does not exist: {value}"),
+                &format!("Source path does not exist: {display_value}"),
                 LogLevel::Error,
             );
             return Err(1);
@@ -300,7 +291,7 @@ pub(crate) fn resolve_source(
     if !metadata.is_dir() && !metadata.is_file() {
         log(
             mode,
-            &format!("Source path must be a file or directory: {value}"),
+            &format!("Source path must be a file or directory: {display_value}"),
             LogLevel::Error,
         );
         return Err(1);
@@ -366,8 +357,73 @@ pub(crate) fn resolve_destination_for_file(
     Ok((dst_real, DstObjKind::File))
 }
 
-pub(crate) fn create_destination_parents(value: &str, mode: TransferMode) -> Result<(), i32> {
-    let destination = to_real_path(value);
+pub(crate) fn resolve_destination_for_file_path(
+    value: &Path,
+    mode: TransferMode,
+    replace_dest_symlink: bool,
+) -> Result<(PathBuf, DstObjKind), i32> {
+    resolve_destination_for_file_inner(value, mode, replace_dest_symlink)
+}
+
+fn resolve_destination_for_file_inner(
+    value: &Path,
+    mode: TransferMode,
+    replace_dest_symlink: bool,
+) -> Result<(PathBuf, DstObjKind), i32> {
+    if replace_dest_symlink {
+        let dst_real = value.to_path_buf();
+        if let Ok(md) = fs::symlink_metadata(&dst_real) {
+            if md.file_type().is_symlink() {
+                return Ok((dst_real, DstObjKind::File));
+            }
+            if md.is_dir() {
+                return Ok((dst_real, DstObjKind::Dir));
+            }
+            return Ok((dst_real, DstObjKind::File));
+        }
+        let parent = dst_real.parent().unwrap_or_else(|| Path::new("."));
+        if !parent.is_dir() {
+            log(
+                mode,
+                &format!(
+                    "Destination parent directory does not exist: {}",
+                    parent.display()
+                ),
+                LogLevel::Error,
+            );
+            return Err(1);
+        }
+        return Ok((dst_real, DstObjKind::File));
+    }
+    let dst_real = realpath_allow_missing(value);
+    if fs::symlink_metadata(&dst_real).is_ok() {
+        if fs::metadata(&dst_real)
+            .map(|md| md.is_dir())
+            .unwrap_or(false)
+        {
+            return Ok((dst_real, DstObjKind::Dir));
+        }
+        return Ok((dst_real, DstObjKind::File));
+    }
+    let parent = dst_real.parent().unwrap_or_else(|| Path::new("."));
+    if !parent.is_dir() {
+        log(
+            mode,
+            &format!(
+                "Destination parent directory does not exist: {}",
+                parent.display()
+            ),
+            LogLevel::Error,
+        );
+        return Err(1);
+    }
+    Ok((dst_real, DstObjKind::File))
+}
+
+pub(crate) fn create_destination_parents_path(
+    destination: &Path,
+    mode: TransferMode,
+) -> Result<(), i32> {
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     if parent.is_dir() {
         return Ok(());
@@ -421,6 +477,44 @@ pub(crate) fn resolve_destination_for_dir(
     Ok((p, DstObjKind::DirNew))
 }
 
+pub(crate) fn resolve_destination_for_dir_path(
+    value: &Path,
+    mode: TransferMode,
+    allow_existing_file: bool,
+) -> Result<(PathBuf, DstObjKind), i32> {
+    let p = realpath_allow_missing(value);
+    if fs::symlink_metadata(&p).is_ok() {
+        if !fs::metadata(&p).map(|md| md.is_dir()).unwrap_or(false) {
+            if allow_existing_file {
+                return Ok((p, DstObjKind::FileExistingForDir));
+            }
+            log(
+                mode,
+                &format!(
+                    "Destination path must be a directory (or a new directory path): {}",
+                    p.display()
+                ),
+                LogLevel::Error,
+            );
+            return Err(1);
+        }
+        return Ok((p, DstObjKind::DirExisting));
+    }
+    let parent = p.parent().unwrap_or_else(|| Path::new("."));
+    if !parent.is_dir() {
+        log(
+            mode,
+            &format!(
+                "Destination parent directory does not exist: {}",
+                parent.display()
+            ),
+            LogLevel::Error,
+        );
+        return Err(1);
+    }
+    Ok((p, DstObjKind::DirNew))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,6 +538,33 @@ mod tests {
     fn parse_remote_spec_rejects_local_path_with_colon() {
         assert!(parse_remote_spec("/tmp/a:b").is_none());
         assert!(parse_remote_spec("mtp://phone/path").is_none());
+    }
+
+    #[test]
+    fn parse_remote_spec_prefers_existing_colon_path() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let local = root.path().join("snapshot:2026");
+        fs::write(&local, b"local").expect("local file");
+        assert!(parse_remote_spec(local.to_str().expect("utf8 path")).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_path_resolution_preserves_non_utf8_components() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut name = b"non-utf8-".to_vec();
+        name.push(0xff);
+        let path = root.path().join(OsString::from_vec(name));
+        fs::write(&path, b"raw path").expect("write raw path");
+        let resolved = to_real_path_os(path.as_os_str());
+        assert_eq!(resolved, path);
+        assert!(resolved
+            .file_name()
+            .expect("resolved name")
+            .as_bytes()
+            .contains(&0xff));
     }
     #[test]
     fn ssh_config_parser_uses_first_matching_user() {

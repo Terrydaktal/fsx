@@ -6,7 +6,7 @@ use crate::domain::{
     TransferMode, TransferProgressRates,
 };
 use crate::output::log;
-use crate::plan::{existing_probe_path, realpath_allow_missing};
+use crate::plan::existing_probe_path;
 use nix::sys::stat::{major, minor};
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
@@ -67,60 +67,10 @@ pub(crate) fn read_diskstats_bytes_for_keys(
     ))
 }
 
-pub(crate) fn unescape_mountinfo_field(raw: &str) -> String {
-    let bytes = raw.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == b'\\'
-            && i + 3 < bytes.len()
-            && bytes[i + 1].is_ascii_digit()
-            && bytes[i + 2].is_ascii_digit()
-            && bytes[i + 3].is_ascii_digit()
-        {
-            let oct = &raw[i + 1..i + 4];
-            if let Ok(v) = u8::from_str_radix(oct, 8) {
-                out.push(v);
-                i += 4;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).to_string()
-}
-
 pub(crate) fn mount_source_device_for_path(path: &Path) -> Option<PathBuf> {
-    let probe = existing_probe_path(path)?;
-    let probe_real = realpath_allow_missing(&probe);
-    let raw = fs::read_to_string("/proc/self/mountinfo").ok()?;
-    let mut best: Option<(usize, PathBuf)> = None;
-    for line in raw.lines() {
-        let (left, right) = line.split_once(" - ")?;
-        let left_cols: Vec<&str> = left.split_whitespace().collect();
-        if left_cols.len() < 5 {
-            continue;
-        }
-        let right_cols: Vec<&str> = right.split_whitespace().collect();
-        if right_cols.len() < 2 {
-            continue;
-        }
-        let mount_point = PathBuf::from(unescape_mountinfo_field(left_cols[4]));
-        if !probe_real.starts_with(&mount_point) {
-            continue;
-        }
-        let src = unescape_mountinfo_field(right_cols[1]);
-        if !src.starts_with("/dev/") {
-            continue;
-        }
-        let depth = mount_point.components().count();
-        match &best {
-            Some((best_depth, _)) if *best_depth >= depth => {}
-            _ => best = Some((depth, PathBuf::from(src))),
-        }
-    }
-    best.map(|(_, p)| p)
+    fsx::mount::mount_for_path_with_policy(path, fsx::mount::FinalSymlinkPolicy::Preserve)
+        .map(|mount| mount.source)
+        .filter(|source| source.starts_with("/dev/"))
 }
 
 pub(crate) fn device_key_for_block_device(devnode: &Path) -> Option<(u64, u64)> {

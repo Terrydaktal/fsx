@@ -4,6 +4,7 @@ use super::super::presentation::{
 use super::*;
 use regex::RegexBuilder;
 use std::io::{self, BufReader, BufWriter, IsTerminal, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileTypeExt;
 
 const QUERY_CONSUMER_STOP: &str = "unearth query consumer stopped after limit";
@@ -78,11 +79,22 @@ pub(crate) fn populate_indexed_dirsize_cache(
     Ok(())
 }
 
-pub(crate) fn write_binary_path_record<W: Write>(writer: &mut W, path: &str) -> io::Result<()> {
-    let len = u32::try_from(path.len())
+pub(crate) fn write_binary_path_record<W: Write>(
+    writer: &mut W,
+    path: &str,
+    path_encoded: bool,
+) -> io::Result<()> {
+    // SQLite stores lossless paths as escaped UTF-8 keys. Binary consumers
+    // expect the original OS bytes, not the database representation.
+    let decoded = path_encoded.then(|| fsx::decode_lossless_path(path));
+    let bytes = decoded
+        .as_deref()
+        .map(|path| path.as_os_str().as_bytes())
+        .unwrap_or_else(|| path.as_bytes());
+    let len = u32::try_from(bytes.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "path too long"))?;
     writer.write_all(&len.to_le_bytes())?;
-    writer.write_all(path.as_bytes())
+    writer.write_all(bytes)
 }
 pub(crate) fn path_has_hidden_component_below(path: &str, root: &str) -> bool {
     let path = path.trim_end_matches('/');
@@ -104,11 +116,20 @@ pub(crate) fn indexed_root_from_opts(
         return Ok((spec.root.clone(), spec.terms.clone()));
     }
     let mut terms = opts.positional.clone();
+    let raw_terms = if opts.positional_os.len() == opts.positional.len() {
+        Some(opts.positional_os.as_slice())
+    } else {
+        None
+    };
     let root = if terms.len() > 1 {
         let last = terms.last().cloned().unwrap();
-        if is_implicit_content_path_token(&last) || Path::new(&expand_home_path(&last)).is_dir() {
+        let last_path = raw_terms
+            .and_then(|values| values.last())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(expand_home_path(&last)));
+        if is_implicit_content_path_token(&last) || last_path.is_dir() {
             terms.pop();
-            PathBuf::from(expand_home_path(&last))
+            last_path
         } else {
             PathBuf::from(".")
         }
@@ -124,15 +145,23 @@ pub(crate) fn indexed_root_from_opts(
 pub(crate) fn recent_query_from_opts(opts: &Options) -> Result<(PathBuf, Vec<String>), String> {
     if let Some(path) = opts.path_override.as_deref() {
         return Ok((
-            PathBuf::from(expand_home_path(path)),
+            opts.path_override_os
+                .as_ref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(expand_home_path(path))),
             opts.positional.clone(),
         ));
     }
     let mut terms = opts.positional.clone();
-    let root = terms
-        .last()
-        .filter(|token| is_implicit_content_path_token(token))
-        .map(|token| PathBuf::from(expand_home_path(token)));
+    let root = terms.last().and_then(|token| {
+        let raw = (opts.positional_os.len() == opts.positional.len())
+            .then(|| PathBuf::from(opts.positional_os.last().expect("matching raw operand")));
+        if is_implicit_content_path_token(token) || raw.as_ref().is_some_and(|path| path.is_dir()) {
+            Some(raw.unwrap_or_else(|| PathBuf::from(expand_home_path(token))))
+        } else {
+            None
+        }
+    });
     if root.is_some() {
         terms.pop();
     }
@@ -310,6 +339,7 @@ pub(crate) fn run_recent_indexed(
                 }
                 results.push(SearchResult {
                     path,
+                    path_encoded: true,
                     is_dir: kind == 1,
                     is_symlink: kind == 2,
                     metadata: None,
@@ -495,6 +525,7 @@ where
                 }
                 emit(SearchResult {
                     path,
+                    path_encoded: true,
                     is_dir: kind == 1,
                     is_symlink: kind == 2,
                     metadata: None,
@@ -640,6 +671,7 @@ where
         }
         emit(SearchResult {
             path,
+            path_encoded: true,
             is_dir,
             is_symlink,
             metadata: None,
@@ -683,7 +715,7 @@ where
             break;
         }
         if !(17..=QUERY_MAX_FRAME).contains(&length) {
-            return Err("invalid unearth query result frame".to_string());
+            return Err("invalid fsxd query result frame".to_string());
         }
         let mut frame = vec![0u8; length];
         reader.read_exact(&mut frame).map_err(|e| e.to_string())?;
@@ -702,6 +734,7 @@ where
         let path = String::from_utf8(frame[17..].to_vec()).map_err(|e| e.to_string())?;
         emit(SearchResult {
             path,
+            path_encoded: true,
             is_dir,
             is_symlink,
             metadata: None,
@@ -719,7 +752,7 @@ pub(crate) fn run_indexed_via_daemon(
     colors: &ColorSpec,
 ) -> Result<Option<SearchRun>, String> {
     let socket =
-        query_socket_path().ok_or_else(|| "Could not determine unearth cache dir".to_string())?;
+        query_socket_path().ok_or_else(|| "Could not determine fsx cache dir".to_string())?;
     if !fs::symlink_metadata(&socket)
         .map(|metadata| metadata.file_type().is_socket())
         .unwrap_or(false)
@@ -773,10 +806,11 @@ pub(crate) fn run_indexed_via_daemon(
                 return Err(QUERY_CONSUMER_STOP.to_string());
             }
             if let Some(state) = cache_state.as_mut() {
-                cache_raw_record_path(&result.path, result.is_dir, state);
+                cache_raw_record_path(&result.path, result.is_dir, result.path_encoded, state);
             }
             if opts.index_binary {
-                write_binary_path_record(&mut output, &result.path).map_err(|e| e.to_string())?;
+                write_binary_path_record(&mut output, &result.path, result.path_encoded)
+                    .map_err(|e| e.to_string())?;
             } else {
                 output
                     .write_all(escape_terminal_text(&result.path).as_bytes())
@@ -793,8 +827,7 @@ pub(crate) fn run_indexed_via_daemon(
         }
         output.flush().map_err(|e| e.to_string())?;
         if let Some(mut state) = cache_state {
-            let _ = state.dirs.flush();
-            let _ = state.files.flush();
+            let _ = state.cache.flush();
         }
         return Ok(Some(SearchRun {
             lines: Vec::new(),
@@ -979,10 +1012,10 @@ pub(crate) fn run_indexed(
                 break;
             }
             if let Some(state) = cache_state.as_mut() {
-                cache_raw_record_path(&path, is_dir, state);
+                cache_raw_record_path(&path, is_dir, true, state);
             }
             if opts.index_binary {
-                write_binary_path_record(&mut lock, &path).map_err(|e| e.to_string())?;
+                write_binary_path_record(&mut lock, &path, true).map_err(|e| e.to_string())?;
             } else {
                 let display_path = escape_terminal_text(&path);
                 lock.write_all(display_path.as_bytes())
@@ -998,8 +1031,7 @@ pub(crate) fn run_indexed(
         }
         lock.flush().map_err(|e| e.to_string())?;
         if let Some(mut state) = cache_state {
-            let _ = state.dirs.flush();
-            let _ = state.files.flush();
+            let _ = state.cache.flush();
         }
         return Ok(SearchRun {
             lines: Vec::new(),
@@ -1046,6 +1078,7 @@ pub(crate) fn run_indexed(
         }
         results.push(SearchResult {
             path,
+            path_encoded: true,
             is_dir,
             is_symlink,
             metadata: None,
@@ -1072,4 +1105,25 @@ pub(crate) fn clean_watcher_covers_search(
     let root_key = normalize_index_dir(&root);
     let conn = open_index_db_for_search()?;
     watch_state_covers_root(&conn, &root_key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn binary_index_record_restores_non_utf8_path_bytes() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let raw = PathBuf::from(OsString::from_vec(b"/tmp/invalid-\xff".to_vec()));
+        let encoded = fsx::encode_lossless_path(&raw);
+        let mut output = Vec::new();
+        write_binary_path_record(&mut output, &encoded, true).expect("write record");
+
+        let length = u32::from_le_bytes(output[..4].try_into().expect("length")) as usize;
+        assert_eq!(length, raw.as_os_str().as_bytes().len());
+        assert_eq!(&output[4..], raw.as_os_str().as_bytes());
+    }
 }

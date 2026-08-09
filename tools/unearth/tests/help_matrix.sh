@@ -1,86 +1,87 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-F_BIN="${F_BIN:-${ROOT_DIR}/target/release/unearth}"
+WORKSPACE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+TOOL_ROOT="${WORKSPACE_ROOT}/tools/unearth"
+F_BIN="${F_BIN:-${WORKSPACE_ROOT}/target/release/unearth}"
 F_TIMEOUT="${F_TIMEOUT:-20}"
 
-if [[ ! -x "$F_BIN" || "${ROOT_DIR}/src/main.rs" -nt "$F_BIN" || "${ROOT_DIR}/Cargo.toml" -nt "$F_BIN" ]]; then
-  cargo build --release --quiet --manifest-path "${ROOT_DIR}/Cargo.toml"
+if [[ ! -x "$F_BIN" || "${TOOL_ROOT}/Cargo.toml" -nt "$F_BIN" || "${WORKSPACE_ROOT}/Cargo.toml" -nt "$F_BIN" ]] || find "${TOOL_ROOT}/src" "${WORKSPACE_ROOT}/crates/fsx/src" -type f -newer "$F_BIN" -print -quit | grep -q .; then
+	cargo build --release --quiet --manifest-path "${WORKSPACE_ROOT}/Cargo.toml" -p unearth
 fi
 
 F="$F_BIN"
 
 assert_eq() {
-  local name="$1"
-  local got="$2"
-  local want="$3"
-  if [[ "$got" != "$want" ]]; then
-    echo "FAIL: ${name}" >&2
-    echo "----- got -----" >&2
-    printf '%s\n' "$got" >&2
-    echo "----- want ----" >&2
-    printf '%s\n' "$want" >&2
-    exit 1
-  fi
+	local name="$1"
+	local got="$2"
+	local want="$3"
+	if [[ "$got" != "$want" ]]; then
+		echo "FAIL: ${name}" >&2
+		echo "----- got -----" >&2
+		printf '%s\n' "$got" >&2
+		echo "----- want ----" >&2
+		printf '%s\n' "$want" >&2
+		exit 1
+	fi
 }
 
 assert_contains() {
-  local name="$1"
-  local haystack="$2"
-  local needle="$3"
-  if [[ "$haystack" != *"$needle"* ]]; then
-    echo "FAIL: ${name}" >&2
-    echo "----- got -----" >&2
-    printf '%s\n' "$haystack" >&2
-    echo "----- missing ----" >&2
-    printf '%s\n' "$needle" >&2
-    exit 1
-  fi
+	local name="$1"
+	local haystack="$2"
+	local needle="$3"
+	if [[ "$haystack" != *"$needle"* ]]; then
+		echo "FAIL: ${name}" >&2
+		echo "----- got -----" >&2
+		printf '%s\n' "$haystack" >&2
+		echo "----- missing ----" >&2
+		printf '%s\n' "$needle" >&2
+		exit 1
+	fi
 }
 
 assert_not_contains() {
-  local name="$1"
-  local haystack="$2"
-  local needle="$3"
-  if [[ "$haystack" == *"$needle"* ]]; then
-    echo "FAIL: ${name}" >&2
-    echo "----- got -----" >&2
-    printf '%s\n' "$haystack" >&2
-    echo "----- unexpected ----" >&2
-    printf '%s\n' "$needle" >&2
-    exit 1
-  fi
+	local name="$1"
+	local haystack="$2"
+	local needle="$3"
+	if [[ "$haystack" == *"$needle"* ]]; then
+		echo "FAIL: ${name}" >&2
+		echo "----- got -----" >&2
+		printf '%s\n' "$haystack" >&2
+		echo "----- unexpected ----" >&2
+		printf '%s\n' "$needle" >&2
+		exit 1
+	fi
 }
 
 assert_regex() {
-  local name="$1"
-  local text="$2"
-  local pattern="$3"
-  if ! printf '%s\n' "$text" | grep -Eq "$pattern"; then
-    echo "FAIL: ${name}" >&2
-    echo "----- got -----" >&2
-    printf '%s\n' "$text" >&2
-    echo "----- pattern ----" >&2
-    printf '%s\n' "$pattern" >&2
-    exit 1
-  fi
+	local name="$1"
+	local text="$2"
+	local pattern="$3"
+	if ! printf '%s\n' "$text" | grep -Eq "$pattern"; then
+		echo "FAIL: ${name}" >&2
+		echo "----- got -----" >&2
+		printf '%s\n' "$text" >&2
+		echo "----- pattern ----" >&2
+		printf '%s\n' "$pattern" >&2
+		exit 1
+	fi
 }
 
 list_rel() {
-  local root="$1"
-  shift
-  "$F" --timeout "$F_TIMEOUT" "$@" "$root" 2>/dev/null | sed "s#^${root}/##" | sort
+	local root="$1"
+	shift
+	"$F" --timeout "$F_TIMEOUT" "$@" "$root" 2>/dev/null | sed "s#^${root}/##" | sort
 }
 
 list_rel_raw() {
-  local root="$1"
-  shift
-  "$F" --timeout "$F_TIMEOUT" "$@" "$root" 2>/dev/null | sed "s#^${root}/##"
+	local root="$1"
+	shift
+	"$F" --timeout "$F_TIMEOUT" "$@" "$root" 2>/dev/null | sed "s#^${root}/##"
 }
 
 list_parent_dirs() {
-  "$F" --timeout "$F_TIMEOUT" "$@" 2>/dev/null | xargs -r -n1 dirname | sort -u
+	"$F" --timeout "$F_TIMEOUT" "$@" 2>/dev/null | xargs -r -n1 dirname | sort -u
 }
 
 TMP_BASE="/tmp/unearth_help_matrix_${RANDOM}_$$"
@@ -227,30 +228,30 @@ mkdir -p "${INDEX_ROOT}/a/sub" "${INDEX_ROOT}/.hidden"
 touch "${INDEX_ROOT}/a/file.txt" "${INDEX_ROOT}/a/sub/nested.txt" "${INDEX_ROOT}/.hidden/secret.txt"
 XDG_CACHE_HOME="$INDEX_CACHE" "$F" --index-refresh "$INDEX_ROOT"
 want_index_all=$(printf '%s\n' \
-  "${INDEX_ROOT}/.hidden/" \
-  "${INDEX_ROOT}/.hidden/secret.txt" \
-  "${INDEX_ROOT}/a/" \
-  "${INDEX_ROOT}/a/file.txt" \
-  "${INDEX_ROOT}/a/sub/" \
-  "${INDEX_ROOT}/a/sub/nested.txt" | sort)
+	"${INDEX_ROOT}/.hidden/" \
+	"${INDEX_ROOT}/.hidden/secret.txt" \
+	"${INDEX_ROOT}/a/" \
+	"${INDEX_ROOT}/a/file.txt" \
+	"${INDEX_ROOT}/a/sub/" \
+	"${INDEX_ROOT}/a/sub/nested.txt" | sort)
 want_index_visible=$(printf '%s\n' \
-  "${INDEX_ROOT}/a/" \
-  "${INDEX_ROOT}/a/file.txt" \
-  "${INDEX_ROOT}/a/sub/" \
-  "${INDEX_ROOT}/a/sub/nested.txt" | sort)
+	"${INDEX_ROOT}/a/" \
+	"${INDEX_ROOT}/a/file.txt" \
+	"${INDEX_ROOT}/a/sub/" \
+	"${INDEX_ROOT}/a/sub/nested.txt" | sort)
 want_index_dirs=$(printf '%s\n' \
-  "${INDEX_ROOT}/.hidden/" \
-  "${INDEX_ROOT}/a/" \
-  "${INDEX_ROOT}/a/sub/" | sort)
+	"${INDEX_ROOT}/.hidden/" \
+	"${INDEX_ROOT}/a/" \
+	"${INDEX_ROOT}/a/sub/" | sort)
 want_index_visible_dirs=$(printf '%s\n' \
-  "${INDEX_ROOT}/a/" \
-  "${INDEX_ROOT}/a/sub/" | sort)
+	"${INDEX_ROOT}/a/" \
+	"${INDEX_ROOT}/a/sub/" | sort)
 assert_eq "index all includes hidden" "$(XDG_CACHE_HOME="$INDEX_CACHE" "$F" --index '*' -H --color=never "$INDEX_ROOT" | sort)" "$want_index_all"
 assert_eq "index visible excludes hidden" "$(XDG_CACHE_HOME="$INDEX_CACHE" "$F" --index '*' --color=never "$INDEX_ROOT" | sort)" "$want_index_visible"
 assert_eq "index dirs only" "$(XDG_CACHE_HOME="$INDEX_CACHE" "$F" --index '*' -d -H --color=never "$INDEX_ROOT" | sort)" "$want_index_dirs"
 assert_eq "index visible dirs only" "$(XDG_CACHE_HOME="$INDEX_CACHE" "$F" --index '*' -d --color=never "$INDEX_ROOT" | sort)" "$want_index_visible_dirs"
 assert_eq "index trigram substring lookup" "$(XDG_CACHE_HOME="$INDEX_CACHE" "$F" --index nested -H --color=never "$INDEX_ROOT")" "${INDEX_ROOT}/a/sub/nested.txt"
-index_db="${INDEX_CACHE}/unearth/index/unearth.db"
+index_db="${INDEX_CACHE}/fsx/index/fsx.db"
 assert_eq "index records exact refreshed root" "$(sqlite3 "$index_db" "select count(*) from indexed_roots where root='${INDEX_ROOT}';")" "1"
 assert_eq "index child root does not mark parent refreshed" "$(sqlite3 "$index_db" "select count(*) from indexed_roots where root='${TMP_BASE}';")" "0"
 XDG_CACHE_HOME="$INDEX_CACHE" "$F" --index-purge "${INDEX_ROOT}/a/sub"
@@ -383,18 +384,18 @@ assert_contains "invalid regex errors" "$invalid_regex_err" "Invalid regex"
 binary_mode_err="$("$F" --index-binary --long '*' "$NONREC_ROOT" 2>&1 >/dev/null || true)"
 assert_contains "binary mode rejects text options" "$binary_mode_err" "--index-binary cannot be combined"
 if ! "$F" / "$NONREC_ROOT" >/dev/null 2>&1; then
-  echo "FAIL: slash pattern should not panic" >&2
-  exit 1
+	echo "FAIL: slash pattern should not panic" >&2
+	exit 1
 fi
 
 # CACHE-RAW MATRIX
 CACHE_USER="unearth_cache_test_${RANDOM}_$$"
 CACHE_FISH_PID="424242"
 XDG_RUNTIME_TEST="${TMP_BASE}/runtime"
-CACHE_ROOT="${XDG_RUNTIME_TEST}/unearth"
+CACHE_ROOT="/tmp/fzf-history-${CACHE_USER}"
 /usr/bin/mkdir -p -- "$XDG_RUNTIME_TEST"
 /usr/bin/rm -rf -- "$CACHE_ROOT"
-cache_raw_out="$(USER="$CACHE_USER" FISH_PID="$CACHE_FISH_PID" XDG_RUNTIME_DIR="$XDG_RUNTIME_TEST" "$F" --timeout "$F_TIMEOUT" --cache-raw abc -f "$FILE_ROOT" 2>/dev/null | sed "s#^${FILE_ROOT}/##" | sort)"
+cache_raw_out="$(USER="$CACHE_USER" fish_pid="$CACHE_FISH_PID" XDG_RUNTIME_DIR="$XDG_RUNTIME_TEST" "$F" --timeout "$F_TIMEOUT" --cache-raw abc -f "$FILE_ROOT" 2>/dev/null | sed "s#^${FILE_ROOT}/##" | sort)"
 assert_eq "cache-raw output unchanged" "$cache_raw_out" "$want_contains"
 cache_raw_dirs_file="${CACHE_ROOT}/universal-last-dirs-${CACHE_FISH_PID}"
 cache_raw_files_file="${CACHE_ROOT}/universal-last-files-${CACHE_FISH_PID}"
@@ -402,7 +403,7 @@ cache_raw_saved_files="$(sed "s#^${FILE_ROOT}/##" "$cache_raw_files_file" | sort
 assert_eq "cache-raw writes files cache" "$cache_raw_saved_files" "$want_contains"
 cache_raw_saved_dirs_from_file="$(sort "$cache_raw_dirs_file")"
 assert_eq "cache-raw writes parent dir for file search" "$cache_raw_saved_dirs_from_file" "${FILE_ROOT}/"
-USER="$CACHE_USER" FISH_PID="$CACHE_FISH_PID" XDG_RUNTIME_DIR="$XDG_RUNTIME_TEST" "$F" --timeout "$F_TIMEOUT" --cache-raw abc -d "$DIR_ROOT" >/dev/null 2>&1
+USER="$CACHE_USER" fish_pid="$CACHE_FISH_PID" XDG_RUNTIME_DIR="$XDG_RUNTIME_TEST" "$F" --timeout "$F_TIMEOUT" --cache-raw abc -d "$DIR_ROOT" >/dev/null 2>&1
 cache_raw_saved_dirs="$(sort "$cache_raw_dirs_file")"
 want_cache_raw_dirs=$(printf '%s\n' "${DIR_ROOT}/" "${DIR_ROOT}/abc/" "${DIR_ROOT}/abcx/" "${DIR_ROOT}/xabc/" "${DIR_ROOT}/xabcx/" | sort)
 assert_eq "cache-raw writes dirs cache (matches + parent)" "$cache_raw_saved_dirs" "$want_cache_raw_dirs"
@@ -426,7 +427,7 @@ mkdir -p "$IGNORE_ROOT"
 touch "${IGNORE_ROOT}/ignore_me" "${IGNORE_ROOT}/keep_me"
 mkdir -p "${IGNORE_ROOT}/nested"
 touch "${IGNORE_ROOT}/nested/inherited_ignore" "${IGNORE_ROOT}/nested/inherited_keep"
-printf 'ignore_me\ninherited_ignore\n' > "${IGNORE_ROOT}/.gitignore"
+printf 'ignore_me\ninherited_ignore\n' >"${IGNORE_ROOT}/.gitignore"
 git -C "$IGNORE_ROOT" init -q
 want_ignore_default='ignore_me'
 assert_eq "default bypasses gitignore" "$(list_rel "$IGNORE_ROOT" ignore_me -f)" "$want_ignore_default"
@@ -468,17 +469,17 @@ LONG_ROOT="${TMP_BASE}/long_root"
 mkdir -p "${LONG_ROOT}/folder_match/sub"
 touch "${LONG_ROOT}/folder_match/a" "${LONG_ROOT}/folder_match/b" "${LONG_ROOT}/folder_match/sub/c"
 long_out="$("$F" --timeout "$F_TIMEOUT" -L -d folder "$LONG_ROOT" 2>/dev/null)"
-assert_regex "extended long format" "$long_out" '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]+([.][0-9]+)? ?(B|KiB|MiB|GiB|TiB) [0-9]+ .+/$'
+assert_regex "extended long format" "$long_out" '^ ?[0-9]{1,2} [A-Za-z]{3}( [0-9]{4}| [0-9]{2}:[0-9]{2}) [0-9]+([.][0-9]+)? ?(B|KiB|MiB|GiB|TiB) [0-9]+ .+/$'
 assert_contains "extended long file count value" "$long_out" " 3 "
 long_out_alias="$("$F" --timeout "$F_TIMEOUT" --long-true-dirsize -d folder "$LONG_ROOT" 2>/dev/null)"
-assert_regex "extended long alias format" "$long_out_alias" '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]+([.][0-9]+)? ?(B|KiB|MiB|GiB|TiB) [0-9]+ .+/$'
+assert_regex "extended long alias format" "$long_out_alias" '^ ?[0-9]{1,2} [A-Za-z]{3}( [0-9]{4}| [0-9]{2}:[0-9]{2}) [0-9]+([.][0-9]+)? ?(B|KiB|MiB|GiB|TiB) [0-9]+ .+/$'
 
 LONG_SYM_ROOT="${TMP_BASE}/long_sym_root"
 mkdir -p "${LONG_SYM_ROOT}/real_dir"
 dd if=/dev/zero of="${LONG_SYM_ROOT}/real_dir/blob" bs=1024 count=1024 status=none
 ln -s "${LONG_SYM_ROOT}/real_dir" "${LONG_SYM_ROOT}/sym_dir"
 long_sym_out="$("$F" --timeout "$F_TIMEOUT" -L sym_dir "$LONG_SYM_ROOT" 2>/dev/null)"
-assert_regex "extended long symlink dir not traversed" "$long_sym_out" '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]+([.][0-9]+)? ?(B|KiB|MiB|GiB|TiB) 0 .+/sym_dir$'
+assert_regex "extended long symlink dir not traversed" "$long_sym_out" '^ ?[0-9]{1,2} [A-Za-z]{3}( [0-9]{4}| [0-9]{2}:[0-9]{2}) [0-9]+([.][0-9]+)? ?(B|KiB|MiB|GiB|TiB) 0 .+/sym_dir$'
 
 # RECENT MATRIX
 RECENT_ROOT="${TMP_BASE}/recent_root"
@@ -503,7 +504,7 @@ assert_eq "recent full-path term matches a parent component" "$recent_full_term"
 recent_base_term="$("$F" --timeout "$F_TIMEOUT" --recent 1 full_path_term "$RECENT_ROOT" 2>/dev/null | sed "s#^${RECENT_ROOT}/##")"
 assert_eq "recent basename term excludes parent-only matches" "$recent_base_term" "full_path_term/"
 recent_long="$("$F" --timeout "$F_TIMEOUT" --recent 1 -l -f newest.txt "$RECENT_ROOT" 2>/dev/null)"
-assert_regex "recent long output shows indexed activity date and size" "$recent_long" "^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]+(\\.[0-9]+)? (B|KiB|MiB|GiB|TiB) ${RECENT_ROOT}/newest[.]txt$"
+assert_regex "recent long output shows indexed activity date and size" "$recent_long" "^ ?[0-9]{1,2} [A-Za-z]{3}( [0-9]{4}| [0-9]{2}:[0-9]{2}) [0-9]+(\\.[0-9]+)? (B|KiB|MiB|GiB|TiB) ${RECENT_ROOT}/newest[.]txt$"
 sleep 1
 touch "${RECENT_ROOT}/older.txt"
 recent_updated="$("$F" --timeout "$F_TIMEOUT" --recent 1 -f "$RECENT_ROOT" 2>/dev/null | sed "s#^${RECENT_ROOT}/##")"

@@ -4,7 +4,31 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn command_output_timeout(mut command: Command) -> std::io::Result<Output> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let deadline = Instant::now() + GIT_COMMAND_TIMEOUT;
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output();
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "git command timed out",
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
 
 pub(crate) fn populate_git_columns(
     listing_path: &Path,
@@ -88,7 +112,8 @@ pub(crate) fn collect_git_statuses_with_root(
         .ok()
         .unwrap_or(Path::new(""));
 
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(&command_path)
         .arg("-c")
@@ -99,9 +124,8 @@ pub(crate) fn collect_git_statuses_with_root(
             "-z",
             "--ignored=matching",
             "--untracked-files=all",
-        ])
-        .output()
-        .ok()?;
+        ]);
+    let output = command_output_timeout(command).ok()?;
 
     if !output.status.success() {
         return None;
@@ -164,12 +188,12 @@ pub(crate) fn git_repo_root(path: &Path) -> Option<PathBuf> {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."))
     };
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(command_path)
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .ok()?;
+        .args(["rev-parse", "--show-toplevel"]);
+    let output = command_output_timeout(command).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -213,12 +237,13 @@ fn collect_git_repo_roots_in_directory(path: &Path) -> Vec<PathBuf> {
 }
 
 fn git_fetch_repo(repo_root: &Path) -> bool {
-    Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(repo_root)
-        .args(["fetch", "--all", "--prune", "--quiet"])
-        .status()
-        .map(|s| s.success())
+        .args(["fetch", "--all", "--prune", "--quiet"]);
+    command_output_timeout(command)
+        .map(|output| output.status.success())
         .unwrap_or(false)
 }
 
@@ -249,17 +274,14 @@ pub(crate) fn git_repo_root_markers(path: &Path) -> (Option<char>, Option<char>)
         return (None, None);
     }
 
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(&abs_path)
-        .args([
-            "status",
-            "--porcelain=2",
-            "--branch",
-            "--untracked-files=normal",
-        ])
-        .output();
-    let Ok(output) = output else {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(&abs_path).args([
+        "status",
+        "--porcelain=2",
+        "--branch",
+        "--untracked-files=normal",
+    ]);
+    let Ok(output) = command_output_timeout(command) else {
         return (Some('~'), Some('?'));
     };
     if !output.status.success() {
@@ -315,32 +337,16 @@ pub(crate) fn git_repo_root_markers(path: &Path) -> (Option<char>, Option<char>)
 }
 
 fn git_status_symbol(raw: char) -> char {
-    match raw {
-        ' ' => '-',
-        'M' => 'M',
-        'A' => 'A',
-        '?' => 'N',
-        'D' => 'D',
-        'R' => 'R',
-        'T' => 'T',
-        '!' => 'I',
-        'U' => 'U',
-        'C' => 'M',
-        _ => '-',
-    }
+    fsx::git::display_status_symbol(raw)
 }
 
 fn parse_git_status_pair(xy: &str) -> (char, char) {
     match xy {
-        "??" => (' ', '?'),
-        "!!" => (' ', '!'),
         // Any unmerged state should read as conflicted in both columns.
         "DD" | "AU" | "UD" | "UA" | "DU" | "AA" | "UU" => ('U', 'U'),
         _ => {
-            let mut chars = xy.chars();
-            let x = chars.next().unwrap_or(' ');
-            let y = chars.next().unwrap_or(' ');
-            (x, y)
+            let pair = fsx::git::parse_status_pair(xy);
+            (pair.staged, pair.worktree)
         }
     }
 }

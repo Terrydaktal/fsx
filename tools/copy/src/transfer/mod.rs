@@ -4,6 +4,7 @@ mod backup;
 mod cleanup;
 mod command;
 mod copy_engine;
+mod journal;
 mod local;
 mod orchestrator;
 mod remote;
@@ -17,6 +18,7 @@ pub(crate) use backup::{
 pub(crate) use cleanup::remove_path_recursive;
 pub(crate) use command::run_command_capture;
 pub(crate) use copy_engine::preserve_directory_times_tree;
+pub(crate) use journal::TransferJournal;
 pub(crate) use local::run_rust_transfer;
 pub(crate) use orchestrator::{
     flush_destination_writes, run_move_cleanup_phase, run_multi_source_file_batch,

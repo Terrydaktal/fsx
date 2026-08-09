@@ -140,12 +140,17 @@ pub(crate) fn backup_path_with_base(
         let ok = if use_sudo {
             let cmd = vec![
                 "mv".to_string(),
+                "-n".to_string(),
                 "--".to_string(),
                 path.display().to_string(),
                 candidate.display().to_string(),
             ];
             run_command_capture(&cmd, true)
-                .map(|o| o.code == 0)
+                .map(|o| {
+                    o.code == 0
+                        && fs::symlink_metadata(path).is_err()
+                        && fs::symlink_metadata(&candidate).is_ok()
+                })
                 .unwrap_or(false)
         } else {
             rename_noreplace(path, &candidate).is_ok()

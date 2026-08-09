@@ -10,7 +10,6 @@ use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use users::{get_group_by_gid, get_user_by_uid};
 
 pub(crate) fn sort_entries(entries: &mut [EntryInfo], ctx: &Context, reverse_sorted_output: bool) {
     entries.sort_unstable_by(|a, b| {
@@ -145,9 +144,9 @@ pub(crate) fn emit_entries(
 }
 
 pub(crate) fn render_multiple_paths(cli: Cli) -> io::Result<()> {
-    let (mut ctx, _sort_explicit, implicit_ascending_sort, _pin_dot_entries, piped_output) =
+    let (mut ctx, _sort_explicit, implicit_ascending_sort, _pin_dot_entries, _piped_output) =
         build_context_and_sort_state(&cli);
-    let cache_raw_enabled = cli.cache_raw && !piped_output;
+    let cache_raw_enabled = cli.cache_raw;
     let need_counts = cli.counts || matches!(ctx.sort_by, SortBy::DirCount | SortBy::FileCount);
     let now = Local::now();
     let now_year = now.year();
@@ -155,6 +154,7 @@ pub(crate) fn render_multiple_paths(cli: Cli) -> io::Result<()> {
     let mut user_cache: HashMap<u32, String> = HashMap::new();
     let mut group_cache: HashMap<u32, String> = HashMap::new();
     let mut entries = Vec::new();
+    let mut first_error: Option<io::Error> = None;
 
     let mut git_status_visible = false;
     let mut git_repo_visible = false;
@@ -166,7 +166,11 @@ pub(crate) fn render_multiple_paths(cli: Cli) -> io::Result<()> {
         let actual_path = path.clone();
         let metadata = match fs::symlink_metadata(&actual_path) {
             Ok(m) => m,
-            Err(err) => return Err(err),
+            Err(err) => {
+                eprintln!("twig: {}: {err}", actual_path.display());
+                first_error.get_or_insert(err);
+                continue;
+            }
         };
         let is_actual_dir = metadata.is_dir();
         let need_target_metadata = cli.dereference
@@ -297,21 +301,22 @@ pub(crate) fn render_multiple_paths(cli: Cli) -> io::Result<()> {
         }
     }
 
-    emit_entries(
+    let output_result = emit_entries(
         &cli,
         &mut ctx,
         entries,
         cli.reverse ^ implicit_ascending_sort,
         false,
         cache_raw_enabled,
-    )
+    );
+    output_result.and_then(|()| first_error.map_or(Ok(()), Err))
 }
 
 pub(crate) fn render_path(cli: Cli) -> io::Result<()> {
     let (mut ctx, _sort_explicit, implicit_ascending_sort, pin_dot_entries, piped_output) =
         build_context_and_sort_state(&cli);
     let show_hidden = cli.all || cli.almost_all;
-    let cache_raw_enabled = cli.cache_raw && !piped_output;
+    let cache_raw_enabled = cli.cache_raw;
     let mut entries = Vec::new();
     let need_counts = cli.counts || matches!(ctx.sort_by, SortBy::DirCount | SortBy::FileCount);
     let input_path = Path::new(&cli.path);
@@ -718,9 +723,7 @@ pub(crate) fn create_entry_info(
         user_cache
             .entry(metadata.uid())
             .or_insert_with(|| {
-                get_user_by_uid(metadata.uid())
-                    .map(|u| u.name().to_string_lossy().into_owned())
-                    .unwrap_or_else(|| metadata.uid().to_string())
+                lookup_user_name(metadata.uid()).unwrap_or_else(|| metadata.uid().to_string())
             })
             .clone()
     } else {
@@ -730,9 +733,7 @@ pub(crate) fn create_entry_info(
         group_cache
             .entry(metadata.gid())
             .or_insert_with(|| {
-                get_group_by_gid(metadata.gid())
-                    .map(|g| g.name().to_string_lossy().into_owned())
-                    .unwrap_or_else(|| metadata.gid().to_string())
+                lookup_group_name(metadata.gid()).unwrap_or_else(|| metadata.gid().to_string())
             })
             .clone()
     } else {
@@ -749,7 +750,7 @@ pub(crate) fn create_entry_info(
     };
 
     let time_str = if ctx.show_time {
-        format_time_display(sort_mtime, now_year, now_timestamp)
+        fsx::format_time_display(sort_mtime, now_year, now_timestamp)
     } else {
         String::new()
     };

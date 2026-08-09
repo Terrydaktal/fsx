@@ -12,83 +12,32 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
 pub(crate) struct PathInfo {
     pub(crate) path: PathBuf,
     pub(crate) is_dir: bool,
 }
 
 #[derive(Clone)]
-struct IgnoreRule {
-    matcher: Regex,
-    dir_only: bool,
-    negated: bool,
-}
-
-#[derive(Clone, Default)]
 pub(crate) struct SimpleIgnoreRules {
-    rules: Vec<IgnoreRule>,
-}
-
-fn ignore_glob_regex(pattern: &str) -> Option<Regex> {
-    let mut regex = String::from("^");
-    for ch in pattern.chars() {
-        match ch {
-            '*' => regex.push_str(".*"),
-            '?' => regex.push('.'),
-            '[' | ']' | '(' | ')' | '{' | '}' | '.' | '+' | '^' | '$' | '|' | '\\' => {
-                regex.push('\\');
-                regex.push(ch);
-            }
-            _ => regex.push(ch),
-        }
-    }
-    regex.push('$');
-    Regex::new(&regex).ok()
+    matcher: fsx::ignore::IgnoreMatcher,
+    root: PathBuf,
 }
 
 pub(crate) fn load_simple_ignore_rules(dir: &Path) -> SimpleIgnoreRules {
-    let mut rules = SimpleIgnoreRules::default();
-    for ignore_name in [".gitignore", ".ignore", ".fdignore"] {
-        let path = dir.join(ignore_name);
-        let Ok(content) = fs::read_to_string(path) else {
-            continue;
-        };
-        for raw in content.lines() {
-            let line = raw.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let negated = line.starts_with('!');
-            let mut token = line.strip_prefix('!').unwrap_or(line);
-            let is_dir_only = token.ends_with('/');
-            if is_dir_only {
-                token = token.trim_end_matches('/');
-            }
-            if token.is_empty() {
-                continue;
-            }
-            if let Some(matcher) = ignore_glob_regex(token) {
-                rules.rules.push(IgnoreRule {
-                    matcher,
-                    dir_only: is_dir_only,
-                    negated,
-                });
-            }
-        }
-    }
-    rules
+    let root = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let matcher = fsx::ignore::IgnoreMatcher::from_search_root(&root)
+        .expect("fsx ignore matcher construction cannot fail");
+    SimpleIgnoreRules { matcher, root }
 }
 
-pub(crate) fn is_simple_ignored_name(name: &str, is_dir: bool, rules: &SimpleIgnoreRules) -> bool {
-    let mut ignored = false;
-    for rule in &rules.rules {
-        if (!rule.dir_only || is_dir) && rule.matcher.is_match(name) {
-            ignored = !rule.negated;
-        }
-    }
-    ignored
+pub(crate) fn is_simple_ignored_name(path: &Path, is_dir: bool, rules: &SimpleIgnoreRules) -> bool {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        rules.root.join(path)
+    };
+    rules.matcher.is_ignored(&path, is_dir)
 }
 
 type VisitedDirs = Option<Arc<Vec<PathBuf>>>;
@@ -173,9 +122,7 @@ fn walk_fast_inner(
         return;
     };
     let ignore_rules = if respect_ignore {
-        let mut rules = inherited_ignore.as_deref().cloned().unwrap_or_default();
-        rules.rules.extend(load_simple_ignore_rules(&dir).rules);
-        Some(Arc::new(rules))
+        Some(inherited_ignore.unwrap_or_else(|| Arc::new(load_simple_ignore_rules(&dir))))
     } else {
         None
     };
@@ -201,9 +148,8 @@ fn walk_fast_inner(
                 }
             }
         }
-        let name_lossy = name.to_string_lossy();
         if let Some(rules) = &ignore_rules {
-            if is_simple_ignored_name(&name_lossy, is_dir, rules) {
+            if is_simple_ignored_name(&path, is_dir, rules) {
                 continue;
             }
         }
@@ -356,9 +302,7 @@ fn walk_rayon_worker_inner(
         return;
     };
     let ignore_rules = if opts.respect_ignore {
-        let mut rules = inherited_ignore.as_deref().cloned().unwrap_or_default();
-        rules.rules.extend(load_simple_ignore_rules(&dir).rules);
-        Some(Arc::new(rules))
+        Some(inherited_ignore.unwrap_or_else(|| Arc::new(load_simple_ignore_rules(&dir))))
     } else {
         None
     };
@@ -385,7 +329,7 @@ fn walk_rayon_worker_inner(
             }
         }
         if let Some(rules) = &ignore_rules {
-            if is_simple_ignored_name(&name_lossy, is_dir, rules) {
+            if is_simple_ignored_name(&path, is_dir, rules) {
                 continue;
             }
         }
@@ -419,6 +363,7 @@ fn walk_rayon_worker_inner(
                 }
                 local_buf.push(SearchResult {
                     path: p_str,
+                    path_encoded: false,
                     is_dir,
                     is_symlink,
                     metadata: if needs_metadata {
@@ -505,120 +450,16 @@ fn walk_rayon_worker_inner(
     }
 }
 
-pub(crate) fn unescape_proc_mount_field(field: &str) -> String {
-    let bytes = field.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 3 < bytes.len() {
-            let a = bytes[i + 1];
-            let b = bytes[i + 2];
-            let c = bytes[i + 3];
-            let octal = (b'0'..=b'7').contains(&a)
-                && (b'0'..=b'7').contains(&b)
-                && (b'0'..=b'7').contains(&c);
-            if octal {
-                let value = ((a - b'0') << 6) | ((b - b'0') << 3) | (c - b'0');
-                out.push(value);
-                i += 4;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 pub(crate) fn detect_mount_info(path: &Path) -> Option<MountInfo> {
-    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let mounts = cached_mounts()?;
-    let mut best: Option<(usize, MountInfo)> = None;
-    for mount in mounts {
-        let mount_len = mount.mount_point.as_os_str().as_bytes().len();
-        if !canonical.starts_with(&mount.mount_point) {
-            continue;
-        }
-        if best
-            .as_ref()
-            .map(|(best_len, _)| mount_len > *best_len)
-            .unwrap_or(true)
-        {
-            best = Some((mount_len, mount));
-        }
-    }
-    best.map(|(_, info)| info)
-}
-
-fn cached_mounts() -> Option<Vec<MountInfo>> {
-    type MountCache = Option<(Instant, Vec<MountInfo>)>;
-    static CACHE: OnceLock<Mutex<MountCache>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(None));
-    let mut guard = cache.lock().ok()?;
-    if let Some((created, mounts)) = guard.as_ref() {
-        if created.elapsed() < Duration::from_secs(5) {
-            return Some(mounts.clone());
-        }
-    }
-    let content = fs::read_to_string("/proc/mounts").ok()?;
-    let mounts = content
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.split_whitespace();
-            let device = PathBuf::from(unescape_proc_mount_field(parts.next()?));
-            let mount_point = PathBuf::from(unescape_proc_mount_field(parts.next()?));
-            let fs_type = parts.next()?.to_string();
-            Some(MountInfo {
-                device,
-                mount_point,
-                fs_type,
-            })
-        })
-        .collect::<Vec<_>>();
-    *guard = Some((Instant::now(), mounts.clone()));
-    Some(mounts)
-}
-
-pub(crate) fn ntfs_best_filename(
-    entry: &ntfs::NtfsIndexEntry<'_, ntfs::indexes::NtfsFileNameIndex>,
-) -> Option<String> {
-    if let Some(Ok(file_name)) = entry.key() {
-        let name = file_name.name().to_string_lossy().to_string();
-        if !name.contains('~') || name.len() > 12 {
-            return Some(name);
-        }
-    }
-    entry
-        .key()
-        .and_then(|result| result.ok())
-        .map(|file_name| file_name.name().to_string_lossy().to_string())
-}
-
-pub(crate) fn ntfs_is_reparse_point(file: &ntfs::NtfsFile, device: &mut fs::File) -> bool {
-    let mut attrs = file.attributes();
-    while let Some(attr_result) = attrs.next(device) {
-        if let Ok(attr_item) = attr_result {
-            if let Ok(attr) = attr_item.to_attribute() {
-                if let Ok(attr_ty) = attr.ty() {
-                    if attr_ty == ntfs::NtfsAttributeType::ReparsePoint {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    false
+    fsx::mount::mount_for_path(path).map(|mount| MountInfo {
+        device: mount.source,
+        mount_point: mount.mount_point,
+        fs_type: mount.filesystem,
+    })
 }
 
 pub(crate) fn ntfs_file_logical_size(file: &ntfs::NtfsFile, device: &mut fs::File) -> u64 {
-    if let Some(Ok(data_item)) = file.data(device, "") {
-        if let Ok(data_attr_obj) = data_item.to_attribute() {
-            if let Ok(value) = data_attr_obj.value(device) {
-                return value.len();
-            }
-        }
-    }
-    0
+    fsx::ntfs::data_logical_size(file, device)
 }
 
 pub(crate) fn ntfs_find_subdir_record(
@@ -646,7 +487,7 @@ pub(crate) fn ntfs_find_subdir_record(
                 Ok(e) => e,
                 Err(_) => continue,
             };
-            let entry_name = match ntfs_best_filename(&entry) {
+            let entry_name = match fsx::ntfs::best_filename(&entry) {
                 Some(n) => n,
                 None => continue,
             };
@@ -696,7 +537,7 @@ pub(crate) fn ntfs_scan_subtree_record(
                 Ok(e) => e,
                 Err(_) => continue,
             };
-            let name = match ntfs_best_filename(&entry) {
+            let name = match fsx::ntfs::best_filename(&entry) {
                 Some(n) => n,
                 None => continue,
             };
@@ -712,7 +553,7 @@ pub(crate) fn ntfs_scan_subtree_record(
                 Err(_) => continue,
             };
             let child_is_dir = child_file.is_directory();
-            let child_is_reparse = ntfs_is_reparse_point(&child_file, device);
+            let child_is_reparse = fsx::ntfs::is_reparse_point(&child_file, device);
             if child_is_dir && !child_is_reparse {
                 stack.push(child_record);
             } else if !child_is_reparse {
@@ -752,7 +593,7 @@ pub(crate) fn get_dir_stats_ntfs_mft(path: &Path, count_files: bool) -> io::Resu
     ))
 }
 
-pub(crate) fn get_dir_stats_walk(path: &str, count_files: bool) -> (u64, u64) {
+pub(crate) fn get_dir_stats_walk(path: &Path, count_files: bool) -> (u64, u64) {
     let mut bytes = 0u64;
     let mut files = 0u64;
     for entry_res in WalkDir::new(path).follow_links(false) {
@@ -768,29 +609,32 @@ pub(crate) fn get_dir_stats_walk(path: &str, count_files: bool) -> (u64, u64) {
             files = files.saturating_add(1);
         }
     }
+    if bytes == u64::MAX || files == u64::MAX {
+        eprintln!("unearth: warning: filesystem aggregate overflowed u64 and was saturated");
+    }
     (bytes, files)
 }
 
-pub(crate) fn get_dir_stats_native(path: &str, count_files: bool) -> (u64, u64) {
-    let path_buf = PathBuf::from(path);
+pub(crate) fn get_dir_stats_native(path: &Path, count_files: bool) -> (u64, u64) {
     let ntfs_debug = env::var_os("UNEARTH_NTFS_DEBUG").is_some();
-    match get_dir_stats_ntfs_mft(&path_buf, count_files) {
+    match get_dir_stats_ntfs_mft(path, count_files) {
         Ok(stats) => {
             if ntfs_debug {
-                eprintln!("unearth: NTFS MFT fast path enabled for {}", path);
+                eprintln!("unearth: NTFS MFT fast path enabled for {}", path.display());
             }
             stats
         }
         Err(err) => {
             if ntfs_debug
-                && detect_mount_info(&path_buf)
+                && detect_mount_info(path)
                     .as_ref()
                     .map(|m| NTFS_FS_TYPES.iter().any(|t| m.fs_type == *t))
                     .unwrap_or(false)
             {
                 eprintln!(
                     "unearth: NTFS MFT fast path unavailable for {}: {}",
-                    path, err
+                    path.display(),
+                    err
                 );
             }
             get_dir_stats_walk(path, count_files)
@@ -798,8 +642,8 @@ pub(crate) fn get_dir_stats_native(path: &str, count_files: bool) -> (u64, u64) 
     }
 }
 
-pub(crate) fn get_dir_bytes_native_serial(path: &str) -> u64 {
-    if let Ok((bytes, _)) = get_dir_stats_ntfs_mft(Path::new(path), false) {
+pub(crate) fn get_dir_bytes_native_serial(path: &Path) -> u64 {
+    if let Ok((bytes, _)) = get_dir_stats_ntfs_mft(path, false) {
         return bytes;
     }
     let mut bytes = 0u64;
@@ -815,14 +659,21 @@ pub(crate) fn get_dir_bytes_native_serial(path: &str) -> u64 {
             bytes = bytes.saturating_add(meta.len());
         }
     }
+    if bytes == u64::MAX {
+        eprintln!("unearth: warning: filesystem size overflowed u64 and was saturated");
+    }
     bytes
 }
 
 pub(crate) fn normalize_dir_key(path: &str) -> String {
-    if path == "/" {
+    let normalized = fsx::path::normalize_lexical(Path::new(path));
+    if normalized == Path::new("/") {
         "/".to_string()
     } else {
-        path.trim_end_matches('/').to_string()
+        normalized
+            .to_string_lossy()
+            .trim_end_matches('/')
+            .to_string()
     }
 }
 

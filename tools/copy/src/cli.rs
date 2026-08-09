@@ -7,9 +7,9 @@ use std::ffi::OsString;
 
 #[derive(Default)]
 pub(crate) struct CliArgs {
-    pub(crate) source: String,
-    pub(crate) destination: String,
-    pub(crate) extra: Vec<String>,
+    pub(crate) source: OsString,
+    pub(crate) destination: OsString,
+    pub(crate) extra: Vec<OsString>,
     pub(crate) move_mode: bool,
     pub(crate) sudo: bool,
     pub(crate) overwrite: bool,
@@ -17,6 +17,7 @@ pub(crate) struct CliArgs {
     pub(crate) create_destination_parents: bool,
     pub(crate) backup: bool,
     pub(crate) sync_mode: bool,
+    pub(crate) verify: bool,
     pub(crate) showall: bool,
     pub(crate) tree_depth: Option<usize>,
     pub(crate) tree_trunc: usize,
@@ -27,7 +28,7 @@ pub(crate) struct CliArgs {
 }
 pub(crate) fn usage() {
     eprintln!(
-        "usage: copy [-h] [-m] [-s] [-o] [-c] [--create-destination-parents] [-b] [--sync] [--replace-dest-symlink] [-v|--verbose|--showall] [-L depth] [-T trunc] [--preview] [--preview-lite] source... destination"
+        "usage: copy [-h] [-m] [-s] [-o] [-c] [--create-destination-parents] [-b] [--sync] [--verify] [--replace-dest-symlink] [-v|--verbose|--showall] [-L depth] [-T trunc] [--preview] [--preview-lite] source... destination"
     );
 }
 
@@ -46,7 +47,7 @@ fn set_merge_collision_policy(args: &mut CliArgs, policy: MergeCollisionPolicy) 
 #[allow(clippy::print_literal)]
 pub(crate) fn print_help() {
     println!(
-        "usage: copy [-h] [-m] [-s] [-o] [-c] [--create-destination-parents] [-b] [--sync] [--replace-dest-symlink] [-v|--verbose|--showall] [-L depth] [-T trunc] [--preview] [--preview-lite] source... destination"
+        "usage: copy [-h] [-m] [-s] [-o] [-c] [--create-destination-parents] [-b] [--sync] [--verify] [--replace-dest-symlink] [-v|--verbose|--showall] [-L depth] [-T trunc] [--preview] [--preview-lite] source... destination"
     );
     println!();
     println!("Standalone copy/move with preview/progress.");
@@ -79,6 +80,8 @@ pub(crate) fn print_help() {
     println!("  --sync              Native exact-tree sync with destination deletions (rsync-style semantics).");
     println!("                        Local transfers use the Rust backend; remote or --sudo transfers use rsync.");
     println!("                        Merge/sync semantics; not target replacement semantics like --overwrite.");
+    println!("  --verify             Hash copied regular files with SHA-256 and verify the published destination bytes.");
+    println!("                        Local Rust backend only; this adds a second read pass and is disabled by default.");
     println!("  -v, --verbose, --showall");
     println!("                        Show full preview tree (new, modified, identical, uncollided, deleted).");
     println!("  --collision policy   Collision policy for file-vs-file conflicts inside local Rust merges.");
@@ -178,7 +181,7 @@ pub(crate) fn parse_args() -> Result<CliArgs, i32> {
         tree_trunc: 25,
         ..CliArgs::default()
     };
-    let mut positional: Vec<String> = Vec::new();
+    let mut positional: Vec<OsString> = Vec::new();
     let argv: Vec<OsString> = env::args_os().skip(1).collect();
     let mut i = 0usize;
     let mut options_done = false;
@@ -187,13 +190,16 @@ pub(crate) fn parse_args() -> Result<CliArgs, i32> {
         let raw = match argv[i].to_str() {
             Some(raw) => raw,
             None => {
-                usage();
-                eprintln!("copy: error: non-UTF-8 command-line paths are not supported; refusing to continue");
-                return Err(1);
+                // Keep filesystem operands as OsString. Remote endpoints and
+                // option values still require UTF-8, but local byte paths do
+                // not need a lossy conversion on the way to syscalls.
+                positional.push(argv[i].clone());
+                i += 1;
+                continue;
             }
         };
         if options_done {
-            positional.push(raw.to_string());
+            positional.push(argv[i].clone());
             i += 1;
             continue;
         }
@@ -210,6 +216,7 @@ pub(crate) fn parse_args() -> Result<CliArgs, i32> {
             "--create-destination-parents" => args.create_destination_parents = true,
             "-b" | "--backup" => args.backup = true,
             "--sync" => args.sync_mode = true,
+            "--verify" => args.verify = true,
             "-v" | "--verbose" | "--showall" => args.showall = true,
             "--replace-dest-symlink" => args.replace_dest_symlink = true,
             "--collision" => {
@@ -282,7 +289,7 @@ pub(crate) fn parse_args() -> Result<CliArgs, i32> {
                 eprintln!("copy: error: unrecognized arguments: {raw}");
                 return Err(1);
             }
-            _ => positional.push(raw.to_string()),
+            _ => positional.push(argv[i].clone()),
         }
         i += 1;
     }

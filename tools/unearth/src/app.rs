@@ -11,7 +11,7 @@ mod patterns;
 mod presentation;
 mod search;
 
-pub(crate) use cli::{cli_main, daemon_main};
+pub(crate) use cli::{cli_main, fsxd_main};
 pub(crate) use filesystem::*;
 #[cfg(any(feature = "watcher", test))]
 pub(crate) use index::*;
@@ -52,16 +52,16 @@ const INDEX_INCREMENTAL_MAX_CHANGES: usize = 100_000;
 const INDEX_INCREMENTAL_CHANGE_DIVISOR: usize = 5;
 const INDEX_REFRESH_LOCK_EMPTY_GRACE: Duration = Duration::from_secs(10);
 const INDEX_SNAPSHOT_MAGIC: &[u8; 8] = b"UNRTHS01";
-const INDEX_MANIFEST_MAGIC: &[u8; 8] = b"UNRMNF02";
+const INDEX_MANIFEST_MAGIC: &[u8; 8] = b"UNRMNF04";
 const INDEX_DELTA_MAGIC: &[u8; 8] = b"UNRDLT01";
 const INDEX_DELTA_COMPACT_RECORDS: usize = 50_000;
-const QUERY_SOCKET_NAME: &str = "unearthd.sock";
-const QUERY_PROTOCOL_MAGIC: &[u8; 8] = b"UNRQ0002";
-const QUERY_RESPONSE_MAGIC: &[u8; 8] = b"UNRS0002";
+const QUERY_SOCKET_NAME: &str = "fsxd.sock";
+const QUERY_PROTOCOL_MAGIC: &[u8; 8] = b"FSXQ0001";
+const QUERY_RESPONSE_MAGIC: &[u8; 8] = b"FSXS0001";
 const QUERY_MAX_FRAME: usize = 16 * 1024 * 1024;
 #[cfg(feature = "watcher")]
 const QUERY_MAX_REQUEST: usize = 64 * 1024 * 1024;
-const INDEX_SCHEMA_VERSION: i32 = 2;
+const INDEX_SCHEMA_VERSION: i32 = 4;
 
 #[cfg(test)]
 mod tests;

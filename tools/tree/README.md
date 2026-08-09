@@ -6,10 +6,10 @@ A modern, high-performance version of the `tree` utility written in Rust.
 
 - **Blazing Fast**: Uses `jwalk` for parallel directory traversal.
 - **Modern Terminal Support**: Includes **OSC 8 Hyperlinks** (clickable files and directories) and respects the `LS_COLORS` environment variable.
-- **Smart Truncation**: Always displays everything at the top level (depth 1), but truncates subdirectories (depth 2+) based on the `-T <value>` parameter with an `... and x more` entry.
+- **Smart Truncation**: Displays the requested depth and truncates subdirectories at depth 2+ based on the `-T <value>` parameter with an `... and x more` entry.
 - **Type Classification**: Supports the `-F` flag to add suffixes (`/` for directories, `@` for symbolic links, and `*` for executables).
 - **Raw Path Cache**: Supports `--cache-raw` to write the currently displayed paths into cache files for downstream shell tooling.
-- **Optimized**: Built with `jemalloc` for memory efficiency and compiled with `target-cpu=native` for maximum performance on your hardware.
+- **Optimized**: Uses `jemalloc` where available and keeps shallow size scans on a specialized ancestor-aggregation path.
 
 ## Installation
 
@@ -25,12 +25,12 @@ cd tree
 cargo build --release
 ```
 
-The optimized binary will be available at `./target/release/tree`.
+The optimized binary will be available at `../../target/release/tree`.
 
 ### System Integration (Linux/macOS)
 
 ```bash
-ln -sf $(pwd)/target/release/tree ~/.local/bin/tree
+ln -sf $(pwd)/../../target/release/tree ~/.local/bin/tree
 ```
 
 ## Usage
@@ -48,14 +48,17 @@ tree [OPTIONS] [PATH]
 - `-M, --hide-more-count`: Hide `... and N more` summary rows.
 - `-d, --dirs-only`: Show directories only.
 - `-G, --no-expand-git`: Toggle `.git/` expansion state (repeat to toggle back; e.g. `-G -G` cancels).
+- `--ignore`: Hide files matched by `.gitignore` and do not descend into ignored directories.
+- `--git`: Show Git status flags in a left-side column.
+- `--no-git`: Suppress Git status output.
 - `--deep`: Alias for `-L 20 -T 2`.
 - `-f, --follow-links`: Follow symbolic links.
 - `-S, --sizes`: Show proper recursive directory sizes (like `dust`).
 - `-H, --no-dedupe-hardlinks`: Disable inode dedup for `--sizes` (faster, may double-count hardlinks).
-- `-t, --times`: Show file modification times.
+- `-t, --times`: Show file modification times using the shared `ls`-style recent/old date layout.
 - `-c, --counts`: Show total recursive counts as `dirs` and `files` columns before the tree.
 - `-l`: Alias for `-Stc` (show sizes, times, and counts).
-- `-r, --reverse`: Reverse the final displayed output lines.
+- `-r, --reverse`: Reverse the final displayed output lines in memory without rescanning or launching a second process.
 - `--cache-raw`: Write shown full paths to session-scoped files in `/tmp/fzf-history-$USER/`:
   - `universal-last-dirs-<pid>`
   - `universal-last-files-<pid>`
@@ -68,6 +71,9 @@ tree [OPTIONS] [PATH]
 - `-j, --threads <THREADS>`: Number of threads to use (default: 8).
 - `--color[=always|auto|never]`: Control ANSI color output (default: `never`; bare `--color` means `always`).
 - `--hyperlink[=always|auto|never]`: Control OSC 8 hyperlinks (default: `auto`; bare `--hyperlink` means `always`).
+- Hyperlinks use the shared Unearth-compatible `file://` format. Visible item
+  names link directly to the item, so clicking a directory opens it and a
+  terminal middle-click handler receives that directory path.
 - `-h, --help`: Print help.
 - `-V, --version`: Print version.
 
@@ -75,7 +81,11 @@ tree [OPTIONS] [PATH]
 
 - `src/main.rs`: The core logic for directory traversal, tree construction, and rendering.
 - `Cargo.toml`: Dependency and optimization profile configuration.
-- `.cargo/config.toml`: Architecture-specific optimization flags.
+- `../../.cargo/config.toml`: Workspace-wide Cargo configuration.
+
+Tree consumes the sibling `fsx` crate for shared metadata facts, Git-ignore matching, Git status
+parsing, path normalization, count formatting, and raw fzf path-cache output. Tree retains the
+tree-specific scan optimizations, sorting, truncation, reverse layout, and branch rendering here.
 
 ## License
 

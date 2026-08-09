@@ -120,7 +120,7 @@ pub(crate) fn read_query_request(reader: &mut BufReader<UnixStream>) -> Result<O
     let mut magic = [0u8; 8];
     reader.read_exact(&mut magic).map_err(|e| e.to_string())?;
     if &magic != QUERY_PROTOCOL_MAGIC {
-        return Err("invalid unearth query protocol header".to_string());
+        return Err("invalid fsxd query protocol header".to_string());
     }
     let mut flags = [0u8; 1];
     reader.read_exact(&mut flags).map_err(|e| e.to_string())?;
@@ -276,7 +276,7 @@ pub(crate) fn handle_query_connection(
     conn: &Connection,
 ) -> Result<(), String> {
     stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
+        .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| e.to_string())?;
     stream
         .set_write_timeout(Some(Duration::from_secs(5)))
@@ -316,7 +316,7 @@ pub(crate) fn query_server_loop(listener: UnixListener, stop: Arc<AtomicBool>) {
             let receiver = receiver.clone();
             let worker_stop = Arc::clone(&stop);
             std::thread::Builder::new()
-                .name(format!("unearthd-query-{index}"))
+                .name(format!("fsxd-query-{index}"))
                 .spawn(move || {
                     let Ok(conn) = open_index_db_readonly() else {
                         return;
@@ -337,14 +337,20 @@ pub(crate) fn query_server_loop(listener: UnixListener, stop: Arc<AtomicBool>) {
                 .ok()
         })
         .collect::<Vec<_>>();
+    if workers.is_empty() {
+        eprintln!("fsxd: unable to start any query workers");
+        return;
+    }
     while !stop.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _)) => {
                 if stop.load(Ordering::Acquire) {
                     break;
                 }
-                if sender.send(stream).is_err() {
-                    break;
+                if sender.try_send(stream).is_err() {
+                    // Never let an untrusted local client block the accept
+                    // loop or prevent the daemon from observing shutdown.
+                    continue;
                 }
             }
             Err(_) => break,
@@ -359,15 +365,30 @@ pub(crate) fn query_server_loop(listener: UnixListener, stop: Arc<AtomicBool>) {
 #[cfg(feature = "watcher")]
 pub(crate) fn start_query_server() -> Result<QueryServerHandle, String> {
     let socket =
-        query_socket_path().ok_or_else(|| "Could not determine unearth cache dir".to_string())?;
+        query_socket_path().ok_or_else(|| "Could not determine fsx cache dir".to_string())?;
     if let Some(parent) = socket.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        let metadata = fs::symlink_metadata(parent).map_err(|e| e.to_string())?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err("fsxd query socket parent is not a real directory".to_string());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            if metadata.uid() != unsafe { libc::getuid() } {
+                return Err("fsxd query socket parent is not user-owned".to_string());
+            }
+            if metadata.mode() & 0o077 != 0 {
+                fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+                    .map_err(|e| e.to_string())?;
+            }
+        }
     }
     let listener = match UnixListener::bind(&socket) {
         Ok(listener) => listener,
         Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
             if UnixStream::connect(&socket).is_ok() {
-                return Err("another unearthd query server is already running".to_string());
+                return Err("another fsxd query server is already running".to_string());
             }
             fs::remove_file(&socket).map_err(|e| e.to_string())?;
             UnixListener::bind(&socket).map_err(|e| e.to_string())?
@@ -378,7 +399,7 @@ pub(crate) fn start_query_server() -> Result<QueryServerHandle, String> {
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
     let join = std::thread::Builder::new()
-        .name("unearthd-query".to_string())
+        .name("fsxd-query".to_string())
         .spawn(move || query_server_loop(listener, thread_stop))
         .map_err(|e| e.to_string())?;
     Ok(QueryServerHandle {

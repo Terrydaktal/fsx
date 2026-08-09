@@ -1,6 +1,7 @@
 use crate::model::EntryInfo;
 use clap::{Parser, ValueEnum};
 use lscolors::LsColors;
+use std::cell::RefCell;
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -179,6 +180,7 @@ pub(crate) struct Cli {
 
 pub(crate) struct Context {
     pub(crate) lscolors: LsColors,
+    pub(crate) fsx_colors: fsx::colors::ColorSpec,
     pub(crate) color_enabled: bool,
     pub(crate) classify: bool,
     pub(crate) show_perms: bool,
@@ -204,6 +206,7 @@ pub(crate) struct Context {
     pub(crate) sort_counts_total: bool,
     pub(crate) sort_reverse: bool,
     pub(crate) cwd: PathBuf,
+    pub(crate) hyperlink_cache: RefCell<fsx::terminal::HyperlinkCache>,
 }
 
 fn push_unique_column(columns: &mut Vec<DetailColumn>, column: DetailColumn) {
@@ -429,12 +432,15 @@ pub(crate) fn build_context_and_sort_state(cli: &Cli) -> (Context, bool, bool, b
     let piped_output = !io::stdout().is_terminal();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let color_enabled = output_enabled(cli.color, piped_output, false);
-    let classify_enabled = cli.classify && !piped_output;
+    let classify_enabled = cli.classify;
     let hyperlink_enabled = output_enabled(cli.hyperlink, piped_output, false);
     let lscolors = LsColors::from_env().unwrap_or_default();
+    let fsx_colors =
+        fsx::colors::parse_ls_colors_value(&std::env::var("LS_COLORS").unwrap_or_default());
 
     let ctx = Context {
         lscolors,
+        fsx_colors,
         color_enabled,
         classify: classify_enabled,
         show_perms: cli.permissions || cli.long,
@@ -460,6 +466,7 @@ pub(crate) fn build_context_and_sort_state(cli: &Cli) -> (Context, bool, bool, b
         sort_counts_total,
         sort_reverse: cli.reverse ^ implicit_ascending_sort,
         cwd,
+        hyperlink_cache: RefCell::new(fsx::terminal::HyperlinkCache::default()),
     };
     (
         ctx,
@@ -470,10 +477,10 @@ pub(crate) fn build_context_and_sort_state(cli: &Cli) -> (Context, bool, bool, b
     )
 }
 
-pub(crate) fn output_enabled(mode: OutputWhen, piped_output: bool, over_auto_limit: bool) -> bool {
+pub(crate) fn output_enabled(mode: OutputWhen, piped_output: bool, _over_auto_limit: bool) -> bool {
     match mode {
         OutputWhen::Always => true,
-        OutputWhen::Auto => !piped_output && !over_auto_limit,
+        OutputWhen::Auto => !piped_output,
         OutputWhen::Never => false,
     }
 }

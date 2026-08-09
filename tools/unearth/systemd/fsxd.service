@@ -1,5 +1,5 @@
 [Unit]
-Description=Compatibility alias for the fsx live filesystem index daemon
+Description=fsx live filesystem index daemon
 After=local-fs.target
 
 [Service]

@@ -2,17 +2,54 @@ use crate::cli::{Cli, Context, DetailColumn, SortBy, dot_entry_rank, output_enab
 use crate::fs_ops::*;
 use crate::git::*;
 use crate::model::EntryInfo;
-use chrono::{DateTime, Datelike, Local};
+use chrono::{Datelike, Local};
 use lscolors::Style;
 use std::collections::HashMap;
+use std::ffi::CStr;
 use std::fs;
 use std::io;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use users::get_user_by_uid;
 
 pub(crate) const AUTO_STYLE_MAX_ENTRIES: usize = 1000;
+
+pub(crate) fn lookup_user_name(uid: u32) -> Option<String> {
+    #[cfg(unix)]
+    unsafe {
+        let entry = libc::getpwuid(uid);
+        if entry.is_null() || (*entry).pw_name.is_null() {
+            return None;
+        }
+        return CStr::from_ptr((*entry).pw_name)
+            .to_str()
+            .ok()
+            .map(str::to_owned);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = uid;
+        None
+    }
+}
+
+pub(crate) fn lookup_group_name(gid: u32) -> Option<String> {
+    #[cfg(unix)]
+    unsafe {
+        let entry = libc::getgrgid(gid);
+        if entry.is_null() || (*entry).gr_name.is_null() {
+            return None;
+        }
+        return CStr::from_ptr((*entry).gr_name)
+            .to_str()
+            .ok()
+            .map(str::to_owned);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = gid;
+        None
+    }
+}
 
 pub(crate) fn escape_terminal_text(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
@@ -319,7 +356,12 @@ pub(crate) fn try_render_large_dir_fast_path(
         }
         let painted = paint_name_fast(&entry.display_name, &entry.actual_path, ctx);
         if ctx.hyperlink {
-            out.push_str(&hyperlink_path(&entry.actual_path, &painted, &ctx.cwd));
+            out.push_str(&hyperlink_path(
+                &entry.actual_path,
+                &painted,
+                &ctx.cwd,
+                &ctx.hyperlink_cache,
+            ));
         } else {
             out.push_str(&painted);
         }
@@ -330,17 +372,6 @@ pub(crate) fn try_render_large_dir_fast_path(
 
 fn long_fast_type_rank(e: &LongFastEntry) -> u8 {
     e.type_rank
-}
-
-pub(crate) fn format_time_display(mtime: i64, now_year: i32, now_timestamp: i64) -> String {
-    let dt: DateTime<Local> = DateTime::from_timestamp(mtime, 0)
-        .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap())
-        .with_timezone(&Local);
-    if now_year == dt.year() && (now_timestamp - dt.timestamp()).abs() < 15552000 {
-        dt.format("%e %b %H:%M").to_string()
-    } else {
-        dt.format("%e %b  %Y").to_string()
-    }
 }
 
 fn make_long_fast_entry(
@@ -386,14 +417,10 @@ fn make_long_fast_entry(
     let uid = metadata.uid();
     let user_str = user_cache
         .entry(uid)
-        .or_insert_with(|| {
-            get_user_by_uid(uid)
-                .map(|u| u.name().to_string_lossy().into_owned())
-                .unwrap_or_else(|| uid.to_string())
-        })
+        .or_insert_with(|| lookup_user_name(uid).unwrap_or_else(|| uid.to_string()))
         .clone();
     let sort_mtime = metadata.mtime();
-    let time_str = format_time_display(sort_mtime, now_year, now_timestamp);
+    let time_str = fsx::format_time_display(sort_mtime, now_year, now_timestamp);
 
     LongFastEntry {
         display_name,
@@ -632,11 +659,7 @@ pub(crate) fn try_render_large_dir_long_fast_path(
         out.push(' ');
 
         let time_text = format!("{:<width$}", e.time_str, width = max_time);
-        out.push_str(&paint_if_enabled(
-            nu_ansi_term::Style::default().dimmed(),
-            &time_text,
-            ctx.color_enabled,
-        ));
+        out.push_str(&fsx::terminal::dim_text(&time_text, ctx.color_enabled));
         out.push(' ');
 
         if e.is_symlink && e.broken_symlink {
@@ -656,7 +679,12 @@ pub(crate) fn try_render_large_dir_long_fast_path(
             let painted_name =
                 paint_text_with_lscolors(&safe_name, &e.actual_path, &e.metadata, ctx);
             if ctx.hyperlink {
-                out.push_str(&hyperlink_path(&e.actual_path, &painted_name, &ctx.cwd));
+                out.push_str(&hyperlink_path(
+                    &e.actual_path,
+                    &painted_name,
+                    &ctx.cwd,
+                    &ctx.hyperlink_cache,
+                ));
             } else {
                 out.push_str(&painted_name);
             }
@@ -852,11 +880,7 @@ pub(crate) fn print_detailed_list(
                 }
                 DetailColumn::Time => {
                     let time_text = format!("{:<width$}", e.time_str, width = max_time);
-                    row.push_str(&paint_if_enabled(
-                        nu_ansi_term::Style::default().dimmed(),
-                        &time_text,
-                        ctx.color_enabled,
-                    ));
+                    row.push_str(&fsx::terminal::dim_text(&time_text, ctx.color_enabled));
                 }
                 DetailColumn::Group => {
                     row.push_str(&format!("{:<width$}", e.group_str, width = max_group));
@@ -984,23 +1008,18 @@ pub(crate) fn get_styled_name(
         };
 
         if ctx.hyperlink {
-            let mut out = String::new();
-            if !styled_prefix.is_empty() {
-                let prefix_target = abs_path
-                    .parent()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| PathBuf::from("/"));
-                out.push_str(&hyperlink_path(&prefix_target, &styled_prefix, &ctx.cwd));
-            }
-            out.push_str(&hyperlink_path(&abs_path, &styled_basename, &ctx.cwd));
-            return out;
+            return ctx.hyperlink_cache.borrow_mut().split_path_link(
+                &abs_path,
+                &styled_prefix,
+                &styled_basename,
+            );
         }
 
         return format!("{}{}", styled_prefix, styled_basename);
     }
     let painted = paint_text_with_lscolors(&name, actual_path, metadata, ctx);
     if ctx.hyperlink {
-        return hyperlink_path(actual_path, &painted, &ctx.cwd);
+        return hyperlink_path(actual_path, &painted, &ctx.cwd, &ctx.hyperlink_cache);
     }
     painted
 }
@@ -1013,6 +1032,18 @@ fn paint_text_with_lscolors(
 ) -> String {
     if !ctx.color_enabled {
         return text.to_string();
+    }
+    let metadata_type = metadata.file_type();
+    let executable = metadata.permissions().mode() & 0o111 != 0;
+    if let Some(code) = fsx::colors::color_code_for_path(
+        &path.to_string_lossy(),
+        metadata_type.is_dir(),
+        metadata_type.is_symlink(),
+        false,
+        executable,
+        &ctx.fsx_colors,
+    ) {
+        return format!("\x1b[{code}m{text}\x1b[0m");
     }
     match ctx
         .lscolors
@@ -1088,69 +1119,21 @@ pub(crate) fn highlight_broken_symlink_text(text: &str, color_enabled: bool) -> 
     }
 }
 
-fn hyperlink_path(path: &Path, text: &str, cwd: &Path) -> String {
+fn hyperlink_path(
+    path: &Path,
+    text: &str,
+    cwd: &Path,
+    cache: &std::cell::RefCell<fsx::terminal::HyperlinkCache>,
+) -> String {
     let abs = normalize_path_lexical(&to_full_path_with_cwd(path, cwd));
-    let mut encoded = String::with_capacity(abs.as_os_str().len());
-    for byte in abs.as_os_str().as_bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.' | b'~') {
-            encoded.push(*byte as char);
-        } else {
-            use std::fmt::Write as _;
-            let _ = write!(encoded, "%{:02X}", byte);
-        }
-    }
-    format!("\x1b]8;;file://{}\x1b\\{}\x1b]8;;\x1b\\", encoded, text)
-}
-
-fn write_path_list(cache_path: &Path, paths: &[PathBuf]) -> io::Result<()> {
-    let mut output = String::with_capacity(paths.len().saturating_mul(64));
-    for path in paths {
-        output.push_str(&path.to_string_lossy());
-        output.push('\n');
-    }
-    fs::write(cache_path, output)
-}
-
-fn cache_pid_suffix() -> u32 {
-    if let Some(value) = std::env::var_os("fish_pid") {
-        if let Some(text) = value.to_str() {
-            if let Ok(pid) = text.parse::<u32>() {
-                return pid;
-            }
-        }
-    }
-
-    if let Ok(stat) = fs::read_to_string("/proc/self/stat") {
-        if let Some((_, after_comm)) = stat.rsplit_once(") ") {
-            let mut fields = after_comm.split_whitespace();
-            let _state = fields.next();
-            if let Some(ppid_field) = fields.next() {
-                if let Ok(ppid) = ppid_field.parse::<u32>() {
-                    return ppid;
-                }
-            }
-        }
-    }
-
-    std::process::id()
+    cache.borrow_mut().direct_link(&abs, text)
 }
 
 pub(crate) fn write_cache_raw_paths(
     dir_paths: &[PathBuf],
     file_paths: &[PathBuf],
 ) -> io::Result<()> {
-    let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
-    let cache_dir = PathBuf::from("/tmp").join(format!("fzf-history-{}", user));
-    let pid = cache_pid_suffix();
-    fs::create_dir_all(&cache_dir)?;
-    write_path_list(
-        &cache_dir.join(format!("universal-last-dirs-{}", pid)),
-        dir_paths,
-    )?;
-    write_path_list(
-        &cache_dir.join(format!("universal-last-files-{}", pid)),
-        file_paths,
-    )
+    fsx::path_cache::write_raw_paths(dir_paths, file_paths)
 }
 
 pub(crate) fn get_symlink_target_display(
@@ -1223,16 +1206,11 @@ pub(crate) fn get_symlink_target_display(
         };
 
         if ctx.hyperlink {
-            let mut out = String::new();
-            if !styled_prefix.is_empty() {
-                let prefix_target = path
-                    .parent()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| PathBuf::from("/"));
-                out.push_str(&hyperlink_path(&prefix_target, &styled_prefix, &ctx.cwd));
-            }
-            out.push_str(&hyperlink_path(path, &styled_basename, &ctx.cwd));
-            return out;
+            return ctx.hyperlink_cache.borrow_mut().split_path_link(
+                path,
+                &styled_prefix,
+                &styled_basename,
+            );
         }
 
         if styled_prefix.is_empty() {
@@ -1339,18 +1317,7 @@ pub(crate) fn format_permissions(mode: u32, color_enabled: bool) -> String {
 }
 
 pub(crate) fn format_size(size: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-    if size >= GB {
-        format!("{:.1}G", size as f64 / GB as f64)
-    } else if size >= MB {
-        format!("{:.1}M", size as f64 / MB as f64)
-    } else if size >= KB {
-        format!("{:.1}K", size as f64 / KB as f64)
-    } else {
-        size.to_string()
-    }
+    fsx::format_size_compact(size)
 }
 
 #[cfg(test)]
@@ -1367,7 +1334,7 @@ mod tests {
 
     #[test]
     fn size_formatting_preserves_small_sizes_and_units() {
-        assert_eq!(format_size(0), "0");
+        assert_eq!(format_size(0), "0B");
         assert_eq!(format_size(4096), "4.0K");
         assert_eq!(format_size(1024 * 1024), "1.0M");
     }
@@ -1375,6 +1342,22 @@ mod tests {
     #[test]
     fn terminal_controls_are_escaped_before_rendering() {
         assert_eq!(escape_terminal_text("a\n\tb\x7f"), "a\\n\\tb\\x7f");
+    }
+
+    #[test]
+    fn basename_hyperlinks_target_the_entry_directly() {
+        let cache = std::cell::RefCell::new(fsx::terminal::HyperlinkCache::default());
+        let rendered = hyperlink_path(
+            Path::new("/tmp/fsx/folder"),
+            "folder/",
+            Path::new("/tmp"),
+            &cache,
+        );
+        assert_eq!(
+            rendered,
+            "\x1b]8;;file:///tmp/fsx/folder\x1b\\folder/\x1b]8;;\x1b\\"
+        );
+        assert!(!rendered.contains("?select="));
     }
 
     #[test]

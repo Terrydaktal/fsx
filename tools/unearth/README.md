@@ -5,12 +5,14 @@
 Build:
 
 ```bash
-cargo build --release
-cargo build --release --features watcher --bin unearthd
+cargo build --release -p unearth
+cargo build --release -p fsxd
+cargo build --release -p unearth --features watcher --bin unearthd
 ```
 
 The default release build produces the short-lived `unearth` client without watcher-only code.
-Build `unearthd` with the `watcher` feature when installing the live index service.
+Build `fsxd` with the `watcher` feature when installing the live index service.
+`unearthd` remains an equivalent compatibility binary.
 
 ## Source structure
 
@@ -25,18 +27,33 @@ Build `unearthd` with the `watcher` feature when installing the live index servi
 - `src/app/index/storage.rs`: SQLite, pooled-path storage, manifests, and sidecars.
 - `src/app/index/refresh.rs`: scans, fingerprints, diffs, refreshes, and purge operations.
 - `src/app/index/query.rs`: indexed/recent queries and result streaming.
-- `src/app/index/protocol.rs`: the private `unearthd` Unix-socket protocol.
+- `src/app/index/protocol.rs`: the private `fsxd` Unix-socket protocol.
 - `src/app/index/snapshot.rs`: the legacy per-query snapshot cache compatibility layer.
 - `src/app/watcher.rs`: the feature-gated fanotify/inotify event state machine and metrics.
 - `tests/live_watcher.sh`: temporary-tree integration and event-flood test for live updates.
 
-The default client does not compile the watcher subsystem. `unearthd` is built with the
-`watcher` feature and owns the shared live index.
+The default client does not compile the watcher subsystem. `fsxd` is built with the
+`watcher` feature and owns the shared fsx live index.
+
+Unearth consumes the sibling `fsx` crate for terminal escaping, file-URI encoding, compact size
+formatting, and canonical lexical directory keys. Unearth retains search policy, LS_COLORS
+precedence, SQLite schema, snapshot formats, and watcher state-machine behavior locally.
+
+Filesystem paths stored in SQLite use fsx's lossless UTF-8 representation: literal percent signs
+are escaped as `%25` and invalid Unix bytes are encoded as `%XX`. The representation preserves
+directory separators and round-trips to the original `PathBuf`, so non-UTF-8 names remain
+searchable and usable by the watcher. `--index-binary` decodes those keys and writes a
+length-prefixed record containing the original path bytes rather than the escaped database text.
+
+All path-bearing command-line operands, maintenance roots, watcher roots, and `--watch-metrics`
+outputs retain their `OsString` form through argument parsing. UTF-8 conversion is limited to
+flags, regex terms, SQL text, and human-readable diagnostics.
 
 ## Indexed fast-start snapshots
 
-Unearth owns the indexed database and its per-root fast-start snapshots under
-`$XDG_CACHE_HOME/unearth/index` or `~/.cache/unearth/index`. Each snapshot uses
+The shared fsx index and its per-root fast-start snapshots live under
+`$XDG_CACHE_HOME/fsx/index` or `~/.cache/fsx/index`. The main database is
+`fsx.db`; each snapshot uses
 a stable FNV-1a hash of its canonical root and has a `.snapshot` suffix; the
 canonical root is also embedded in the header and validated by consumers.
 
@@ -63,7 +80,7 @@ replace the base snapshot and manifest. Missing, stale, or malformed sidecars ar
 self-healed from the committed database. `--index-snapshot DIR` performs
 only the snapshot-build portion for an existing index, which is useful when
 upgrading. `--index-purge DIR` removes the associated snapshots. Consumers such
-as Friz may use the snapshot for startup and fall back to `unearth.db` when it is
+as Friz may use the snapshot for startup and fall back to `fsx.db` when it is
 absent, incompatible, or does not cover the requested filtering mode.
 
 ## Live index
@@ -72,12 +89,19 @@ The live index uses the same pooled SQLite database; it does not create a second
 Friz-specific cache. Start it in the foreground with one or more roots:
 
 ```bash
-unearthd /home /media
+fsxd /home /media
 ```
 
-`unearthd` is the dedicated long-running index owner. It stays in the foreground and should be
-run under a supervisor such as the user service in `systemd/unearthd.service`. The legacy
-`unearth --watch ...` form remains accepted for compatibility.
+`fsxd` is the dedicated long-running index owner. It stays in the foreground and should be
+run under a supervisor such as the user service in `systemd/fsxd.service`. The compatibility
+`unearthd` binary and legacy `unearth --watch ...` form remain accepted.
+
+The schema maintains direct allocated-size and file/directory counts per pooled
+directory with SQLite entry triggers. It also stores device/inode identity only
+for entries whose link count exceeds one. Shared fsx consumers can therefore
+aggregate directory rows instead of every entry and still reproduce live
+hardlink-deduplication semantics. Schema upgrades backfill direct statistics
+once; fsxd populates inode completeness during its next initial refresh.
 
 When a clean watcher covers the requested root, `--full` searches automatically query the daemon's
 Unix socket. If no daemon covers the root, Unearth falls back to its normal filesystem scan.
@@ -123,7 +147,7 @@ unearth --watch-status
 Collect one-second resource samples for a watcher with:
 
 ```bash
-unearthd --watch-metrics "$HOME/.cache/unearth/home-metrics.tsv" "$HOME"
+fsxd --watch-metrics "$HOME/.cache/fsx/home-metrics.tsv" "$HOME"
 ```
 
 The TSV contains current RSS and virtual memory, cumulative user/system CPU time, interval CPU
@@ -161,27 +185,30 @@ or sidecar rebuild can publish a matching snapshot atomically.
 Run from this repo:
 
 ```bash
-./target/release/unearth --help
-./target/release/unearthd --help
+../../target/release/unearth --help
+../../target/release/fsxd --help
+../../target/release/unearthd --help
 ```
 
 Install to your PATH:
 
 ```bash
-ln -sfn "$PWD/target/release/unearth" ~/.local/bin/unearth
-ln -sfn "$PWD/target/release/unearthd" ~/.local/bin/unearthd
+ln -sfn "$PWD/../../target/release/unearth" ~/.local/bin/unearth
+ln -sfn "$PWD/../../target/release/fsxd" ~/.local/bin/fsxd
+ln -sfn "$PWD/../../target/release/unearthd" ~/.local/bin/unearthd
 ```
 
 Install the optional user service to start the home watcher with the user session:
 
 ```bash
 mkdir -p ~/.config/systemd/user
+ln -sfn "$PWD/systemd/fsxd.service" ~/.config/systemd/user/fsxd.service
 ln -sfn "$PWD/systemd/unearthd.service" ~/.config/systemd/user/unearthd.service
 systemctl --user daemon-reload
-systemctl --user enable --now unearthd.service
+systemctl --user enable --now fsxd.service
 ```
 
-The service can be inspected with `systemctl --user status unearthd` and the indexed state can be
+The service can be inspected with `systemctl --user status fsxd` and the indexed state can be
 queried independently with `unearth --watch-status`.
 
 ```
@@ -300,8 +327,9 @@ Options:
   --regex, -r
       Treat filename/dirname and search_dir patterns as regular expressions.
   --long, -l
-      Show the date and time of last modification and size
-      (B, KiB, MiB, GiB, TiB) at the start of each line.
+      Show the activity date and size (B, KiB, MiB, GiB, TiB) at the start of
+      each line. Dates share Twig's ls-style layout and dim colour: recent
+      entries use D Mon HH:MM and older entries use D Mon  YYYY.
   --sizes
       Show compact sizes for matching files and recursively computed sizes
       for matching directories as: SIZE<TAB>PATH.
@@ -324,7 +352,7 @@ Options:
       path roots instead of search terms.
   -L, --long-true-dirsize
       Extended long output for directories:
-      YYYY-MM-DD HH:MM:SS REALDIRSIZE FILECOUNT PATH
+      DATE REALDIRSIZE FILECOUNT PATH
       Symlinked directories are not traversed (shown as link size, count 0).
   --sort FIELD ORDER
       Sort listed results by metadata. Supported:
@@ -370,14 +398,14 @@ Options:
       explicitly.
   --index
       Query the global pooled path database instead of walking the filesystem.
-      The database is stored at ~/.cache/unearth/index/unearth.db unless
+      The database is stored at ~/.cache/fsx/index/fsx.db unless
       XDG_CACHE_HOME is set. Current DB rows are returned immediately; if the
       root is missing or stale, one background refresh is started. Plain terms
       of three or more characters use trigram indexes over pooled names and
       directory paths. Existing databases build these indexes once on the first
       indexed query after upgrading, which increases that same database's size.
   --watch ROOT ...
-      Compatibility alias for the separate unearthd daemon. Perform an initial
+      Compatibility alias for the separate fsxd daemon. Perform an initial
       scan and continuously update the pooled database from fanotify filesystem
       or recursive inotify events.
   --watch-status

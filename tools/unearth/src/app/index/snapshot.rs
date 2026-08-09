@@ -1,9 +1,12 @@
 use super::*;
 use std::os::unix::fs::OpenOptionsExt;
-pub(crate) fn snapshot_args_key_parts() -> Vec<String> {
-    env::args()
+pub(crate) fn snapshot_args_key_parts() -> Vec<std::ffi::OsString> {
+    env::args_os()
         .skip(1)
-        .filter(|arg| arg != "--snapshot-cache" && arg != "--snapshot-refresh")
+        .filter(|arg| {
+            arg != std::ffi::OsStr::new("--snapshot-cache")
+                && arg != std::ffi::OsStr::new("--snapshot-refresh")
+        })
         .collect()
 }
 
@@ -137,7 +140,7 @@ pub(crate) fn spawn_snapshot_refresh() {
         return;
     }
     let mut args = snapshot_args_key_parts();
-    args.push("--snapshot-refresh".to_string());
+    args.push("--snapshot-refresh".into());
     if Command::new(exe)
         .args(args)
         .stdin(Stdio::null())

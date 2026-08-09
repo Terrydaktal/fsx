@@ -40,6 +40,7 @@ fn base_opts() -> Options {
         watch: false,
         watch_status: false,
         watch_metrics: None,
+        watch_metrics_os: None,
         absolute_paths: false,
         force_dir: false,
         force_file: false,
@@ -51,6 +52,11 @@ fn base_opts() -> Options {
         contains_all: false,
         path_override: None,
         positional: Vec::new(),
+        path_override_os: None,
+        positional_os: Vec::new(),
+        index_refresh_os: None,
+        index_snapshot_os: None,
+        index_purge_os: None,
     }
 }
 
@@ -80,6 +86,7 @@ fn ls_colors_suffix_rules_preserve_first_match_precedence() {
     );
     let result = |path: &str| SearchResult {
         path: path.to_string(),
+        path_encoded: false,
         is_dir: false,
         is_symlink: false,
         metadata: None,
@@ -149,10 +156,15 @@ fn sql_prefilter_skips_unrestricted_wildcards() {
 fn scanned_index_entries_are_deduplicated_before_refresh() {
     let entry = |path: &str, kind| ScannedIndexEntry {
         path: path.to_string(),
+        raw_path: PathBuf::from(path),
         kind,
         mtime: Some(1),
         size: Some(2),
+        allocated_size: Some(2),
         activity: Some(3),
+        device: None,
+        inode: None,
+        link_count: Some(1),
     };
     let mut entries = vec![
         entry("/root/repeated", 0),
@@ -198,14 +210,18 @@ fn index_batch_insert_is_idempotent_for_live_entries() {
                  kind INTEGER NOT NULL,
                  mtime INTEGER,
                  size INTEGER,
+                 allocated_size INTEGER,
                  activity INTEGER,
+                 device INTEGER,
+                 inode INTEGER,
+                 link_count INTEGER,
                  event_kind INTEGER,
                  actor_id INTEGER,
                  UNIQUE(dir_id, name_id, kind)
              );
              INSERT INTO entries(
-                 dir_id, name_id, kind, mtime, size, activity, event_kind, actor_id
-             ) VALUES (10, 20, 0, 1, 2, 3, 4, 99);",
+                 dir_id, name_id, kind, mtime, size, allocated_size, activity, event_kind, actor_id
+             ) VALUES (10, 20, 0, 1, 2, 22, 3, 4, 99);",
     )
     .unwrap();
     let tx = conn.transaction().unwrap();
@@ -218,7 +234,11 @@ fn index_batch_insert_is_idempotent_for_live_entries() {
             kind: 0,
             mtime: Some(11),
             size: Some(22),
+            allocated_size: Some(22),
             activity: Some(33),
+            device: None,
+            inode: None,
+            link_count: Some(1),
         }],
     )
     .unwrap();
@@ -267,6 +287,7 @@ fn indexed_directory_stats_aggregate_complete_subtrees() {
     opts.sizes = true;
     let items = vec![SearchResult {
         path: "/root/".to_string(),
+        path_encoded: false,
         is_dir: true,
         is_symlink: false,
         metadata: None,
@@ -302,6 +323,7 @@ fn indexed_directory_stats_skip_subtrees_with_missing_sizes() {
     opts.sizes = true;
     let items = vec![SearchResult {
         path: "/root/".to_string(),
+        path_encoded: false,
         is_dir: true,
         is_symlink: false,
         metadata: None,
@@ -354,13 +376,13 @@ fn root_index_excludes_volatile_system_trees() {
 }
 
 #[test]
-fn root_index_excludes_unearths_own_cache() {
+fn root_index_excludes_fsx_own_cache() {
     let cache = unearth_cache_dir().expect("test environment has a cache directory");
     let cache_key = normalize_index_dir(&cache);
     assert!(is_root_index_excluded_path("/", &cache_key));
     assert!(is_root_index_excluded_path(
         "/home",
-        &format!("{cache_key}/index/unearth.db-wal")
+        &format!("{cache_key}/index/fsx.db-wal")
     ));
     assert!(is_root_index_prune_child("/", &cache));
     assert!(!is_root_index_excluded_path(
@@ -389,24 +411,39 @@ fn index_diff_finds_additions_removals_and_kind_changes() {
     let scanned = vec![
         ScannedIndexEntry {
             path: "/root/added".to_string(),
+            raw_path: PathBuf::from("/root/added"),
             kind: 0,
             mtime: None,
             size: None,
+            allocated_size: None,
             activity: None,
+            device: None,
+            inode: None,
+            link_count: None,
         },
         ScannedIndexEntry {
             path: "/root/changed".to_string(),
+            raw_path: PathBuf::from("/root/changed"),
             kind: 1,
             mtime: None,
             size: None,
+            allocated_size: None,
             activity: None,
+            device: None,
+            inode: None,
+            link_count: None,
         },
         ScannedIndexEntry {
             path: "/root/kept".to_string(),
+            raw_path: PathBuf::from("/root/kept"),
             kind: 0,
             mtime: None,
             size: None,
+            allocated_size: None,
             activity: None,
+            device: None,
+            inode: None,
+            link_count: None,
         },
     ];
     let existing = vec![
@@ -417,7 +454,11 @@ fn index_diff_finds_additions_removals_and_kind_changes() {
             kind: 0,
             mtime: None,
             size: None,
+            allocated_size: None,
             activity: None,
+            device: None,
+            inode: None,
+            link_count: None,
         },
         ExistingIndexEntry {
             dir_id: 11,
@@ -426,7 +467,11 @@ fn index_diff_finds_additions_removals_and_kind_changes() {
             kind: 0,
             mtime: None,
             size: None,
+            allocated_size: None,
             activity: None,
+            device: None,
+            inode: None,
+            link_count: None,
         },
         ExistingIndexEntry {
             dir_id: 12,
@@ -435,7 +480,11 @@ fn index_diff_finds_additions_removals_and_kind_changes() {
             kind: 0,
             mtime: None,
             size: None,
+            allocated_size: None,
             activity: None,
+            device: None,
+            inode: None,
+            link_count: None,
         },
     ];
 
@@ -450,10 +499,15 @@ fn index_diff_finds_additions_removals_and_kind_changes() {
 fn index_diff_detects_same_count_rename() {
     let scanned = vec![ScannedIndexEntry {
         path: "/root/new-name".to_string(),
+        raw_path: PathBuf::from("/root/new-name"),
         kind: 0,
         mtime: None,
         size: None,
+        allocated_size: None,
         activity: None,
+        device: None,
+        inode: None,
+        link_count: None,
     }];
     let existing = vec![ExistingIndexEntry {
         dir_id: 42,
@@ -462,7 +516,11 @@ fn index_diff_detects_same_count_rename() {
         kind: 0,
         mtime: None,
         size: None,
+        allocated_size: None,
         activity: None,
+        device: None,
+        inode: None,
+        link_count: None,
     }];
 
     let (removed, added, updated) = diff_index_entries(&scanned, &existing);

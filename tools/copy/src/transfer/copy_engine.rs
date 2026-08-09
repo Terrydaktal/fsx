@@ -8,14 +8,107 @@ use crate::plan::{map_dir_dest_path, normalize_rel};
 use crate::runtime::copy_chunk_bytes_for_file;
 use filetime::{set_file_times, FileTime};
 use jwalk::WalkDir;
+use sha2::{Digest, Sha256};
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{symlink, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Once;
+use tempfile::TempPath;
+
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+static INSTALL_INTERRUPT_HANDLER: Once = Once::new();
+
+#[cfg(unix)]
+extern "C" fn handle_interrupt(_: nix::libc::c_int) {
+    INTERRUPTED.store(true, Ordering::Relaxed);
+}
+
+pub(crate) fn install_interrupt_handler() {
+    INSTALL_INTERRUPT_HANDLER.call_once(|| {
+        #[cfg(unix)]
+        unsafe {
+            let handler = handle_interrupt as nix::libc::sighandler_t;
+            let _ = nix::libc::signal(nix::libc::SIGINT, handler);
+            let _ = nix::libc::signal(nix::libc::SIGTERM, handler);
+        }
+    });
+}
+
+pub(crate) fn interrupted() -> bool {
+    INTERRUPTED.load(Ordering::Relaxed)
+}
+
+/// Compare the logical bytes of two regular files after a transfer.
+///
+/// This deliberately hashes both paths after publication rather than trusting
+/// the copy primitive: reflinks, copy_file_range, sparse writes, and resumed
+/// destinations all receive the same verification.
+pub(crate) fn verify_regular_file_pair(source: &Path, destination: &Path) -> io::Result<()> {
+    let source_meta = fs::metadata(source)?;
+    let destination_meta = fs::metadata(destination)?;
+    if !source_meta.is_file() || !destination_meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "verification requires regular files",
+        ));
+    }
+    if source_meta.len() != destination_meta.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "verification failed: size differs ({} != {})",
+                source_meta.len(),
+                destination_meta.len()
+            ),
+        ));
+    }
+
+    let mut source_file = open_source_noatime(source)?;
+    let mut destination_file = File::open(destination)?;
+    let mut source_hash = Sha256::new();
+    let mut destination_hash = Sha256::new();
+    // Keep verification buffers on the heap; Rust's test worker stacks are
+    // intentionally small and two 1 MiB arrays would overflow them.
+    let mut source_buf = vec![0u8; 1024 * 1024];
+    let mut destination_buf = vec![0u8; 1024 * 1024];
+    loop {
+        if interrupted() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "verification cancelled",
+            ));
+        }
+        let source_read = source_file.read(&mut source_buf)?;
+        let destination_read = destination_file.read(&mut destination_buf)?;
+        if source_read != destination_read {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "verification failed: files ended at different offsets",
+            ));
+        }
+        if source_read == 0 {
+            break;
+        }
+        source_hash.update(&source_buf[..source_read]);
+        destination_hash.update(&destination_buf[..destination_read]);
+    }
+    if source_hash.finalize() != destination_hash.finalize() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "verification failed: SHA-256 digest differs",
+        ));
+    }
+    Ok(())
+}
+
+fn cancellation() -> Option<&'static AtomicBool> {
+    Some(&INTERRUPTED)
+}
 
 pub(crate) fn open_source_noatime(path: &Path) -> io::Result<File> {
     match OpenOptions::new()
@@ -80,6 +173,121 @@ pub(crate) fn ensure_no_symlink_ancestors(path: &Path) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn open_directory_nofollow(path: &Path) -> io::Result<File> {
+    let mut current = File::open(if path.is_absolute() {
+        Path::new("/")
+    } else {
+        Path::new(".")
+    })?;
+    for component in path.components() {
+        let name = match component {
+            std::path::Component::Normal(name) => name,
+            std::path::Component::RootDir | std::path::Component::CurDir => continue,
+            std::path::Component::ParentDir => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "parent traversal is not allowed for transfer paths",
+                ));
+            }
+            std::path::Component::Prefix(_) => continue,
+        };
+        let name = CString::new(name.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid directory name"))?;
+        let fd = unsafe {
+            nix::libc::openat(
+                current.as_raw_fd(),
+                name.as_ptr(),
+                nix::libc::O_RDONLY
+                    | nix::libc::O_DIRECTORY
+                    | nix::libc::O_NOFOLLOW
+                    | nix::libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        current = unsafe { File::from_raw_fd(fd) };
+    }
+    Ok(current)
+}
+
+#[cfg(target_os = "linux")]
+fn open_destination_for_update(destination: &Path) -> io::Result<File> {
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    let follow_final_symlink = fs::symlink_metadata(destination)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false);
+    let parent_fd = open_directory_nofollow(parent)?;
+    let name = CString::new(
+        destination
+            .file_name()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "destination has no name"))?
+            .as_bytes(),
+    )
+    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid destination name"))?;
+    let mut flags =
+        nix::libc::O_WRONLY | nix::libc::O_CREAT | nix::libc::O_TRUNC | nix::libc::O_CLOEXEC;
+    if !follow_final_symlink {
+        flags |= nix::libc::O_NOFOLLOW;
+    }
+    let fd = unsafe { nix::libc::openat(parent_fd.as_raw_fd(), name.as_ptr(), flags, 0o600) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_destination_for_update(destination: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(destination)
+}
+
+#[cfg(target_os = "linux")]
+fn persist_temp_path(staged: TempPath, destination: &Path) -> io::Result<()> {
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    let temp_name = staged
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "staged file has no name"))?;
+    let destination_name = destination
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "destination has no name"))?;
+    let temp_bytes = CString::new(temp_name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid staged name"))?;
+    let destination_bytes = CString::new(destination_name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid destination name"))?;
+    let directory = open_directory_nofollow(parent)?;
+    let directory_fd = directory.as_raw_fd();
+    let result = unsafe {
+        nix::libc::renameat(
+            directory_fd,
+            temp_bytes.as_ptr(),
+            directory_fd,
+            destination_bytes.as_ptr(),
+        )
+    };
+    let error = if result == 0 {
+        None
+    } else {
+        Some(io::Error::last_os_error())
+    };
+    if let Some(error) = error {
+        return Err(error);
+    }
+    std::mem::forget(staged);
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn persist_temp_path(staged: TempPath, destination: &Path) -> io::Result<()> {
+    staged.persist(destination).map_err(|error| error.error)
 }
 
 pub(crate) fn apply_file_metadata_fd(file: &File, meta: &fs::Metadata) -> io::Result<()> {
@@ -317,7 +525,7 @@ where
         media,
         reusable_buf,
         false,
-        None,
+        cancellation(),
         on_bytes,
     )
 }
@@ -347,7 +555,7 @@ where
         media,
         &mut buf,
         true,
-        None,
+        cancellation(),
         on_bytes,
     )?;
 
@@ -357,7 +565,7 @@ where
     {
         fs::remove_dir_all(dst)?;
     }
-    staged.persist(dst).map_err(|err| err.error)?;
+    persist_temp_path(staged, dst)?;
     Ok(copied)
 }
 
@@ -388,12 +596,7 @@ where
         }
     }
     let mut in_file = open_source_noatime(src)?;
-    let mut out_file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(dst)?;
+    let mut out_file = open_destination_for_update(dst)?;
     advise_sequential(&in_file);
 
     let desired = copy_chunk_bytes_for_file(media, meta.len()).max(64 * 1024);
@@ -594,7 +797,7 @@ pub(crate) fn copy_symlink_atomic(src: &Path, dst: &Path) -> io::Result<()> {
     {
         fs::remove_dir_all(dst)?;
     }
-    staged.persist(dst).map_err(|err| err.error)?;
+    persist_temp_path(staged, dst)?;
     Ok(())
 }
 
@@ -615,7 +818,7 @@ pub(crate) fn copy_hardlink_atomic(existing: &Path, dst: &Path) -> io::Result<()
     {
         fs::remove_dir_all(dst)?;
     }
-    staged.persist(dst).map_err(|err| err.error)?;
+    persist_temp_path(staged, dst)?;
     Ok(())
 }
 
@@ -722,4 +925,28 @@ fn set_directory_times_checked(path: &Path, atime: FileTime, mtime: FileTime) ->
         ));
     }
     set_file_times(path, atime, mtime)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verification_detects_post_copy_corruption() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let source = root.path().join("source");
+        let destination = root.path().join("destination");
+        fs::write(&source, b"verified bytes").expect("write source");
+        copy_file_preserve_atomic_with_progress_buf(
+            &source,
+            &destination,
+            MediaKind::Other,
+            4096,
+            |_| {},
+        )
+        .expect("copy source");
+        verify_regular_file_pair(&source, &destination).expect("matching files verify");
+        fs::write(&destination, b"corrupt").expect("corrupt destination");
+        assert!(verify_regular_file_pair(&source, &destination).is_err());
+    }
 }

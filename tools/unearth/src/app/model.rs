@@ -1,7 +1,8 @@
+pub(crate) use fsx::colors::ColorSpec;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
-use std::io::BufWriter;
+use std::ffi::OsString;
+use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,6 +83,7 @@ pub(crate) struct Options {
     pub(crate) watch: bool,
     pub(crate) watch_status: bool,
     pub(crate) watch_metrics: Option<String>,
+    pub(crate) watch_metrics_os: Option<OsString>,
     pub(crate) absolute_paths: bool,
     pub(crate) force_dir: bool,
     pub(crate) force_file: bool,
@@ -93,10 +95,16 @@ pub(crate) struct Options {
     pub(crate) contains_all: bool,
     pub(crate) path_override: Option<String>,
     pub(crate) positional: Vec<String>,
+    pub(crate) path_override_os: Option<OsString>,
+    pub(crate) positional_os: Vec<OsString>,
+    pub(crate) index_refresh_os: Option<OsString>,
+    pub(crate) index_snapshot_os: Option<OsString>,
+    pub(crate) index_purge_os: Option<OsString>,
 }
 
 pub(crate) struct SearchResult {
     pub(crate) path: String,
+    pub(crate) path_encoded: bool,
     pub(crate) is_dir: bool,
     pub(crate) is_symlink: bool,
     pub(crate) metadata: Option<fs::Metadata>,
@@ -135,21 +143,9 @@ pub(crate) struct DirStatsCache {
 }
 
 pub(crate) struct RawCacheState {
-    pub(crate) dirs: BufWriter<File>,
-    pub(crate) files: BufWriter<File>,
+    pub(crate) cache: fsx::path_cache::RawPathCache,
     pub(crate) seen_dirs: HashSet<String>,
     pub(crate) seen_files: HashSet<String>,
-}
-
-#[derive(Clone)]
-pub(crate) struct ColorSpec {
-    pub(crate) by_key: HashMap<String, String>,
-    pub(crate) suffix_globs: HashMap<String, (usize, String)>,
-    pub(crate) globs: Vec<(usize, Regex, String)>,
-    pub(crate) color_prefix_dir: String,
-    pub(crate) color_dir: String,
-    pub(crate) color_link: String,
-    pub(crate) color_exec: String,
 }
 
 pub(crate) fn system_time_to_unix_nanos(value: SystemTime) -> Option<i64> {

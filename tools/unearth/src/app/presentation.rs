@@ -6,17 +6,25 @@ use super::model::{
     system_time_to_unix_nanos, ColorSpec, DirStats, DirStatsCache, HighlightSpec, Options,
     RawCacheState, SearchResult, SortField, SortOrder,
 };
-use chrono::{DateTime, Local};
+use chrono::{Datelike, Local};
 use rayon::prelude::*;
 use regex::{Regex, RegexBuilder};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::fs::{self, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::fs;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
+
+fn result_path(path: &str, encoded: bool) -> PathBuf {
+    if encoded {
+        fsx::decode_lossless_path(path)
+    } else {
+        PathBuf::from(path)
+    }
+}
 
 pub(crate) fn style_enabled(opts: &Options, stdout_is_tty: bool) -> bool {
     match opts.color_when {
@@ -27,22 +35,7 @@ pub(crate) fn style_enabled(opts: &Options, stdout_is_tty: bool) -> bool {
 }
 
 pub(crate) fn escape_terminal_text(text: &str) -> Cow<'_, str> {
-    if !text.bytes().any(|byte| byte < 0x20 || byte == 0x7f) {
-        return Cow::Borrowed(text);
-    }
-    let mut escaped = String::with_capacity(text.len());
-    for ch in text.chars() {
-        match ch {
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            '\t' => escaped.push_str("\\t"),
-            '\u{0}'..='\u{1f}' | '\u{7f}' => {
-                escaped.push_str(&format!("\\x{:02x}", ch as u32));
-            }
-            _ => escaped.push(ch),
-        }
-    }
-    Cow::Owned(escaped)
+    fsx::terminal::escape_terminal_text(text)
 }
 
 pub(crate) fn can_stream_direct(opts: &Options, use_style: bool) -> bool {
@@ -61,44 +54,11 @@ pub(crate) fn can_stream_direct(opts: &Options, use_style: bool) -> bool {
         && !opts.hyperlinks
 }
 pub(crate) fn format_size_iec(bytes: u64) -> String {
-    let units = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut unit = 0usize;
-    let mut size = bytes as f64;
-    while size >= 1024.0 && unit < units.len() - 1 {
-        size /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{} {}", bytes, units[unit])
-    } else if size >= 100.0 {
-        format!("{:.0} {}", size, units[unit])
-    } else if size >= 10.0 {
-        format!("{:.1} {}", size, units[unit])
-    } else {
-        format!("{:.2} {}", size, units[unit])
-    }
+    fsx::format_size_iec(bytes)
 }
 
 pub(crate) fn format_size_compact_3(bytes: u64) -> String {
-    let units = ["B", "K", "M", "G", "T"];
-    let mut unit = 0usize;
-    let mut size = bytes as f64;
-    while (size >= 1024.0 || (unit == 0 && size > 99_999.0)) && unit < units.len() - 1 {
-        size /= 1024.0;
-        unit += 1;
-    }
-    for decimals in (0usize..=3).rev() {
-        let factor = 10f64.powi(decimals as i32);
-        let truncated = (size * factor).floor() / factor;
-        let candidate = format!("{:.*}{}", decimals, truncated, units[unit]);
-        if candidate.len() <= 6 {
-            return candidate;
-        }
-    }
-    if unit < units.len() - 1 {
-        return format_size_compact_3(bytes / 1024);
-    }
-    "99999T".to_string()
+    fsx::format_size_compact_3(bytes)
 }
 
 pub(crate) fn should_use_recursive_dirsize(item: &SearchResult, opts: &Options) -> bool {
@@ -117,7 +77,7 @@ pub(crate) fn size_bytes_for_result(
         if should_skip_root_size_tree(&item.path) {
             return 0;
         }
-        return get_dirsize_bytes(&item.path, cache).unwrap_or(0);
+        return get_dirsize_bytes(&item.path, item.path_encoded, cache).unwrap_or(0);
     }
     item.metadata
         .as_ref()
@@ -135,11 +95,6 @@ pub(crate) fn result_activity_nanos(item: &SearchResult) -> Option<i64> {
     })
 }
 
-pub(crate) fn result_activity_time(item: &SearchResult) -> Option<std::time::SystemTime> {
-    let nanos = u64::try_from(result_activity_nanos(item)?).ok()?;
-    std::time::UNIX_EPOCH.checked_add(Duration::from_nanos(nanos))
-}
-
 pub(crate) fn precompute_dirsize_cache(
     items: &[SearchResult],
     opts: &Options,
@@ -151,34 +106,34 @@ pub(crate) fn precompute_dirsize_cache(
     if !need_recursive {
         return;
     }
-    let mut needed_dirs: Vec<String> = items
+    let mut needed_dirs: Vec<(String, bool)> = items
         .iter()
         .filter(|item| should_use_recursive_dirsize(item, opts))
-        .map(|item| normalize_dir_key(&item.path))
+        .map(|item| (normalize_dir_key(&item.path), item.path_encoded))
         .collect();
-    needed_dirs.sort();
-    needed_dirs.dedup();
+    needed_dirs.sort_by(|a, b| a.0.cmp(&b.0));
+    needed_dirs.dedup_by(|a, b| a.0 == b.0);
     if opts.long_extended {
-        for dir in needed_dirs {
+        for (dir, encoded) in needed_dirs {
             if should_skip_root_size_tree(&dir) {
                 continue;
             }
-            let _ = get_dirsize_stats(&dir, cache);
+            let _ = get_dirsize_stats(&dir, encoded, cache);
         }
     } else {
         let mut missing = Vec::new();
-        for dir in needed_dirs {
+        for (dir, encoded) in needed_dirs {
             if should_skip_root_size_tree(&dir) {
                 continue;
             }
             if !cache.bytes_map.contains_key(&dir) && !cache.map.contains_key(&dir) {
-                missing.push(dir);
+                missing.push((dir, encoded));
             }
         }
         let computed: Vec<(String, u64)> = missing
             .into_par_iter()
-            .map(|dir| {
-                let bytes = get_dir_bytes_native_serial(&dir);
+            .map(|(dir, encoded)| {
+                let bytes = get_dir_bytes_native_serial(&result_path(&dir, encoded));
                 (dir, bytes)
             })
             .collect();
@@ -271,86 +226,31 @@ pub(crate) fn absolute_paths_transform(
     items
 }
 
-pub(crate) fn parent_pid() -> Option<u32> {
-    let stat = fs::read_to_string("/proc/self/stat").ok()?;
-    let (_, tail) = stat.rsplit_once(") ")?;
-    let mut fields = tail.split_whitespace();
-    let _state = fields.next()?;
-    let ppid = fields.next()?.parse::<u32>().ok()?;
-    Some(ppid)
-}
-
-pub(crate) fn fish_pid() -> String {
-    if let Ok(v) = env::var("FISH_PID") {
-        if !v.is_empty() && v.chars().all(|c| c.is_ascii_digit()) {
-            return v;
-        }
-    }
-    if let Ok(v) = env::var("fish_pid") {
-        if !v.is_empty() && v.chars().all(|c| c.is_ascii_digit()) {
-            return v;
-        }
-    }
-    if let Some(ppid) = parent_pid() {
-        return ppid.to_string();
-    }
-    std::process::id().to_string()
-}
-
 pub(crate) fn init_raw_cache_state() -> Option<RawCacheState> {
-    let user = env::var("USER")
-        .unwrap_or_else(|_| "unknown".to_string())
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    let pid = fish_pid();
-    let cache_dir = env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .filter(|path| path.is_dir())
-        .map(|path| path.join("unearth"))
-        .unwrap_or_else(|| PathBuf::from(format!("/tmp/unearth-raw-{}", user)));
-    fs::create_dir_all(&cache_dir).ok()?;
-    let _ = fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700));
-    let dirs_file = cache_dir.join(format!("universal-last-dirs-{}", pid));
-    let files_file = cache_dir.join(format!("universal-last-files-{}", pid));
-    const O_NOFOLLOW: i32 = 0x20000;
-    let open = |path: &PathBuf| {
-        OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .custom_flags(O_NOFOLLOW)
-            .open(path)
-            .ok()
-    };
-    let dirs = BufWriter::new(open(&dirs_file)?);
-    let files = BufWriter::new(open(&files_file)?);
+    let cache = fsx::path_cache::RawPathCache::open().ok()?;
     Some(RawCacheState {
-        dirs,
-        files,
+        cache,
         seen_dirs: HashSet::new(),
         seen_files: HashSet::new(),
     })
 }
 
-pub(crate) fn cache_raw_record_path(path: &str, is_dir: bool, state: &mut RawCacheState) {
+pub(crate) fn cache_raw_record_path(
+    path: &str,
+    is_dir: bool,
+    encoded: bool,
+    state: &mut RawCacheState,
+) {
     if is_dir {
         let mut p = path.to_string();
         if !p.ends_with('/') {
             p.push('/');
         }
         if state.seen_dirs.insert(p.clone()) {
-            let _ = writeln!(state.dirs, "{}", p);
+            let _ = state.cache.write_dir(&result_path(&p, encoded));
         }
     } else if state.seen_files.insert(path.to_string()) {
-        let _ = writeln!(state.files, "{}", path);
+        let _ = state.cache.write_file(&result_path(path, encoded));
     }
     let mut parent = path.trim_end_matches('/').to_string();
     if let Some(idx) = parent.rfind('/') {
@@ -364,7 +264,7 @@ pub(crate) fn cache_raw_record_path(path: &str, is_dir: bool, state: &mut RawCac
         parent = "./".to_string();
     }
     if state.seen_dirs.insert(parent.clone()) {
-        let _ = writeln!(state.dirs, "{}", parent);
+        let _ = state.cache.write_dir(&result_path(&parent, encoded));
     }
 }
 
@@ -376,19 +276,22 @@ pub(crate) fn cache_transform(items: &Vec<SearchResult>, opts: &Options) {
         return;
     };
     for item in items {
-        cache_raw_record_path(&item.path, item.is_dir, &mut state);
+        cache_raw_record_path(&item.path, item.is_dir, item.path_encoded, &mut state);
     }
-    let _ = state.dirs.flush();
-    let _ = state.files.flush();
+    let _ = state.cache.flush();
 }
 
-pub(crate) fn get_dirsize_stats(path: &str, cache: &mut DirStatsCache) -> Option<DirStats> {
+pub(crate) fn get_dirsize_stats(
+    path: &str,
+    encoded: bool,
+    cache: &mut DirStatsCache,
+) -> Option<DirStats> {
     let key = normalize_dir_key(path);
-    let walk_path = if key == "/" { "/" } else { key.as_str() };
+    let walk_path = result_path(&key, encoded);
     if let Some(v) = cache.map.get(&key) {
         return Some(v.clone());
     }
-    let (bytes, files) = get_dir_stats_native(walk_path, true);
+    let (bytes, files) = get_dir_stats_native(&walk_path, true);
     let stats = DirStats {
         files,
         bytes,
@@ -399,9 +302,13 @@ pub(crate) fn get_dirsize_stats(path: &str, cache: &mut DirStatsCache) -> Option
     Some(stats)
 }
 
-pub(crate) fn get_dirsize_bytes(path: &str, cache: &mut DirStatsCache) -> Option<u64> {
+pub(crate) fn get_dirsize_bytes(
+    path: &str,
+    encoded: bool,
+    cache: &mut DirStatsCache,
+) -> Option<u64> {
     let key = normalize_dir_key(path);
-    let walk_path = if key == "/" { "/" } else { key.as_str() };
+    let walk_path = result_path(&key, encoded);
     if let Some(v) = cache.bytes_map.get(&key) {
         return Some(*v);
     }
@@ -409,7 +316,7 @@ pub(crate) fn get_dirsize_bytes(path: &str, cache: &mut DirStatsCache) -> Option
         cache.bytes_map.insert(key.clone(), v.bytes);
         return Some(v.bytes);
     }
-    let (bytes, _) = get_dir_stats_native(walk_path, false);
+    let (bytes, _) = get_dir_stats_native(&walk_path, false);
     cache.bytes_map.insert(key, bytes);
     Some(bytes)
 }
@@ -424,50 +331,57 @@ pub(crate) fn add_info_transform(
     }
     let mut rows = Vec::with_capacity(items.len());
     let mut max_size_width = 0usize;
+    let now = Local::now();
+    let now_year = now.year();
+    let now_timestamp = now.timestamp();
     for item in items {
-        if let Some(activity_time) = result_activity_time(&item) {
-            let dt: DateTime<Local> = activity_time.into();
-            let dt_str = dt.format("%Y-%m-%d %H:%M:%S").to_string();
-            let mut human_size = format_size_iec(
-                item.metadata
-                    .as_ref()
-                    .map(|metadata| metadata.len())
-                    .or(item.indexed_size)
-                    .unwrap_or(0),
-            );
-            let mut extra = String::new();
-            if context.opts.long_extended {
-                if item.is_symlink {
-                    let link_path = item.path.trim_end_matches('/');
-                    if fs::metadata(link_path).map(|m| m.is_dir()).unwrap_or(false) {
-                        extra = " 0".to_string();
-                    }
-                } else if item.is_dir {
-                    if let Some(stats) = get_dirsize_stats(&item.path, cache) {
-                        human_size = stats.human;
-                        extra = format!(" {}", stats.files);
-                    }
+        let dt_str = result_activity_nanos(&item)
+            .map(|activity_nanos| {
+                fsx::format_time_display(
+                    activity_nanos.div_euclid(1_000_000_000),
+                    now_year,
+                    now_timestamp,
+                )
+            })
+            .unwrap_or_else(|| "-".to_string());
+        let mut human_size = format_size_iec(
+            item.metadata
+                .as_ref()
+                .map(|metadata| metadata.len())
+                .or(item.indexed_size)
+                .unwrap_or(0),
+        );
+        let mut extra = String::new();
+        if context.opts.long_extended {
+            if item.is_symlink {
+                let link_path = item.path.trim_end_matches('/');
+                if fs::metadata(result_path(link_path, item.path_encoded))
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false)
+                {
+                    extra = " 0".to_string();
+                }
+            } else if item.is_dir {
+                if let Some(stats) = get_dirsize_stats(&item.path, item.path_encoded, cache) {
+                    human_size = stats.human;
+                    extra = format!(" {}", stats.files);
                 }
             }
-            let path_display = render_styled_path(&item, context);
-            max_size_width = max_size_width.max(human_size.len());
-            rows.push((Some((dt_str, human_size, extra)), path_display));
-        } else {
-            let path_display = render_styled_path(&item, context);
-            rows.push((None, path_display));
         }
+        let path_display = render_styled_path(&item, context);
+        max_size_width = max_size_width.max(human_size.len());
+        rows.push((Some((dt_str, human_size, extra)), path_display));
     }
     let mut out = Vec::with_capacity(rows.len());
     for (info, path_display) in rows {
         if let Some((dt_str, human_size, extra)) = info {
             let padded_size = format!("{:>width$}", human_size, width = max_size_width);
             let size_display = style_size(&padded_size, context.use_style);
+            let date_display = fsx::terminal::dim_text(&dt_str, context.use_style);
             out.push(format!(
                 "{} {}{} {}",
-                dt_str, size_display, extra, path_display
+                date_display, size_display, extra, path_display
             ));
-        } else {
-            out.push(path_display);
         }
     }
     out
@@ -533,6 +447,7 @@ pub(crate) fn counts_summary_transform(
     for (folder, n) in rows {
         let folder_item = SearchResult {
             path: folder,
+            path_encoded: false,
             is_dir: true,
             is_symlink: false,
             metadata: None,
@@ -547,130 +462,38 @@ pub(crate) fn counts_summary_transform(
 }
 
 pub(crate) fn parse_ls_colors() -> ColorSpec {
-    parse_ls_colors_value(&env::var("LS_COLORS").unwrap_or_default())
+    fsx::colors::parse_ls_colors_value(&env::var("LS_COLORS").unwrap_or_default())
 }
 
+#[cfg(test)]
 pub(crate) fn parse_ls_colors_value(spec: &str) -> ColorSpec {
-    let mut by_key = HashMap::new();
-    let mut suffix_globs = HashMap::new();
-    let mut globs = Vec::new();
-    let (mut color_dir, mut color_link, mut color_exec) = (
-        "01;34".to_string(),
-        "01;36".to_string(),
-        "01;32".to_string(),
-    );
-    for (order, entry) in spec.split(':').enumerate() {
-        if let Some((k, v)) = entry.split_once('=') {
-            if let Some(suffix) = k.strip_prefix('*') {
-                if !suffix.contains(['*', '?', '\\']) {
-                    suffix_globs
-                        .entry(suffix.to_string())
-                        .or_insert_with(|| (order, v.to_string()));
-                    continue;
-                }
-                let mut rx = String::from("^");
-                for ch in k.chars() {
-                    match ch {
-                        '*' => rx.push_str(".*"),
-                        '?' => rx.push('.'),
-                        '.' | '+' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|' | '\\' => {
-                            rx.push('\\');
-                            rx.push(ch);
-                        }
-                        _ => rx.push(ch),
-                    }
-                }
-                rx.push('$');
-                if let Ok(re) = Regex::new(&rx) {
-                    globs.push((order, re, v.to_string()));
-                }
-            } else {
-                by_key.insert(k.to_string(), v.to_string());
-                match k {
-                    "di" => color_dir = v.to_string(),
-                    "ln" => color_link = v.to_string(),
-                    "ex" => color_exec = v.to_string(),
-                    _ => {}
-                }
-            }
-        }
-    }
-    ColorSpec {
-        by_key,
-        suffix_globs,
-        globs,
-        color_prefix_dir: "38;2;255;255;255".to_string(),
-        color_dir,
-        color_link,
-        color_exec,
-    }
+    fsx::colors::parse_ls_colors_value(spec)
 }
 
 pub(crate) fn default_color_spec() -> ColorSpec {
-    ColorSpec {
-        by_key: HashMap::new(),
-        suffix_globs: HashMap::new(),
-        globs: Vec::new(),
-        color_prefix_dir: "38;2;255;255;255".to_string(),
-        color_dir: "01;34".to_string(),
-        color_link: "01;36".to_string(),
-        color_exec: "01;32".to_string(),
-    }
+    fsx::colors::default_color_spec()
 }
 
 pub(crate) fn color_code_for_path<'a>(
     res: &SearchResult,
     colors: &'a ColorSpec,
 ) -> Option<&'a str> {
-    let ln_code = colors
-        .by_key
-        .get("ln")
-        .map(String::as_str)
-        .unwrap_or(colors.color_link.as_str());
-    let symlink_target_mode = res.is_symlink && ln_code == "target";
-    if res.is_symlink && !symlink_target_mode {
-        return Some(ln_code);
-    }
-    if res.is_dir
-        || (symlink_target_mode && res.metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false))
-    {
-        return Some(
-            colors
-                .by_key
-                .get("di")
-                .map(String::as_str)
-                .unwrap_or(colors.color_dir.as_str()),
-        );
-    }
-    let base = res.path.rsplit('/').next().unwrap_or("");
-    let mut best: Option<(usize, &str)> = None;
-    let mut consider = |order: usize, code: &'a str| {
-        if best.is_none_or(|(best_order, _)| order < best_order) {
-            best = Some((order, code));
-        }
-    };
-    for (start, _) in base.char_indices() {
-        if let Some((order, code)) = colors.suffix_globs.get(&base[start..]) {
-            consider(*order, code.as_str());
-        }
-    }
-    if let Some((order, code)) = colors.suffix_globs.get("") {
-        consider(*order, code.as_str());
-    }
-    for (order, re, val) in &colors.globs {
-        if re.is_match(base) {
-            consider(*order, val.as_str());
-        }
-    }
-    if let Some((_, code)) = best {
-        return Some(code);
-    }
-    if let Some(m) = &res.metadata {
-        if m.permissions().mode() & 0o111 != 0 {
-            return Some(colors.color_exec.as_str());
-        }
-    }
-    None
+    let target_is_dir = res
+        .metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.is_dir());
+    let executable = res
+        .metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.permissions().mode() & 0o111 != 0);
+    fsx::colors::color_code_for_path(
+        &res.path,
+        res.is_dir,
+        res.is_symlink,
+        target_is_dir,
+        executable,
+        colors,
+    )
 }
 
 pub(crate) fn decorator_for_res(res: &SearchResult) -> Option<char> {
@@ -790,19 +613,11 @@ pub(crate) fn colorize_segment_with_highlights(
     out
 }
 
+#[cfg(test)]
 pub(crate) fn encode_file_uri_path(path: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut encoded = String::with_capacity(path.len());
-    for byte in path.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
-            encoded.push(byte as char);
-        } else {
-            encoded.push('%');
-            encoded.push(HEX[(byte >> 4) as usize] as char);
-            encoded.push(HEX[(byte & 0x0f) as usize] as char);
-        }
-    }
-    encoded
+    fsx::terminal::encode_file_uri_path(Path::new(path))
+        .and_then(|uri| uri.strip_prefix("file://").map(str::to_string))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -819,7 +634,7 @@ fn parent_file_uri_encoded(prefix: &str, encoded_leaf: &str) -> String {
 
 #[derive(Default)]
 pub(crate) struct RenderCache {
-    encoded_parent_paths: HashMap<String, String>,
+    pub(crate) hyperlinks: fsx::terminal::HyperlinkCache,
 }
 
 pub(crate) struct RenderContext<'a> {
@@ -863,7 +678,13 @@ pub(crate) fn render_styled_path(res: &SearchResult, context: &mut RenderContext
             (prefix.to_string(), leaf.to_string())
         };
         if context.opts.hyperlinks {
-            return hyperlink_path(&plain_prefix, &plain_leaf, &res.path, context.cache);
+            return hyperlink_path(
+                &plain_prefix,
+                &plain_leaf,
+                &res.path,
+                res.path_encoded,
+                context.cache,
+            );
         }
         return format!("{}{}", plain_prefix, plain_leaf);
     }
@@ -887,7 +708,13 @@ pub(crate) fn render_styled_path(res: &SearchResult, context: &mut RenderContext
         format!("\x1b[{}m{}\x1b[0m", context.colors.color_prefix_dir, prefix)
     };
     if context.opts.hyperlinks {
-        return hyperlink_path(&prefix_colored, &leaf_colored, &res.path, context.cache);
+        return hyperlink_path(
+            &prefix_colored,
+            &leaf_colored,
+            &res.path,
+            res.path_encoded,
+            context.cache,
+        );
     }
     if prefix.is_empty() {
         leaf_colored
@@ -896,46 +723,16 @@ pub(crate) fn render_styled_path(res: &SearchResult, context: &mut RenderContext
     }
 }
 
-fn hyperlink_path(prefix: &str, leaf: &str, path: &str, render_cache: &mut RenderCache) -> String {
-    let abs_leaf = if path.starts_with('/') {
-        Cow::Borrowed(path)
-    } else if let Ok(cwd) = env::current_dir() {
-        Cow::Owned(format!(
-            "{}/{}",
-            cwd.display(),
-            path.trim_start_matches("./")
-        ))
-    } else {
-        Cow::Borrowed(path)
-    };
-    let raw_leaf = abs_leaf.trim_end_matches('/');
-    let raw_parent = Path::new(raw_leaf)
-        .parent()
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "/".to_string());
-    let raw_prefix = if raw_parent == "/" {
-        "/".to_string()
-    } else {
-        format!("{}/", raw_parent.trim_end_matches('/'))
-    };
-    if prefix.is_empty() {
-        format!(
-            "\x1b]8;;file://{}\x1b\\{}\x1b]8;;\x1b\\",
-            encode_file_uri_path(&abs_leaf),
-            leaf,
-        )
-    } else {
-        let encoded_leaf = encode_file_uri_path(&abs_leaf);
-        let encoded_prefix = render_cache
-            .encoded_parent_paths
-            .entry(raw_prefix.clone())
-            .or_insert_with(|| encode_file_uri_path(&raw_prefix));
-        let prefix_target = format!("file://{}?select={}", encoded_prefix, encoded_leaf);
-        format!(
-            "\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\\x1b]8;;file://{}\x1b\\{}\x1b]8;;\x1b\\",
-            prefix_target, prefix, encoded_leaf, leaf
-        )
-    }
+fn hyperlink_path(
+    prefix: &str,
+    leaf: &str,
+    path: &str,
+    encoded: bool,
+    render_cache: &mut RenderCache,
+) -> String {
+    render_cache
+        .hyperlinks
+        .split_path_link(&result_path(path, encoded), prefix, leaf)
 }
 
 pub(crate) fn final_transform(

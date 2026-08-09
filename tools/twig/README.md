@@ -5,13 +5,13 @@
 ## Justification
 
 1. Eligible plain and long listings use dedicated `std::fs::read_dir` fast paths. When piping or when there are >1000 entries in the listing, `--color=auto` and `--hyperlink=auto` do not apply colour or hyperlinks.
-   - Benchmarking with hyperlinks and colours disabled on all `twig` is **2–3× faster** than `/bin/ls` (with `twig -la` same speed as `/bin/ls -la`) and **8–12× faster** than `eza` (with `twig -la` **1.5× faster** than `eza -la`).  
+   - Benchmarking with hyperlinks and colours disabled on all `twig` is **2–3× faster** than `/bin/ls` (with `twig -la` same speed as `/bin/ls -la`) and **8–12× faster** than `eza` (with `twig -la` **1.5× faster** than `eza -la`).
    - With hyperlinks and colour forced on both, `twig` is **4× faster** than `eza` with hyperlinks and colour (with `twig -la` **2.2× faster** than `eza -la`).
 2. On NTFS-like mounts, recursive stats (`-S`, `-c`, `--sort dircount|filecount`) attempt an MFT-based fast path first, then automatically fall back to regular filesystem scanning when unavailable.
 3. `--cache-raw` writes full directory/file path lists to `/tmp/fzf-history-$USER/universal-last-{dirs,files}-<fish_pid>`, allowing quick access to listed files with a fuzzy picker.
 4. `-c`, `--counts` – recursive directory/file count columns. Supports `--sort dircount` and `--sort filecount`.
 5. `eza` `--git-repos` and `--git` are combined into a smart `--git` flag that shows either or both columns when relevant
-6. In `-X` / `--absolute`, `twig` splits the prefix and basename into separate hyperlinks, with the prefix styled in white.
+6. Hyperlinks use the shared Unearth-compatible `file://` format. In `-X` / `--absolute`, `twig` splits the prefix and basename into separate links: the prefix selects the entry in its parent and the basename opens the entry. Basename-only listings link directly to the entry.
 7. `-x`, `--show-targets` – explicit flag to display symlink targets (usable outside long mode).
 8. Symlink targets are rendered/styled separately and can be hyperlinked independently. The hyperlink is also split; the prefix is coloured white and styled separately from the `LS_COLORS` scheme.
 9. Column order follows flag order from `argv`, including compact short bundles. `-l` is expanded into ordered `p,s,o,t` at parse time, so later flags append after it.
@@ -23,14 +23,15 @@
 15. Recursive totals include hidden descendants even when hidden entries are not displayed.
 16. `--git-fetch` fetches the current repository when inside one, plus immediate child repository roots.
 
+Long timestamps use the shared fsx `ls` layout: entries from the current year
+and within six months show `D Mon HH:MM`; older entries show `D Mon  YYYY`.
+The complete date field uses the shared dim terminal style.
+
 ## Project Structure
 
 ```text
 .
-├── .cargo/
-│   └── config.toml      # local cargo build flags (target-cpu=native)
-├── Cargo.toml          # crate metadata and dependencies
-├── Cargo.lock          # locked dependency graph
+├── Cargo.toml          # member crate metadata and dependencies
 ├── src/
 │   ├── main.rs         # process entry point and module wiring
 │   ├── app.rs          # listing orchestration, sorting, entry construction and cache coordination
@@ -39,7 +40,7 @@
 │   ├── git.rs          # Git status, repository markers, remote state and fetch operations
 │   ├── model.rs        # shared entry and filesystem data structures
 │   └── render.rs       # fast paths, detailed/grid output, styling and hyperlinks
-└── target/             # build artifacts (ignored in git)
+└── ../../target/       # workspace build artifacts (ignored in git)
 ```
 
 ### File Responsibilities
@@ -63,8 +64,9 @@
 - `src/render.rs`
   - Owns the large-directory fast paths, list/grid rendering, LS_COLORS,
     hyperlinks, symlink targets, permissions, sizes, and raw path caches.
-- `.cargo/config.toml`
-  - Enables `-C target-cpu=native` for local optimized builds
+- `../../.cargo/config.toml`
+  - Keeps workspace release artifacts portable; opt into local CPU tuning with
+    `RUSTFLAGS='-C target-cpu=native'` only for machine-specific benchmarks
 
 ## Build, Run, Install
 
@@ -77,13 +79,13 @@ cargo build --release
 Binary:
 
 ```text
-./target/release/twig
+../../target/release/twig
 ```
 
 ### Run
 
 ```bash
-./target/release/twig [OPTIONS] [PATH]
+../../target/release/twig [OPTIONS] [PATH]
 ```
 
 Default path is `.`.
@@ -132,6 +134,10 @@ For each invocation, `twig` runs roughly this pipeline:
    - recursive sizes for `-S`
    - recursive counts for `-c` and `--sort dircount|filecount`
    - root recursive total for injected `.` in `-a -S`
+   - when a clean fsxd index covers the root, fetch the root and all immediate
+     child aggregates in one query over maintained per-directory statistics
+   - preserve default hardlink deduplication from indexed `(device, inode)`
+     candidates; incomplete index metadata falls back to the live scanner
    - on NTFS-like mounts, attempts MFT scan first and falls back automatically
 3. Scan one directory level for displayed entries (`std::fs::read_dir`).
 4. Build per-entry metadata struct:
@@ -185,6 +191,10 @@ Environment controls:
 ### Hardlink Deduplication (`-S` mode)
 
 By default, `-S` deduplicates hardlinks by `(dev, ino)` while aggregating descendants.
+
+A clean fsxd index uses the same semantics: one identity is counted globally
+for the listed root and once independently within each immediate child. This
+keeps child totals stable when hardlinks cross between sibling directories.
 
 - Default: dedupe on
 - `-H` / `--no-dedupe-hardlinks`: dedupe off
@@ -290,37 +300,37 @@ Detailed row columns are assembled left-to-right as enabled:
 
 ```bash
 # Fast type-sorted top-level list
-./target/release/twig
+../../target/release/twig
 
 # Long view equivalent to -Lptos --show-targets
-./target/release/twig -l ~/Dev
+../../target/release/twig -l ~/Dev
 
 # Include hidden files and classify entries
-./target/release/twig -aF ~
+../../target/release/twig -aF ~
 
 # List-only mode without metadata columns
-./target/release/twig -L ~/Dev
+../../target/release/twig -L ~/Dev
 
 # Show symlink targets in compact mode
-./target/release/twig -x /home/lewis/.local/bin/twig
+../../target/release/twig -x /home/lewis/.local/bin/twig
 
 # True size with hardlink dedupe (default)
-./target/release/twig -S ~/Downloads
+../../target/release/twig -S ~/Downloads
 
 # True size without hardlink dedupe
-./target/release/twig -S -H ~/Downloads
+../../target/release/twig -S -H ~/Downloads
 
 # Git-aware long listing
-./target/release/twig -l --git .
+../../target/release/twig -l --git .
 
 # Show Git root status for child directories (same --git flag)
-./target/release/twig -l --git ~/src
+../../target/release/twig -l --git ~/src
 
 # Reverse by date
-./target/release/twig --sort time -r
+../../target/release/twig --sort time -r
 
 # Emit shell cache files for last shown dirs/files
-./target/release/twig --cache-raw ~/Dev
+../../target/release/twig --cache-raw ~/Dev
 ```
 
 ## Dependencies
@@ -332,8 +342,12 @@ Core crates:
 - `ntfs` for MFT-based NTFS recursive scanning
 - `lscolors` + `nu-ansi-term` for styling
 - `chrono` for timestamp formatting
-- `users` for uid/gid resolution
+- libc passwd/group lookups for uid/gid resolution without a Rust users dependency
 - `jemallocator` for allocator performance
+
+Twig also consumes the sibling `fsx` crate for allocated-size metadata, lexical path normalization,
+and raw fzf path-cache output. NTFS MFT traversal, Twig's one-level listing fast paths, sorting,
+and presentation policy remain local to Twig.
 
 ## Notes and Limits
 
@@ -341,7 +355,7 @@ Core crates:
 - Git status is computed via NUL-delimited `git status --porcelain=v1 -z` records.
 - Repo-root marker is shown only for directories that are Git toplevel roots.
 - Size units are decimal text with `K/M/G` suffixes, one decimal above bytes.
-- `--cache-raw` is disabled automatically when stdout is not a TTY.
+- `--cache-raw` is independent of terminal output mode and remains active when stdout is piped.
 - NTFS MFT fast path generally requires raw block-device access (often root privileges).
 
 ## Development

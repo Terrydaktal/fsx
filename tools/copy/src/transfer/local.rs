@@ -3,8 +3,8 @@
 
 use super::copy_engine::{
     copy_file_preserve_atomic_with_progress_buf, copy_file_preserve_with_progress_buf,
-    copy_hardlink_atomic, copy_symlink_atomic, ensure_directory_target,
-    preserve_directory_times_tree,
+    copy_hardlink_atomic, copy_symlink_atomic, ensure_directory_target, interrupted,
+    preserve_directory_times_tree, verify_regular_file_pair,
 };
 use super::telemetry::{counter_delta, device_io_deltas, proc_io_deltas};
 use crate::domain::{
@@ -61,7 +61,9 @@ pub(crate) fn run_rust_transfer(
     merge_collision_policy: MergeCollisionPolicy,
     sync_mode: bool,
     exclude_rel: Option<&str>,
+    verify: bool,
 ) -> TransferOutcome {
+    super::copy_engine::install_interrupt_handler();
     let done = Arc::new(AtomicU64::new(0));
     let transfer_errors = Arc::new(Mutex::new(None::<String>));
     let copy_buf_bytes = copy_chunk_bytes_for_media(media);
@@ -169,6 +171,7 @@ pub(crate) fn run_rust_transfer(
 
     macro_rules! finish_transfer {
         ($rc:expr) => {{
+            let transfer_rc = if interrupted() { 130 } else { $rc };
             let final_done = done.load(Ordering::Relaxed);
             let elapsed = transfer_start.elapsed().as_secs_f64().max(1e-6);
             let io_end_totals = io_window_for_avg.current_totals();
@@ -225,7 +228,7 @@ pub(crate) fn run_rust_transfer(
                 }
             }
             return TransferOutcome {
-                rc: $rc,
+                rc: transfer_rc,
                 bytes_done: final_done,
                 elapsed_s: elapsed,
                 progress_snapshot: Some(ProgressSnapshot {
@@ -342,6 +345,12 @@ pub(crate) fn run_rust_transfer(
                     finish_transfer!(1);
                 }
             }
+            if verify {
+                if let Err(err) = verify_regular_file_pair(src, dst) {
+                    remember_transfer_error(&transfer_errors, "verify file", src, &err);
+                    finish_transfer!(1);
+                }
+            }
             eta_progress.mark_file(src_meta.len());
             if let Some(workload) = eta_workload.as_ref() {
                 workload.mark_operation(0);
@@ -446,6 +455,19 @@ pub(crate) fn run_rust_transfer(
                             if let Some(anchor) = anchor {
                                 match copy_hardlink_atomic(&anchor, &dst_item) {
                                     Ok(()) => {
+                                        if verify {
+                                            if let Err(err) =
+                                                verify_regular_file_pair(&src_file, &dst_item)
+                                            {
+                                                remember_transfer_error(
+                                                    &transfer_errors,
+                                                    "verify hardlink",
+                                                    &src_file,
+                                                    &err,
+                                                );
+                                                return false;
+                                            }
+                                        }
                                         eta_progress.mark_file(0);
                                         if let Some(workload) = eta_workload.as_ref() {
                                             workload.mark_operation(
@@ -530,6 +552,18 @@ pub(crate) fn run_rust_transfer(
                                 .is_some()
                             };
                             if !needs_copy {
+                                if verify {
+                                    if let Err(err) = verify_regular_file_pair(&src_file, &dst_item)
+                                    {
+                                        remember_transfer_error(
+                                            &transfer_errors,
+                                            "verify file",
+                                            &src_file,
+                                            &err,
+                                        );
+                                        return false;
+                                    }
+                                }
                                 eta_progress.mark_file(src_md.len());
                                 if let Some(workload) = eta_workload.as_ref() {
                                     workload.mark_operation(
@@ -567,6 +601,19 @@ pub(crate) fn run_rust_transfer(
                             };
                             match result {
                                 Ok(()) => {
+                                    if verify {
+                                        if let Err(err) =
+                                            verify_regular_file_pair(&src_file, &dst_item)
+                                        {
+                                            remember_transfer_error(
+                                                &transfer_errors,
+                                                "verify file",
+                                                &src_file,
+                                                &err,
+                                            );
+                                            return false;
+                                        }
+                                    }
                                     if let Some(key) = hardlink_key {
                                         if let Ok(mut anchors) = hardlink_anchors.lock() {
                                             anchors.entry(key).or_insert_with(|| dst_item.clone());
@@ -715,6 +762,12 @@ pub(crate) fn run_rust_transfer(
                             )
                         };
                         if copy_result.is_err() {
+                            finish_transfer!(1);
+                        }
+                    }
+                    if verify {
+                        if let Err(err) = verify_regular_file_pair(&p, &dst_item) {
+                            remember_transfer_error(&transfer_errors, "verify file", &p, &err);
                             finish_transfer!(1);
                         }
                     }

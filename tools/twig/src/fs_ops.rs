@@ -19,7 +19,7 @@ pub(crate) struct MountInfo {
 }
 
 pub(crate) fn on_disk_size(metadata: &fs::Metadata) -> u64 {
-    metadata.blocks() * 512
+    fsx::metadata::allocated_size(metadata)
 }
 
 pub(crate) fn is_hidden_name(name: &OsStr) -> bool {
@@ -27,13 +27,7 @@ pub(crate) fn is_hidden_name(name: &OsStr) -> bool {
 }
 
 pub(crate) fn to_full_path(path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map(|cwd| cwd.join(path))
-            .unwrap_or_else(|_| path.to_path_buf())
-    }
+    fsx::path::full_path(path)
 }
 
 pub(crate) fn to_full_path_with_cwd(path: &Path, cwd: &Path) -> PathBuf {
@@ -45,84 +39,15 @@ pub(crate) fn to_full_path_with_cwd(path: &Path, cwd: &Path) -> PathBuf {
 }
 
 pub(crate) fn normalize_path_lexical(path: &Path) -> PathBuf {
-    let is_absolute = path.is_absolute();
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !out.pop() && !is_absolute {
-                    out.push("..");
-                }
-            }
-            Component::RootDir | Component::Prefix(_) | Component::Normal(_) => {
-                out.push(component.as_os_str())
-            }
-        }
-    }
-    out
-}
-
-fn unescape_proc_mount_field(field: &str) -> String {
-    let bytes = field.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 3 < bytes.len() {
-            let a = bytes[i + 1];
-            let b = bytes[i + 2];
-            let c = bytes[i + 3];
-            let octal = (b'0'..=b'7').contains(&a)
-                && (b'0'..=b'7').contains(&b)
-                && (b'0'..=b'7').contains(&c);
-            if octal {
-                let value = ((a - b'0') << 6) | ((b - b'0') << 3) | (c - b'0');
-                out.push(value);
-                i += 4;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
+    fsx::path::normalize_lexical(path)
 }
 
 fn detect_mount_info(path: &Path) -> Option<MountInfo> {
-    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let mounts = fs::read_to_string("/proc/mounts").ok()?;
-    let mut best: Option<(usize, MountInfo)> = None;
-
-    for line in mounts.lines() {
-        let mut parts = line.split_whitespace();
-        let (device_raw, mount_point_raw, fs_type) =
-            match (parts.next(), parts.next(), parts.next()) {
-                (Some(device), Some(mount), Some(fs_type)) => (device, mount, fs_type),
-                _ => continue,
-            };
-        let device = PathBuf::from(unescape_proc_mount_field(device_raw));
-        let mount_point = PathBuf::from(unescape_proc_mount_field(mount_point_raw));
-        if !canonical.starts_with(&mount_point) {
-            continue;
-        }
-        let mount_len = mount_point.as_os_str().as_bytes().len();
-        if best
-            .as_ref()
-            .map(|(best_len, _)| mount_len > *best_len)
-            .unwrap_or(true)
-        {
-            best = Some((
-                mount_len,
-                MountInfo {
-                    device,
-                    mount_point,
-                    fs_type: fs_type.to_string(),
-                },
-            ));
-        }
-    }
-
-    best.map(|(_, info)| info)
+    fsx::mount::mount_for_path(path).map(|mount| MountInfo {
+        device: mount.source,
+        mount_point: mount.mount_point,
+        fs_type: mount.filesystem,
+    })
 }
 
 fn detect_filesystem_type(path: &Path) -> Option<String> {
@@ -135,62 +60,8 @@ fn is_ntfs_like_filesystem(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn ntfs_best_filename(
-    entry: &ntfs::NtfsIndexEntry<'_, ntfs::indexes::NtfsFileNameIndex>,
-) -> Option<String> {
-    let file_name = entry.key()?.ok()?;
-    match file_name.namespace() {
-        ntfs::structured_values::NtfsFileNamespace::Dos => None,
-        _ => Some(file_name.name().to_string_lossy().to_string()),
-    }
-}
-
-fn ntfs_is_reparse_point(file: &ntfs::NtfsFile, device: &mut fs::File) -> bool {
-    let mut attrs = file.attributes();
-    while let Some(attr_result) = attrs.next(device) {
-        if let Ok(attr_item) = attr_result {
-            if let Ok(attr) = attr_item.to_attribute() {
-                if let Ok(attr_ty) = attr.ty() {
-                    if attr_ty == ntfs::NtfsAttributeType::ReparsePoint {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    false
-}
-
 fn ntfs_file_allocated_size(file: &ntfs::NtfsFile, device: &mut fs::File, block_size: u64) -> u64 {
-    if let Some(data_attr) = file.data(device, "") {
-        if let Ok(data_item) = data_attr {
-            if let Ok(data_attr_obj) = data_item.to_attribute() {
-                if data_attr_obj.is_resident() {
-                    return round_up_to_block(data_attr_obj.value_length(), block_size);
-                }
-                if let Ok(value) = data_attr_obj.value(device) {
-                    return match value {
-                        ntfs::attribute_value::NtfsAttributeValue::NonResident(value) => value
-                            .data_runs()
-                            .flatten()
-                            .filter(|run| run.data_position().value().is_some())
-                            .map(|run| run.allocated_size())
-                            .sum(),
-                        // The crate does not expose the individual runs of an
-                        // attribute-list value; its logical length is the safe
-                        // fallback instead of reporting zero allocation.
-                        ntfs::attribute_value::NtfsAttributeValue::AttributeListNonResident(
-                            value,
-                        ) => round_up_to_block(value.len(), block_size),
-                        ntfs::attribute_value::NtfsAttributeValue::Resident(value) => {
-                            round_up_to_block(value.len(), block_size)
-                        }
-                    };
-                }
-            }
-        }
-    }
-    0
+    fsx::ntfs::data_allocated_size(file, device, block_size)
 }
 
 fn fs_block_size(path: &Path) -> u64 {
@@ -207,6 +78,7 @@ fn fs_block_size(path: &Path) -> u64 {
     }
 }
 
+#[cfg(test)]
 fn round_up_to_block(size: u64, block_size: u64) -> u64 {
     if size == 0 {
         return 0;
@@ -243,7 +115,7 @@ fn ntfs_find_subdir_record(
                 Ok(e) => e,
                 Err(_) => continue,
             };
-            let entry_name = match ntfs_best_filename(&entry) {
+            let entry_name = match fsx::ntfs::best_filename(&entry) {
                 Some(n) => n,
                 None => continue,
             };
@@ -289,8 +161,8 @@ fn ntfs_scan_subtree_record(
             Err(_) => continue,
         };
         if need_sizes {
-            local_size += block_size;
-            global_size += block_size;
+            local_size = local_size.saturating_add(block_size);
+            global_size = global_size.saturating_add(block_size);
         }
         let index = match dir_file.directory_index(device) {
             Ok(i) => i,
@@ -302,7 +174,7 @@ fn ntfs_scan_subtree_record(
                 Ok(e) => e,
                 Err(_) => continue,
             };
-            let name = match ntfs_best_filename(&entry) {
+            let name = match fsx::ntfs::best_filename(&entry) {
                 Some(n) => n,
                 None => continue,
             };
@@ -318,16 +190,16 @@ fn ntfs_scan_subtree_record(
                 Err(_) => continue,
             };
             let child_is_dir = child_file.is_directory();
-            let child_is_reparse = ntfs_is_reparse_point(&child_file, device);
+            let child_is_reparse = fsx::ntfs::is_reparse_point(&child_file, device);
 
             if child_is_dir && !child_is_reparse {
                 if need_counts {
-                    total_dirs += 1;
+                    total_dirs = total_dirs.saturating_add(1);
                 }
                 stack.push(child_record);
             } else {
                 if need_counts {
-                    total_files += 1;
+                    total_files = total_files.saturating_add(1);
                 }
                 if need_sizes {
                     let include_local_size = local_seen
@@ -342,10 +214,10 @@ fn ntfs_scan_subtree_record(
                     }
                     let size = ntfs_file_allocated_size(&child_file, device, block_size);
                     if include_local_size {
-                        local_size += size;
+                        local_size = local_size.saturating_add(size);
                     }
                     if include_global_size {
-                        global_size += size;
+                        global_size = global_size.saturating_add(size);
                     }
                 }
             }
@@ -425,7 +297,7 @@ fn collect_recursive_stats_ntfs_mft(
             Ok(e) => e,
             Err(_) => continue,
         };
-        let name = match ntfs_best_filename(&entry) {
+        let name = match fsx::ntfs::best_filename(&entry) {
             Some(n) => n,
             None => continue,
         };
@@ -441,11 +313,11 @@ fn collect_recursive_stats_ntfs_mft(
             Err(_) => continue,
         };
         let child_is_dir = child_file.is_directory();
-        let child_is_reparse = ntfs_is_reparse_point(&child_file, &mut device);
+        let child_is_reparse = fsx::ntfs::is_reparse_point(&child_file, &mut device);
 
         if child_is_dir && !child_is_reparse {
             if need_counts {
-                root_dirs_count += 1;
+                root_dirs_count = root_dirs_count.saturating_add(1);
             }
             top_level_dirs.push((OsString::from(name), child_record));
         } else if need_sizes {
@@ -456,14 +328,17 @@ fn collect_recursive_stats_ntfs_mft(
                 }
             }
             if include_size {
-                root_recursive_size +=
-                    ntfs_file_allocated_size(&child_file, &mut device, block_size);
+                root_recursive_size = root_recursive_size.saturating_add(ntfs_file_allocated_size(
+                    &child_file,
+                    &mut device,
+                    block_size,
+                ));
             }
             if need_counts {
-                root_files_count += 1;
+                root_files_count = root_files_count.saturating_add(1);
             }
         } else if need_counts {
-            root_files_count += 1;
+            root_files_count = root_files_count.saturating_add(1);
         }
     }
 
@@ -528,11 +403,11 @@ fn collect_recursive_stats_ntfs_mft(
     for (name, local_size, global_size, dirs_count, file_count) in dir_results {
         if need_sizes {
             recursive_sizes.insert(name.clone(), local_size);
-            root_recursive_size += global_size;
+            root_recursive_size = root_recursive_size.saturating_add(global_size);
         }
         if need_counts {
-            root_dirs_count += dirs_count;
-            root_files_count += file_count;
+            root_dirs_count = root_dirs_count.saturating_add(dirs_count);
+            root_files_count = root_files_count.saturating_add(file_count);
             recursive_counts.insert(name, (dirs_count.saturating_add(1), file_count));
         }
     }
@@ -579,6 +454,28 @@ struct WalkAggregate {
     root_files: u64,
 }
 
+fn report_recursive_stats_overflow(
+    stats: &(
+        HashMap<OsString, u64>,
+        HashMap<OsString, (u64, u64)>,
+        Option<u64>,
+        Option<(u64, u64)>,
+    ),
+) {
+    let (sizes, counts, root_size, root_counts) = stats;
+    let saturated = root_size == &Some(u64::MAX)
+        || root_counts.is_some_and(|(dirs, files)| dirs == u64::MAX || files == u64::MAX)
+        || sizes.values().any(|value| *value == u64::MAX)
+        || counts
+            .values()
+            .any(|(dirs, files)| *dirs == u64::MAX || *files == u64::MAX);
+    if saturated {
+        eprintln!(
+            "twig: warning: one or more filesystem aggregates overflowed u64 and were saturated"
+        );
+    }
+}
+
 fn scan_subtree_stats_low_overhead(
     top_dir: &Path,
     show_hidden: bool,
@@ -595,8 +492,8 @@ fn scan_subtree_stats_low_overhead(
     if need_sizes {
         if let Ok(meta) = fs::symlink_metadata(top_dir) {
             let size = on_disk_size(&meta);
-            local_size += size;
-            global_size += size;
+            local_size = local_size.saturating_add(size);
+            global_size = global_size.saturating_add(size);
         }
     }
 
@@ -624,9 +521,9 @@ fn scan_subtree_stats_low_overhead(
 
             if need_counts {
                 if is_dir {
-                    total_dirs += 1;
+                    total_dirs = total_dirs.saturating_add(1);
                 } else {
-                    total_files += 1;
+                    total_files = total_files.saturating_add(1);
                 }
             }
 
@@ -649,10 +546,10 @@ fn scan_subtree_stats_low_overhead(
                     true
                 };
                 if include_local_size {
-                    local_size += size;
+                    local_size = local_size.saturating_add(size);
                 }
                 if include_global_size {
-                    global_size += size;
+                    global_size = global_size.saturating_add(size);
                 }
             }
 
@@ -767,14 +664,15 @@ fn collect_recursive_stats_ntfs(
             };
             if metadata.file_type().is_dir() {
                 if need_counts {
-                    root_dirs_count += 1;
+                    root_dirs_count = root_dirs_count.saturating_add(1);
                 }
                 top_level_dirs.push((name, child_path));
             } else {
                 if need_counts {
-                    root_files_count += 1;
+                    root_files_count = root_files_count.saturating_add(1);
                 }
-                root_recursive_size += size_with_hardlink_dedupe(&metadata, shared_seen.as_ref());
+                root_recursive_size = root_recursive_size
+                    .saturating_add(size_with_hardlink_dedupe(&metadata, shared_seen.as_ref()));
             }
             continue;
         }
@@ -784,11 +682,11 @@ fn collect_recursive_stats_ntfs(
         };
         if file_type.is_dir() {
             if need_counts {
-                root_dirs_count += 1;
+                root_dirs_count = root_dirs_count.saturating_add(1);
             }
             top_level_dirs.push((name, child_path));
         } else if need_counts {
-            root_files_count += 1;
+            root_files_count = root_files_count.saturating_add(1);
         }
     }
 
@@ -834,11 +732,11 @@ fn collect_recursive_stats_ntfs(
     for (name, local_size, global_size, dirs, files) in dir_results {
         if need_sizes {
             recursive_sizes.insert(name.clone(), local_size);
-            root_recursive_size += global_size;
+            root_recursive_size = root_recursive_size.saturating_add(global_size);
         }
         if need_counts {
-            root_dirs_count += dirs;
-            root_files_count += files;
+            root_dirs_count = root_dirs_count.saturating_add(dirs);
+            root_files_count = root_files_count.saturating_add(files);
             recursive_counts.insert(name, (dirs.saturating_add(1), files));
         }
     }
@@ -876,14 +774,28 @@ pub(crate) fn collect_recursive_stats(
     }
 
     let canonical_base = fs::canonicalize(base_path).unwrap_or_else(|_| base_path.to_path_buf());
+    if show_hidden
+        && !is_ntfs_like_filesystem(&canonical_base)
+        && let Some(indexed) = collect_recursive_stats_from_index(
+            &canonical_base,
+            dedupe_hardlinks,
+            need_sizes,
+            need_counts,
+        )
+    {
+        report_recursive_stats_overflow(&indexed);
+        return indexed;
+    }
     if is_ntfs_like_filesystem(&canonical_base) {
-        return collect_recursive_stats_ntfs(
+        let stats = collect_recursive_stats_ntfs(
             &canonical_base,
             show_hidden,
             dedupe_hardlinks,
             need_sizes,
             need_counts,
         );
+        report_recursive_stats_overflow(&stats);
+        return stats;
     }
     let scan_root = canonical_base.clone();
     // Aggregate callback results under one lock instead of taking separate
@@ -945,9 +857,9 @@ pub(crate) fn collect_recursive_stats(
                     let ft = child.file_type();
                     if need_counts {
                         if ft.is_dir() {
-                            callback_dirs += 1;
+                            callback_dirs = callback_dirs.saturating_add(1);
                         } else {
-                            callback_files += 1;
+                            callback_files = callback_files.saturating_add(1);
                         }
                     }
                     if !need_sizes {
@@ -956,12 +868,12 @@ pub(crate) fn collect_recursive_stats(
                     if let Ok(metadata) = child.metadata() {
                         let size = on_disk_size(&metadata);
                         if ft.is_dir() {
-                            callback_size += size;
+                            callback_size = callback_size.saturating_add(size);
                             let key = child.file_name().to_os_string();
                             let stats = local_updates.entry(key).or_insert((0, 0, 0));
-                            stats.0 += size;
+                            stats.0 = stats.0.saturating_add(size);
                         } else if shared_seen.is_none() || metadata.nlink() <= 1 {
-                            callback_size += size;
+                            callback_size = callback_size.saturating_add(size);
                         } else {
                             hardlink_candidates.push((metadata.dev(), metadata.ino(), size));
                         }
@@ -972,7 +884,7 @@ pub(crate) fn collect_recursive_stats(
                         if let Ok(mut set) = seen.lock() {
                             for (dev, ino, size) in hardlink_candidates {
                                 if set.insert((dev, ino)) {
-                                    callback_size += size;
+                                    callback_size = callback_size.saturating_add(size);
                                 }
                             }
                         }
@@ -995,17 +907,17 @@ pub(crate) fn collect_recursive_stats(
                     let ft = child.file_type();
                     if need_counts {
                         if ft.is_dir() {
-                            local_dirs += 1;
+                            local_dirs = local_dirs.saturating_add(1);
                         } else {
-                            local_files += 1;
+                            local_files = local_files.saturating_add(1);
                         }
                     }
                     if need_sizes {
                         if let Ok(metadata) = child.metadata() {
                             if shared_seen.is_none() || metadata.is_dir() || metadata.nlink() <= 1 {
                                 let size = on_disk_size(&metadata);
-                                local_size += size;
-                                global_size += size;
+                                local_size = local_size.saturating_add(size);
+                                global_size = global_size.saturating_add(size);
                             } else {
                                 hardlink_candidates.push((
                                     metadata.dev(),
@@ -1025,7 +937,7 @@ pub(crate) fn collect_recursive_stats(
                                 .or_insert_with(HashSet::new);
                             for &(dev, ino, size) in &hardlink_candidates {
                                 if bucket.insert((dev, ino)) {
-                                    local_size += size;
+                                    local_size = local_size.saturating_add(size);
                                 }
                             }
                         }
@@ -1037,7 +949,7 @@ pub(crate) fn collect_recursive_stats(
                         if let Ok(mut set) = seen.lock() {
                             for &(dev, ino, size) in &hardlink_candidates {
                                 if set.insert((dev, ino)) {
-                                    global_size += size;
+                                    global_size = global_size.saturating_add(size);
                                 }
                             }
                         }
@@ -1052,17 +964,17 @@ pub(crate) fn collect_recursive_stats(
 
             if let Ok(mut aggregate) = shared_aggregate.lock() {
                 if need_sizes {
-                    aggregate.root_size += callback_size;
+                    aggregate.root_size = aggregate.root_size.saturating_add(callback_size);
                 }
                 for (key, value) in local_updates {
                     let entry = aggregate.top_level.entry(key).or_insert((0, 0, 0));
-                    entry.0 += value.0;
-                    entry.1 += value.1;
-                    entry.2 += value.2;
+                    entry.0 = entry.0.saturating_add(value.0);
+                    entry.1 = entry.1.saturating_add(value.1);
+                    entry.2 = entry.2.saturating_add(value.2);
                 }
                 if need_counts {
-                    aggregate.root_dirs += callback_dirs;
-                    aggregate.root_files += callback_files;
+                    aggregate.root_dirs = aggregate.root_dirs.saturating_add(callback_dirs);
+                    aggregate.root_files = aggregate.root_files.saturating_add(callback_files);
                 }
             }
         })
@@ -1115,12 +1027,49 @@ pub(crate) fn collect_recursive_stats(
         None
     };
 
-    (
+    let stats = (
         recursive_sizes,
         recursive_counts,
         root_recursive_size,
         root_recursive_counts,
-    )
+    );
+    report_recursive_stats_overflow(&stats);
+    stats
+}
+
+fn collect_recursive_stats_from_index(
+    base_path: &Path,
+    dedupe_hardlinks: bool,
+    need_sizes: bool,
+    need_counts: bool,
+) -> Option<(
+    HashMap<OsString, u64>,
+    HashMap<OsString, (u64, u64)>,
+    Option<u64>,
+    Option<(u64, u64)>,
+)> {
+    let batch = if need_sizes {
+        fsx::index::query_recursive_stats_batch(base_path, dedupe_hardlinks)?
+    } else {
+        fsx::index::query_recursive_counts_batch(base_path, false)?
+    };
+    let root = batch.root;
+    let mut sizes = HashMap::new();
+    let mut counts = HashMap::new();
+    for (name, child_stats) in batch.children {
+        if need_sizes {
+            sizes.insert(name.clone(), child_stats.allocated_size);
+        }
+        if need_counts {
+            counts.insert(name, (child_stats.dirs, child_stats.files));
+        }
+    }
+    Some((
+        sizes,
+        counts,
+        need_sizes.then_some(root.allocated_size),
+        need_counts.then_some((root.dirs, root.files)),
+    ))
 }
 
 pub(crate) fn recursive_dir_on_disk_size(
@@ -1170,9 +1119,12 @@ pub(crate) fn recursive_dir_on_disk_size(
             }
         }
 
-        total += on_disk_size(&metadata);
+        total = total.saturating_add(on_disk_size(&metadata));
     }
 
+    if total == u64::MAX {
+        eprintln!("twig: warning: filesystem size overflowed u64 and was saturated");
+    }
     total
 }
 

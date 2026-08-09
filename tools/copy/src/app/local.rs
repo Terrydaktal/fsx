@@ -13,17 +13,17 @@ use crate::output::{
     render_showall_tree_to_string_with_cache, ENDC, FAIL,
 };
 use crate::plan::{
-    can_fast_rename_same_fs, count_tree_any, create_destination_parents,
+    can_fast_rename_same_fs, count_tree_any, create_destination_parents_path,
     destination_available_bytes, normalize_rel, pre_scan_directory, pre_scan_file,
-    realpath_allow_missing, resolve_destination_for_dir, resolve_destination_for_file,
-    resolve_source, top_level_rel_component,
+    realpath_allow_missing, resolve_destination_for_dir_path, resolve_destination_for_file_path,
+    resolve_source_path, top_level_rel_component,
 };
 use crate::runtime::{configure_rayon_threads_for_media, dev_media_kind, transfer_media_kind};
 use crate::transfer::{
     backup_base_path, backup_path_with_base, copy_path_to_backup, flush_destination_writes,
     plan_backup_path, prefer_hdd_scheduler_for_paths, premerge_fast_rename_noncolliding_children,
     remove_path_recursive, run_command_capture, run_move_cleanup_phase, run_rsync_transfer,
-    run_rust_transfer, run_sync_cleanup_phase,
+    run_rust_transfer, run_sync_cleanup_phase, TransferJournal,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -34,9 +34,10 @@ use tempfile::TempDir;
 
 pub(crate) struct LocalTransferRequest<'a> {
     pub(crate) args: &'a CliArgs,
-    pub(crate) source_input: &'a str,
-    pub(crate) source: &'a str,
-    pub(crate) destination: &'a str,
+    pub(crate) source: &'a Path,
+    pub(crate) destination: &'a Path,
+    pub(crate) source_input_display: &'a str,
+    pub(crate) destination_display: &'a str,
     pub(crate) requested_mode: TransferMode,
     pub(crate) preview_only: bool,
     pub(crate) contents_mode_requested: bool,
@@ -44,12 +45,62 @@ pub(crate) struct LocalTransferRequest<'a> {
     pub(crate) source_glob_contents: bool,
 }
 
+fn move_path_for_replace(source: &Path, destination: &Path, use_sudo: bool) -> bool {
+    if use_sudo {
+        let command = vec![
+            "mv".to_string(),
+            "--".to_string(),
+            source.display().to_string(),
+            destination.display().to_string(),
+        ];
+        run_command_capture(&command, true)
+            .map(|output| output.code == 0)
+            .unwrap_or(false)
+    } else {
+        fs::rename(source, destination).is_ok()
+    }
+}
+
 pub(crate) fn run_local_transfer(request: LocalTransferRequest<'_>) -> i32 {
+    if request.preview_only {
+        return run_local_transfer_inner(request);
+    }
+
+    let mut journal =
+        match TransferJournal::begin(request.source, request.destination, request.requested_mode) {
+            Ok(mut journal) => {
+                if let Err(error) = journal.mark("transferring") {
+                    eprintln!("copy: cannot persist operation journal: {error}");
+                    return 1;
+                }
+                journal
+            }
+            Err(error) => {
+                eprintln!("copy: cannot create operation journal: {error}");
+                return 1;
+            }
+        };
+    let result = run_local_transfer_inner(request);
+    if result == 0 {
+        if let Err(error) = journal.mark("published") {
+            eprintln!("copy: transfer published but operation journal update failed: {error}");
+            return 1;
+        }
+        if let Err(error) = journal.complete() {
+            eprintln!("copy: transfer succeeded but operation journal cleanup failed: {error}");
+            return 1;
+        }
+    }
+    result
+}
+
+fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
     let LocalTransferRequest {
         args,
-        source_input,
         source,
         destination,
+        source_input_display,
+        destination_display,
         requested_mode,
         preview_only,
         contents_mode_requested,
@@ -60,10 +111,11 @@ pub(crate) fn run_local_transfer(request: LocalTransferRequest<'_>) -> i32 {
     let use_sudo = args.sudo;
     let backup_requested = args.backup;
     let overwrite = args.overwrite;
-    let (src_mnt, src_obj_kind) = match resolve_source(source, requested_mode) {
-        Ok(v) => v,
-        Err(code) => return code,
-    };
+    let (src_mnt, src_obj_kind) =
+        match resolve_source_path(source, requested_mode, source_input_display) {
+            Ok(v) => v,
+            Err(code) => return code,
+        };
     if args.sync_mode && src_obj_kind != SrcObjKind::Dir {
         log(
             requested_mode,
@@ -74,13 +126,13 @@ pub(crate) fn run_local_transfer(request: LocalTransferRequest<'_>) -> i32 {
     }
 
     if args.create_destination_parents {
-        if let Err(code) = create_destination_parents(destination, requested_mode) {
+        if let Err(code) = create_destination_parents_path(destination, requested_mode) {
             return code;
         }
     }
 
     let (dst_mnt, dst_obj_kind) = match src_obj_kind {
-        SrcObjKind::File => match resolve_destination_for_file(
+        SrcObjKind::File => match resolve_destination_for_file_path(
             destination,
             requested_mode,
             args.replace_dest_symlink,
@@ -89,7 +141,7 @@ pub(crate) fn run_local_transfer(request: LocalTransferRequest<'_>) -> i32 {
             Err(code) => return code,
         },
         SrcObjKind::Dir => {
-            match resolve_destination_for_dir(destination, requested_mode, overwrite) {
+            match resolve_destination_for_dir_path(destination, requested_mode, overwrite) {
                 Ok(v) => v,
                 Err(code) => return code,
             }
@@ -122,12 +174,12 @@ pub(crate) fn run_local_transfer(request: LocalTransferRequest<'_>) -> i32 {
         && src_obj_kind == SrcObjKind::Dir;
     let effective_source_contents_mode = (source_contents_mode || descendant_target_contents_mode)
         && src_obj_kind == SrcObjKind::Dir;
-    let dest_tail_raw = destination
+    let dest_tail_raw = destination_display
         .trim_end_matches('/')
         .split('/')
         .next_back()
         .unwrap_or("");
-    let destination_is_dir_ref = destination.ends_with('/')
+    let destination_is_dir_ref = destination_display.ends_with('/')
         || dest_tail_raw.is_empty()
         || dest_tail_raw == "."
         || dest_tail_raw == "..";
@@ -176,6 +228,24 @@ pub(crate) fn run_local_transfer(request: LocalTransferRequest<'_>) -> i32 {
                     source_already_in_destination = false;
                 }
             }
+        }
+    }
+
+    // Never allow a copy or move to replace one of its own ancestors. The
+    // resolver can otherwise turn `parent/child -> parent` into a destructive
+    // self-replacement before the transfer phase has a chance to protect it.
+    if src_obj_kind == SrcObjKind::Dir {
+        let source_real = realpath_allow_missing(&src_mnt);
+        let destination_real = realpath_allow_missing(&dst_mnt);
+        if source_real == destination_real
+            || (destination_real != Path::new("/") && source_real.starts_with(&destination_real))
+        {
+            log(
+                requested_mode,
+                "Source and destination overlap; refusing ancestor replacement.",
+                LogLevel::Error,
+            );
+            return 1;
         }
     }
 
@@ -1088,26 +1158,9 @@ pub(crate) fn run_local_transfer(request: LocalTransferRequest<'_>) -> i32 {
         })
         .unwrap_or(false);
 
-    let backup_bytes = if backup_requested {
-        backup_source_path
-            .as_ref()
-            .and_then(|path| fs::symlink_metadata(path).ok())
-            .map(|meta| {
-                if meta.is_dir() {
-                    count_tree_any(
-                        backup_source_path.as_deref().unwrap_or(Path::new(".")),
-                        false,
-                    )
-                    .bytes
-                } else {
-                    meta.len()
-                }
-            })
-            .unwrap_or(0)
-    } else {
-        0
-    };
-    let required_space = planned_bytes.saturating_add(backup_bytes);
+    // A backup is an in-filesystem rename and does not require a second copy
+    // of the backup tree. Counting it here rejects valid low-free-space moves.
+    let required_space = planned_bytes;
     if required_space > 0 && !fast_rename_possible {
         match destination_available_bytes(&dst_mnt) {
             Ok((available_bytes, probe_path)) => {
@@ -1173,8 +1226,8 @@ pub(crate) fn run_local_transfer(request: LocalTransferRequest<'_>) -> i32 {
             &format!(
                 "Starting {} cleanup: {} -> {}...",
                 requested_mode.word(),
-                source_input,
-                destination
+                source_input_display,
+                destination_display
             ),
             LogLevel::Info,
         );
@@ -1185,8 +1238,8 @@ pub(crate) fn run_local_transfer(request: LocalTransferRequest<'_>) -> i32 {
                 "Starting {} ({} backend): {} -> {}...",
                 requested_mode.word(),
                 backend_name,
-                source_input,
-                destination
+                source_input_display,
+                destination_display
             ),
             LogLevel::Info,
         );
@@ -1236,7 +1289,9 @@ pub(crate) fn run_local_transfer(request: LocalTransferRequest<'_>) -> i32 {
         }
 
         if let Some(otp) = &overwrite_target_path {
-            if overwrite_parent_from_child {
+            if overwrite_parent_from_child
+                || (overwrite_target_kind == Some("dir") && src_obj_kind == SrcObjKind::Dir)
+            {
                 let stage_parent = dst_mnt.parent().unwrap_or_else(|| Path::new("."));
                 let stage_path = match tempfile::Builder::new()
                     .prefix(&format!(".{}-stage-", requested_mode.word()))
@@ -1282,6 +1337,7 @@ pub(crate) fn run_local_transfer(request: LocalTransferRequest<'_>) -> i32 {
                         args.merge_collision_policy,
                         args.sync_mode,
                         descendant_target_exclude_rel.as_deref(),
+                        args.verify,
                     ),
                 };
                 transferred_bytes_total += transfer.bytes_done;
@@ -1309,16 +1365,48 @@ pub(crate) fn run_local_transfer(request: LocalTransferRequest<'_>) -> i32 {
                             return 1;
                         }
                         println!();
-                    } else {
+                    }
+
+                    // Keep the old target under an atomic sibling name until
+                    // the staged replacement is visible. A failed final move
+                    // must not turn an overwrite into data loss.
+                    let mut rollback_path = None;
+                    if !backup_requested && fs::symlink_metadata(otp).is_ok() {
                         log(
                             requested_mode,
                             &format!("Overwriting existing directory: {}", otp.display()),
                             LogLevel::Info,
                         );
-                        if !remove_path_recursive(otp, use_sudo, requested_mode) {
+                        let rollback = match tempfile::Builder::new()
+                            .prefix(&format!(".{}-rollback-", requested_mode.word()))
+                            .tempdir_in(stage_parent)
+                        {
+                            Ok(td) => {
+                                let path = td.keep();
+                                let _ = fs::remove_dir(&path);
+                                path
+                            }
+                            Err(_) => {
+                                let _ =
+                                    remove_path_recursive(&stage_path, use_sudo, requested_mode);
+                                log(
+                                    requested_mode,
+                                    "Failed to reserve an overwrite rollback path.",
+                                    LogLevel::Error,
+                                );
+                                return 1;
+                            }
+                        };
+                        if !move_path_for_replace(otp, &rollback, use_sudo) {
                             let _ = remove_path_recursive(&stage_path, use_sudo, requested_mode);
+                            log(
+                                requested_mode,
+                                "Failed to reserve the existing destination for rollback.",
+                                LogLevel::Error,
+                            );
                             return 1;
                         }
+                        rollback_path = Some(rollback);
                     }
 
                     if use_sudo {
@@ -1337,6 +1425,9 @@ pub(crate) fn run_local_transfer(request: LocalTransferRequest<'_>) -> i32 {
                                 "Failed to place staged directory into destination.",
                                 LogLevel::Error,
                             );
+                            if let Some(rollback) = rollback_path.as_ref() {
+                                let _ = move_path_for_replace(rollback, otp, use_sudo);
+                            }
                             let _ = remove_path_recursive(&stage_path, use_sudo, requested_mode);
                             return 1;
                         }
@@ -1346,8 +1437,22 @@ pub(crate) fn run_local_transfer(request: LocalTransferRequest<'_>) -> i32 {
                             "Failed to place staged directory into destination.",
                             LogLevel::Error,
                         );
+                        if let Some(rollback) = rollback_path.as_ref() {
+                            let _ = move_path_for_replace(rollback, otp, use_sudo);
+                        }
                         let _ = remove_path_recursive(&stage_path, use_sudo, requested_mode);
                         return 1;
+                    }
+
+                    if let Some(rollback) = rollback_path.take() {
+                        if !remove_path_recursive(&rollback, use_sudo, requested_mode) {
+                            log(
+                                requested_mode,
+                                "Replacement succeeded but old destination cleanup failed.",
+                                LogLevel::Error,
+                            );
+                            return 1;
+                        }
                     }
 
                     if rc_transfer == 0 {
@@ -1371,10 +1476,11 @@ pub(crate) fn run_local_transfer(request: LocalTransferRequest<'_>) -> i32 {
                             return 1;
                         }
                         log_transfer_complete(requested_mode);
+                        let mut move_cleanup_success = true;
                         if is_move {
                             let cleanup = run_move_cleanup_phase(
                                 &src_path,
-                                &stage_path.display().to_string(),
+                                &otp.display().to_string(),
                                 &src_mnt,
                                 src_obj_kind,
                                 effective_contents_mode_requested,
@@ -1399,13 +1505,14 @@ pub(crate) fn run_local_transfer(request: LocalTransferRequest<'_>) -> i32 {
                                 cleanup_flush_bytes_total =
                                     cleanup_flush_bytes_total.saturating_add(b);
                             }
+                            move_cleanup_success = cleanup.success;
                         }
-                        return 0;
+                        return if move_cleanup_success { 0 } else { 1 };
                     }
                     if is_move {
                         let cleanup = run_move_cleanup_phase(
                             &src_path,
-                            &stage_path.display().to_string(),
+                            &otp.display().to_string(),
                             &src_mnt,
                             src_obj_kind,
                             effective_contents_mode_requested,
@@ -1576,6 +1683,14 @@ pub(crate) fn run_local_transfer(request: LocalTransferRequest<'_>) -> i32 {
             if let Some(b) = cleanup.flush.flushed_bytes {
                 cleanup_flush_bytes_total = cleanup_flush_bytes_total.saturating_add(b);
             }
+            if !cleanup.success {
+                log(
+                    requested_mode,
+                    "Move cleanup did not verify every source entry; source was retained.",
+                    LogLevel::Error,
+                );
+                return 1;
+            }
             log_transfer_complete(requested_mode);
             return 0;
         }
@@ -1603,6 +1718,7 @@ pub(crate) fn run_local_transfer(request: LocalTransferRequest<'_>) -> i32 {
                 args.merge_collision_policy,
                 args.sync_mode,
                 descendant_target_exclude_rel.as_deref(),
+                args.verify,
             ),
         };
         transferred_bytes_total += transfer.bytes_done;

@@ -31,18 +31,18 @@ pub(crate) struct TreeCounts {
 }
 
 pub(crate) fn count_tree_any(path: &Path, include_root_dir: bool) -> TreeCounts {
-    let root_meta = match fs::symlink_metadata(path) {
-        Ok(meta) => meta,
+    let root_snapshot = match fsx::metadata::metadata_snapshot_for(path) {
+        Ok(snapshot) => snapshot,
         Err(_) => return TreeCounts::default(),
     };
-    if root_meta.is_file() {
+    if root_snapshot.kind == fsx::EntryKind::File {
         return TreeCounts {
             files: 1,
-            bytes: root_meta.len(),
+            bytes: root_snapshot.logical_size,
             dirs: 0,
         };
     }
-    if !root_meta.is_dir() {
+    if root_snapshot.kind != fsx::EntryKind::Directory {
         return TreeCounts::default();
     }
     let mut counts = TreeCounts {
@@ -62,7 +62,9 @@ pub(crate) fn count_tree_any(path: &Path, include_root_dir: bool) -> TreeCounts 
         } else if file_type.is_file() {
             counts.files = counts.files.saturating_add(1);
             if let Ok(meta) = entry.metadata() {
-                counts.bytes = counts.bytes.saturating_add(meta.len());
+                counts.bytes = counts
+                    .bytes
+                    .saturating_add(fsx::metadata::logical_size(&meta));
             }
         }
     }

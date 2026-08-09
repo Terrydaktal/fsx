@@ -9,7 +9,7 @@ use std::env;
 use std::fs::{self, File};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 #[cfg(feature = "watcher")]
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;

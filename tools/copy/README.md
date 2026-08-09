@@ -54,6 +54,9 @@ copy/
   - Make the destination tree match the source using native Rust transfer and cleanup phases for local, non-elevated operations.
   - Copy files whose type, size, or modification time differs, then delete destination-only entries after the transfer has flushed.
   - Remote and `--sudo` sync operations retain the rsync backend.
+- `--verify`
+  - Hash copied regular files with SHA-256 after publication and compare source and destination bytes.
+  - Local Rust backend only. Verification is opt-in because it performs a second read pass over each regular file.
 - `--replace-dest-symlink`
   - Replace the destination link itself; without it, a destination symlink is followed for regular-file copies.
 - `-v`, `--verbose`, `--showall`
@@ -69,7 +72,12 @@ copy/
 - Local, non-elevated copy, move, and sync operations use the Rust backend.
 - The Rust backend tunes worker count, buffering, and writeback pacing for NVMe, HDD, and other media.
 - Remote endpoints and `--sudo` force the rsync backend.
+- Local operands stay as raw OS paths through argument parsing and resolution, so non-UTF-8
+  filenames are preserved. Remote endpoint syntax remains UTF-8 text by definition.
 - Rust regular-file and symlink replacements are staged and published atomically; interrupted copies leave only disposable `.copy-rs-partial-*` files.
+- Final regular-file creation and atomic publication use descriptor-relative, no-follow parent opens on Linux. A symlinked ancestor is rejected rather than allowing a path race to redirect the transfer; an existing final destination symlink keeps the documented follow-or-replace policy.
+- Every local operation, including multi-source batches, has a durable journal under `$XDG_STATE_HOME/copy-rs` (or `$HOME/.local/state/copy-rs`). Journal records are mode 0600 and fsynced through `planned`, `transferring`, `published`, and `complete` states. A crash leaves the journal for inspection and the next operation reports it; staging and the idempotent planner make retrying safe without silently resuming an unknown partial transfer.
+- The Rust backend handles `SIGINT` and `SIGTERM` at copy-buffer checkpoints, returns a non-zero interrupted status, and skips move cleanup when the transfer was interrupted. Remote and rsync-backed modes keep rsync's signal handling.
 - Rsync uses `--partial` and `--protect-args`, but exit status 24 is treated as an incomplete transfer and never committed as a move.
 - Incomplete source or destination scans fail closed before sync deletion or move cleanup.
 - Local move cleanup validates source identity and destination content before deletion, then flushes the source filesystem separately.
@@ -78,9 +86,10 @@ copy/
 
 ## Performance Build Settings
 
-- `copy` builds and runs `target/release/copy-rs` by default.
-- Release profile uses aggressive optimization (`opt-level=3`, `lto=fat`, `codegen-units=1`, `panic=abort`, stripped symbols).
-- Host tuning is enabled with `-C target-cpu=native` via `.cargo/config.toml`.
+- `copy` builds and runs `../../target/release/copy-rs` by default.
+- Release profile uses aggressive optimization (`opt-level=3`, `lto=fat`, `codegen-units=1`, stripped symbols)
+  with unwinding enabled so transfer cleanup can return errors rather than aborting the process.
+- The workspace release build does not require host-specific `target-cpu=native` tuning, keeping artifacts portable.
 
 ## Runtime Behavior
 
@@ -93,13 +102,18 @@ copy/
 - Remote moves are refused: remote durability and post-transfer source cleanup cannot be verified safely by the local process.
 - Mode line and preview output remain compatible with the previous CLI behavior.
 
+Copy consumes the sibling `fsx` crate for metadata snapshots used by generic tree counts. Transfer
+manifests, collision policy, hard-link recreation, sparse/reflink copying, remote execution, and
+progress/ETA behavior remain Copy-specific because they are transfer decisions rather than
+filesystem facts.
+
 ## Build
 
 ```bash
 cargo build --release
 ```
 
-The launcher `./copy` auto-builds `target/release/copy-rs` when needed.
+The launcher `./copy` auto-builds the workspace binary at `../../target/release/copy-rs` when needed.
 
 ## Test
 

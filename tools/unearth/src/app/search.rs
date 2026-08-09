@@ -12,7 +12,7 @@ use super::presentation::{
     final_transform, init_raw_cache_state, render_styled_path, style_enabled, RenderCache,
     RenderContext,
 };
-use crossbeam_channel::{bounded, unbounded, Sender};
+use crossbeam_channel::{bounded, Sender};
 use rayon::prelude::*;
 use regex::{Regex, RegexBuilder};
 use std::io::{self, BufWriter, IsTerminal, Write};
@@ -75,7 +75,7 @@ pub(crate) fn run_standard(
     let _timeout_guard = TimeoutGuard::new(opts.timeout_dur, timeout_triggered.clone());
 
     if stream_direct {
-        let (tx, rx) = unbounded::<Vec<PathInfo>>();
+        let (tx, rx) = bounded::<Vec<PathInfo>>(64);
         let opts_clone = opts.clone();
         let timeout_fast = timeout_triggered.clone();
         if opts.positional.len() == 1 {
@@ -127,8 +127,10 @@ pub(crate) fn run_standard(
                 }
                 SearchDirMode::Pattern(_) => {
                     let mut roots = Vec::new();
-                    let (rtx, rrx) = unbounded::<Vec<PathInfo>>();
-                    let sd_re = sd_re.expect("pattern regex was compiled before spawning");
+                    let (rtx, rrx) = bounded::<Vec<PathInfo>>(64);
+                    let Some(sd_re) = sd_re else {
+                        return;
+                    };
                     walk_fast(
                         PathBuf::from("/"),
                         &sd_re,
@@ -186,7 +188,7 @@ pub(crate) fn run_standard(
                     continue;
                 }
                 if let Some(state) = cache_state.as_mut() {
-                    cache_raw_record_path(&info.path.to_string_lossy(), info.is_dir, state);
+                    cache_raw_record_path(&info.path.to_string_lossy(), info.is_dir, false, state);
                 }
                 let raw_path = info.path.to_string_lossy();
                 let display_path = escape_terminal_text(&raw_path);
@@ -205,8 +207,7 @@ pub(crate) fn run_standard(
         }
 
         if let Some(mut state) = cache_state {
-            let _ = state.dirs.flush();
-            let _ = state.files.flush();
+            let _ = state.cache.flush();
         }
         lock.flush().map_err(|e| e.to_string())?;
         return Ok(SearchRun {
@@ -217,7 +218,7 @@ pub(crate) fn run_standard(
 
     let mut results = Vec::new();
     let needs_metadata = opts.long_format || opts.sort_field.is_some() || opts.sizes;
-    let (tx, rx) = unbounded::<Vec<SearchResult>>();
+    let (tx, rx) = bounded::<Vec<SearchResult>>(64);
     let opts_clone = opts.clone();
     if opts.positional.len() == 1 {
         let timeout_walk = timeout_triggered.clone();
@@ -266,7 +267,7 @@ pub(crate) fn run_standard(
                 let timeout_walk = timeout_triggered.clone();
                 rayon::spawn(move || {
                     let mut roots = Vec::new();
-                    let (rtx, rrx) = unbounded::<Vec<SearchResult>>();
+                    let (rtx, rrx) = bounded::<Vec<SearchResult>>(64);
                     walk_rayon_worker(
                         PathBuf::from("/"),
                         &sd_re,
@@ -377,7 +378,7 @@ pub(crate) fn run_contains_all(
     let first_re = compiled_regexes[0].clone();
     let is_catch_all = regexes[0] == ".*" || regexes[0] == "^.*$";
     let needs_metadata = opts.long_format || opts.sort_field.is_some() || opts.sizes;
-    let (tx, rx) = unbounded::<Vec<SearchResult>>();
+    let (tx, rx) = bounded::<Vec<SearchResult>>(64);
     let opts_clone = opts.clone();
     let root = spec.root.clone();
     let root_serial = root_prefers_single_thread(&root);
@@ -495,7 +496,7 @@ pub(crate) fn run_full(
     let re = compiled_regexes[0].clone();
     let timeout_triggered = Arc::new(AtomicBool::new(false));
     let _timeout_guard = TimeoutGuard::new(opts.timeout_dur, timeout_triggered.clone());
-    let (tx, rx) = unbounded::<Vec<SearchResult>>();
+    let (tx, rx) = bounded::<Vec<SearchResult>>(64);
     let opts_clone = opts.clone();
     let is_catch_all = pattern_specs[0].0 == ".*" || pattern_specs[0].0 == "^.*$";
     let first_full_path_match = pattern_specs[0].1;
@@ -561,7 +562,7 @@ pub(crate) fn run_full(
                     continue;
                 }
                 if let Some(state) = cache_state.as_mut() {
-                    cache_raw_record_path(&item.path, item.is_dir, state);
+                    cache_raw_record_path(&item.path, item.is_dir, item.path_encoded, state);
                 }
                 let display = render_styled_path(&item, &mut render_context);
                 output
@@ -576,8 +577,7 @@ pub(crate) fn run_full(
             }
         }
         if let Some(mut state) = cache_state {
-            let _ = state.dirs.flush();
-            let _ = state.files.flush();
+            let _ = state.cache.flush();
         }
         output.flush().map_err(|e| e.to_string())?;
         return Ok(SearchRun {

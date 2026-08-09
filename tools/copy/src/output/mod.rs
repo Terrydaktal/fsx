@@ -65,7 +65,8 @@ pub(crate) fn print_preview_root_line(
     highlight_new_leaf: bool,
     emphasize_non_new: bool,
 ) {
-    let full = preview_root.display().to_string();
+    let full =
+        fsx::terminal::escape_terminal_text(&preview_root.display().to_string()).into_owned();
     if !highlight_new_leaf {
         if emphasize_non_new {
             println!("{WARNING}{}{ENDC}", full);

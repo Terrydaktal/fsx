@@ -8,7 +8,7 @@ use std::io::{self, BufWriter, Write};
 use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -31,7 +31,8 @@ const WATCH_CHANNEL_CAPACITY: usize = 16_384;
 const WATCH_BATCH_DELAY: Duration = Duration::from_millis(125);
 const WATCH_BACKEND_WAIT: Duration = Duration::from_millis(500);
 const WATCH_MOUNT_CHECK_INTERVAL: Duration = Duration::from_secs(10);
-const WATCH_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const WATCH_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const MAX_STARTUP_REPLAY_BATCHES: usize = 1024;
 const PENDING_MOVE_TIMEOUT: Duration = Duration::from_secs(2);
 const WATCH_RESTART_TIMEOUT: Duration = Duration::from_secs(10);
 const LIVE_ID_CACHE_CAPACITY: usize = 32_768;
@@ -548,6 +549,30 @@ fn stop_existing_watchers(roots: &[RootState]) -> Result<(), String> {
             owners.push((pid, boot_id, starttime));
         }
     }
+    for (pid, boot_id, starttime) in &owners {
+        let mut stmt = conn
+            .prepare(
+                "SELECT root FROM watch_state
+                 WHERE watcher_pid=?1 AND owner_boot_id=?2 AND owner_starttime=?3
+                   AND status IN ('starting', 'running', 'recovering')",
+            )
+            .map_err(|e| e.to_string())?;
+        let owned_roots = stmt
+            .query_map(params![pid, boot_id, starttime], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        if owned_roots
+            .iter()
+            .any(|owned| !roots.iter().any(|root| &root.key == owned))
+        {
+            return Err(format!(
+                "watcher pid {pid} owns additional roots; stop it explicitly before restarting"
+            ));
+        }
+    }
     drop(conn);
 
     for (pid, boot_id, starttime) in &owners {
@@ -682,11 +707,10 @@ impl Drop for WatchStateGuard {
 }
 
 fn periodic_reconcile_interval() -> Option<Duration> {
-    periodic_reconcile_interval_from(
-        std::env::var("UNEARTH_WATCH_RECONCILE_SECS")
-            .ok()
-            .as_deref(),
-    )
+    match std::env::var("UNEARTH_WATCH_RECONCILE_SECS") {
+        Ok(value) => periodic_reconcile_interval_from(Some(&value)),
+        Err(_) => Some(Duration::from_secs(300)),
+    }
 }
 
 fn periodic_reconcile_interval_from(value: Option<&str>) -> Option<Duration> {
@@ -810,9 +834,12 @@ pub(crate) fn run(opts: &Options) -> Result<(), String> {
     }
     let _ = initialize_index_db()?;
     let mut roots = Vec::new();
-    for raw in &opts.positional {
-        let path = fs::canonicalize(expand_home_path(raw))
-            .map_err(|e| format!("cannot watch '{}': {}", raw, e))?;
+    for (index, raw) in opts.positional.iter().enumerate() {
+        let raw_path = (opts.positional_os.len() == opts.positional.len())
+            .then(|| PathBuf::from(&opts.positional_os[index]));
+        let path =
+            fs::canonicalize(raw_path.unwrap_or_else(|| PathBuf::from(expand_home_path(raw))))
+                .map_err(|e| format!("cannot watch '{}': {}", raw, e))?;
         if !path.is_dir() {
             return Err(format!("--watch target '{}' is not a directory", raw));
         }
@@ -823,6 +850,27 @@ pub(crate) fn run(opts: &Options) -> Result<(), String> {
     }
     if roots.is_empty() {
         return Err("--watch did not receive a usable directory root".to_string());
+    }
+    // Overlapping roots make one event belong to multiple ownership domains
+    // and cause duplicate subtree scans. Require callers to watch the common
+    // ancestor once instead.
+    let mut root_keys: Vec<&str> = roots.iter().map(|root| root.key.as_str()).collect();
+    root_keys.sort_unstable();
+    for pair in root_keys.windows(2) {
+        if let [ancestor, child] = pair {
+            let prefix = if *ancestor == "/" {
+                "/".to_string()
+            } else {
+                format!("{ancestor}/")
+            };
+            if !child.starts_with(&prefix) {
+                continue;
+            }
+            return Err(format!(
+                "watch roots overlap: '{}' contains '{}'",
+                ancestor, child
+            ));
+        }
     }
     let worker_threads = if !opts.threads_explicit
         && roots
@@ -849,9 +897,14 @@ pub(crate) fn run(opts: &Options) -> Result<(), String> {
     };
     let _query_server = start_query_server()?;
     let mut metrics_counters = None;
-    let _metrics_logger = if let Some(path) = opts.watch_metrics.as_deref() {
+    let _metrics_logger = if let Some(path) = opts
+        .watch_metrics_os
+        .as_deref()
+        .map(Path::new)
+        .or_else(|| opts.watch_metrics.as_deref().map(Path::new))
+    {
         let counters = Arc::new(MetricsCounters::default());
-        let logger = match MetricsLogger::start(Path::new(path), Arc::clone(&counters)) {
+        let logger = match MetricsLogger::start(path, Arc::clone(&counters)) {
             Ok(logger) => logger,
             Err(error) => {
                 return Err(error);
@@ -919,7 +972,9 @@ pub(crate) fn run(opts: &Options) -> Result<(), String> {
     if WATCH_STOP.load(Ordering::Relaxed) {
         return Err("watcher interrupted during initial index scan".to_string());
     }
+    let mut replay_batches = 0usize;
     while let Ok(first) = events.recv_timeout(Duration::from_millis(10)) {
+        replay_batches = replay_batches.saturating_add(1);
         let mut startup_events = vec![first];
         while startup_events.len() < WATCH_BATCH_MAX {
             match events.try_recv() {
@@ -941,6 +996,12 @@ pub(crate) fn run(opts: &Options) -> Result<(), String> {
                 let _ = update_state_error(&root.key, &backend, &error);
             }
             return Err(format!("initial live event replay failed: {error}"));
+        }
+        if replay_batches >= MAX_STARTUP_REPLAY_BATCHES {
+            eprintln!(
+                "unearth: startup event replay reached its bound; continuing with live processing"
+            );
+            break;
         }
     }
     if WATCH_STOP.load(Ordering::Relaxed) {
@@ -1729,25 +1790,6 @@ fn ensure_dir_cached(
     Ok(id)
 }
 
-fn ensure_dir_chain(
-    tx: &Transaction<'_>,
-    path: &Path,
-    caches: &mut DbCaches,
-) -> Result<i64, String> {
-    let key = normalize_index_dir(path);
-    let mut current = PathBuf::from("/");
-    ensure_dir_cached(tx, "/", caches)?;
-    if key != "/" {
-        for component in Path::new(&key).components() {
-            if let Component::Normal(part) = component {
-                current.push(part);
-                ensure_dir_cached(tx, &normalize_index_dir(&current), caches)?;
-            }
-        }
-    }
-    ensure_dir_cached(tx, &key, caches)
-}
-
 fn ensure_name_cached(
     tx: &Transaction<'_>,
     name: &str,
@@ -1778,7 +1820,7 @@ fn upsert_path(
     caches: &mut DbCaches,
 ) -> Result<IndexedPathState, String> {
     let path = normalize_index_dir(raw_path);
-    let metadata = match fs::symlink_metadata(&path) {
+    let metadata = match fs::symlink_metadata(raw_path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             remove_path(tx, raw_path, is_dir_hint, caches)?;
@@ -1794,27 +1836,35 @@ fn upsert_path(
     } else {
         0
     };
-    let parent = Path::new(&path)
-        .parent()
+    let (parent_key, name) = path
+        .rsplit_once('/')
+        .map(|(parent, name)| (if parent.is_empty() { "/" } else { parent }, name))
         .ok_or_else(|| "event path has no parent".to_string())?;
-    let name = Path::new(&path)
-        .file_name()
-        .ok_or_else(|| "event path has no basename".to_string())?
-        .to_string_lossy()
-        .into_owned();
-    let dir_id = ensure_dir_chain(tx, parent, caches)?;
-    let name_id = ensure_name_cached(tx, &name, caches)?;
+    let dir_id = ensure_dir_chain_encoded(tx, parent_key, caches)?;
+    let name_id = ensure_name_cached(tx, name, caches)?;
     let actor_id = actor_id_cached(tx, actor, now_nanos(), caches)?;
+    let link_count = i64::try_from(metadata.nlink()).ok();
+    let (device, inode) = if !is_dir && metadata.nlink() > 1 {
+        (
+            i64::try_from(metadata.dev()).ok(),
+            i64::try_from(metadata.ino()).ok(),
+        )
+    } else {
+        (None, None)
+    };
     tx.prepare_cached("DELETE FROM entries WHERE dir_id=?1 AND name_id=?2 AND kind<>?3")
         .map_err(|e| e.to_string())?
         .execute(params![dir_id, name_id, kind])
         .map_err(|e| e.to_string())?;
     tx.prepare_cached(
-        "INSERT INTO entries(dir_id, name_id, kind, mtime, size, activity,
-                             event_kind, actor_id, actor_uid, actor_pid, event_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        "INSERT INTO entries(dir_id, name_id, kind, mtime, size, allocated_size, activity,
+                             device, inode, link_count, event_kind, actor_id, actor_uid,
+                             actor_pid, event_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
          ON CONFLICT(dir_id, name_id, kind) DO UPDATE SET mtime=excluded.mtime,
-             size=excluded.size, activity=excluded.activity, event_kind=excluded.event_kind,
+             size=excluded.size, allocated_size=excluded.allocated_size,
+             activity=excluded.activity, device=excluded.device, inode=excluded.inode,
+             link_count=excluded.link_count, event_kind=excluded.event_kind,
              actor_id=CASE WHEN excluded.event_kind = 6
                                 OR excluded.actor_id = (SELECT id FROM actors WHERE executable = 'unknown')
                            THEN entries.actor_id ELSE excluded.actor_id END,
@@ -1835,7 +1885,11 @@ fn upsert_path(
             kind,
             metadata_mtime_nanos(&metadata),
             metadata_size_i64(&metadata),
+            i64::try_from(::fsx::metadata::allocated_size(&metadata)).ok(),
             metadata_activity_nanos(&metadata),
+            device,
+            inode,
+            link_count,
             event_kind,
             actor_id,
             actor.uid,
@@ -1875,6 +1929,26 @@ fn upsert_parent_directory(
     Ok(())
 }
 
+fn ensure_dir_chain_encoded(
+    tx: &Transaction<'_>,
+    key: &str,
+    caches: &mut DbCaches,
+) -> Result<i64, String> {
+    ensure_dir_cached(tx, "/", caches)?;
+    if key == "/" {
+        return ensure_dir_cached(tx, key, caches);
+    }
+    let mut current = String::from("/");
+    for component in key.trim_start_matches('/').split('/') {
+        if !current.ends_with('/') {
+            current.push('/');
+        }
+        current.push_str(component);
+        ensure_dir_cached(tx, &current, caches)?;
+    }
+    ensure_dir_cached(tx, key, caches)
+}
+
 fn remove_path(
     tx: &Transaction<'_>,
     raw_path: &Path,
@@ -1885,40 +1959,35 @@ fn remove_path(
     if path == "/" {
         return Ok(());
     }
-    let parent = Path::new(&path)
-        .parent()
+    let (parent_key, name) = path
+        .rsplit_once('/')
+        .map(|(parent, name)| (if parent.is_empty() { "/" } else { parent }, name))
         .ok_or_else(|| "removed path has no parent".to_string())?;
-    let name = Path::new(&path)
-        .file_name()
-        .ok_or_else(|| "removed path has no basename".to_string())?
-        .to_string_lossy()
-        .into_owned();
-    let parent_key = normalize_index_dir(parent);
-    let name_id = if let Some(id) = caches.names.get(&name).copied() {
+    let name_id = if let Some(id) = caches.names.get(name).copied() {
         Some(id)
     } else {
         let id: Option<i64> = tx
             .prepare_cached("SELECT id FROM strings WHERE value=?1")
             .map_err(|e| e.to_string())?
-            .query_row([&name], |row| row.get(0))
+            .query_row([name], |row| row.get(0))
             .optional()
             .map_err(|e| e.to_string())?;
         if let Some(id) = id {
-            DbCaches::insert(&mut caches.names, name.clone(), id);
+            DbCaches::insert(&mut caches.names, name.to_string(), id);
         }
         id
     };
-    let parent_id = if let Some(id) = caches.dirs.get(&parent_key).copied() {
+    let parent_id = if let Some(id) = caches.dirs.get(parent_key).copied() {
         Some(id)
     } else {
         let id: Option<i64> = tx
             .prepare_cached("SELECT id FROM dirs WHERE path=?1")
             .map_err(|e| e.to_string())?
-            .query_row([&parent_key], |row| row.get(0))
+            .query_row([parent_key], |row| row.get(0))
             .optional()
             .map_err(|e| e.to_string())?;
         if let Some(id) = id {
-            DbCaches::insert(&mut caches.dirs, parent_key.clone(), id);
+            DbCaches::insert(&mut caches.dirs, parent_key.to_string(), id);
         }
         id
     };
@@ -2101,7 +2170,7 @@ fn reconcile_subtree_from_entries(
     ensure_dir_cached(&tx, &root_key, caches)?;
     let actor = Actor::reconcile();
     for entry in entries {
-        let path = PathBuf::from(entry.path);
+        let path = fsx::decode_lossless_path(&entry.path);
         let metadata = fs::symlink_metadata(&path).ok();
         if metadata.is_some() {
             let _ = upsert_path(&tx, &path, entry.kind == 1, &actor, EVENT_RECONCILE, caches)?;
@@ -2486,6 +2555,7 @@ impl InotifyWatcher {
                 if collect_entries && path != scan_root && path.file_name().is_some() {
                     scanned.push(ScannedIndexEntry {
                         path: path_key,
+                        raw_path: path.clone(),
                         kind: if file_type.is_dir() {
                             1
                         } else if file_type.is_symlink() {
@@ -2495,7 +2565,11 @@ impl InotifyWatcher {
                         },
                         mtime: None,
                         size: None,
+                        allocated_size: None,
                         activity: None,
+                        device: None,
+                        inode: None,
+                        link_count: None,
                     });
                 }
             }
@@ -3679,7 +3753,7 @@ fn cached_mount_identities() -> HashMap<String, u64> {
             };
             if let Ok(id) = raw_id.parse() {
                 identities.insert(
-                    normalize_index_dir(Path::new(&unescape_proc_mount_field(raw_mount))),
+                    normalize_index_dir(Path::new(&fsx::mount::unescape_mount_field(raw_mount))),
                     id,
                 );
             }
@@ -3703,7 +3777,7 @@ fn mount_candidates(root: &Path) -> Vec<PathBuf> {
         let Some(raw_mount) = fields.next() else {
             continue;
         };
-        let mount = PathBuf::from(unescape_proc_mount_field(raw_mount));
+        let mount = PathBuf::from(fsx::mount::unescape_mount_field(raw_mount));
         if !mount.starts_with(&root) || mount == root {
             continue;
         }
@@ -3782,7 +3856,11 @@ mod tests {
                  kind INTEGER NOT NULL,
                  mtime INTEGER,
                  size INTEGER,
+                 allocated_size INTEGER,
                  activity INTEGER,
+                 device INTEGER,
+                 inode INTEGER,
+                 link_count INTEGER,
                  event_kind INTEGER,
                  actor_id INTEGER,
                  actor_uid INTEGER,
