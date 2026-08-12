@@ -110,6 +110,27 @@ fn ls_colors_suffix_rules_preserve_first_match_precedence() {
 }
 
 #[test]
+fn indexed_executables_use_live_mode_for_color_and_classification() {
+    let colors = parse_ls_colors_value("fi=file:ex=exec");
+    let path = std::env::current_exe()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let result = SearchResult {
+        path,
+        path_encoded: false,
+        is_dir: false,
+        is_symlink: false,
+        metadata: None,
+        indexed_activity_nanos: None,
+        indexed_size: None,
+    };
+
+    assert_eq!(color_code_for_path(&result, &colors), Some("exec"));
+    assert_eq!(decorator_for_res(&result), Some('*'));
+}
+
+#[test]
 fn media_root_prefers_single_thread() {
     assert!(root_prefers_single_thread(Path::new("/media")));
     assert!(root_prefers_single_thread(Path::new("/media/disk")));

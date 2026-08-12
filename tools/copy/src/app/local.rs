@@ -3,7 +3,7 @@
 use crate::cli::CliArgs;
 use crate::domain::{
     ChangeItem, ChangeKind, DeleteCleanupOutcome, DstObjKind, LogLevel, PreScan, SrcObjKind,
-    TransferBackend, TransferMode,
+    TransferBackend, TransferManifest, TransferMode,
 };
 use crate::output::{
     build_change_tree, collect_source_top_entries, fmt_mode_word, format_bytes_binary,
@@ -21,9 +21,10 @@ use crate::plan::{
 use crate::runtime::{configure_rayon_threads_for_media, dev_media_kind, transfer_media_kind};
 use crate::transfer::{
     backup_base_path, backup_path_with_base, copy_path_to_backup, flush_destination_writes,
-    plan_backup_path, prefer_hdd_scheduler_for_paths, premerge_fast_rename_noncolliding_children,
-    remove_path_recursive, run_command_capture, run_move_cleanup_phase, run_rsync_transfer,
-    run_rust_transfer, run_sync_cleanup_phase, TransferJournal,
+    plan_backup_path, prefer_hdd_scheduler_for_paths, preflight_source_file_reads,
+    premerge_fast_rename_noncolliding_children, remove_path_recursive,
+    report_source_read_preflight_failures, run_command_capture, run_move_cleanup_phase,
+    run_rsync_transfer, run_rust_transfer, run_sync_cleanup_phase, run_test_hook, TransferJournal,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -31,6 +32,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tempfile::TempDir;
+
+const NONMUTATING_PREFLIGHT_FAILURE: i32 = 2;
 
 pub(crate) struct LocalTransferRequest<'a> {
     pub(crate) args: &'a CliArgs,
@@ -43,6 +46,44 @@ pub(crate) struct LocalTransferRequest<'a> {
     pub(crate) contents_mode_requested: bool,
     pub(crate) force: bool,
     pub(crate) source_glob_contents: bool,
+}
+
+fn planned_regular_source_paths(
+    source: &Path,
+    source_kind: SrcObjKind,
+    manifest: Option<&TransferManifest>,
+) -> Vec<PathBuf> {
+    match source_kind {
+        SrcObjKind::File => fs::symlink_metadata(source)
+            .map(|metadata| {
+                if metadata.file_type().is_symlink() {
+                    Vec::new()
+                } else {
+                    vec![source.to_path_buf()]
+                }
+            })
+            // Let the open preflight produce the useful error if the source
+            // disappeared after it was scanned.
+            .unwrap_or_else(|_| vec![source.to_path_buf()]),
+        SrcObjKind::Dir => manifest
+            .map(|manifest| {
+                manifest
+                    .copy_files
+                    .iter()
+                    .filter(|entry| !entry.is_symlink)
+                    .map(|entry| {
+                        entry.source_path.clone().unwrap_or_else(|| {
+                            entry
+                                .relative_path
+                                .as_deref()
+                                .map(|path| source.join(path))
+                                .unwrap_or_else(|| source.join(entry.rel.as_ref()))
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
 }
 
 fn move_path_for_replace(source: &Path, destination: &Path, use_sudo: bool) -> bool {
@@ -81,6 +122,12 @@ pub(crate) fn run_local_transfer(request: LocalTransferRequest<'_>) -> i32 {
             }
         };
     let result = run_local_transfer_inner(request);
+    if result == NONMUTATING_PREFLIGHT_FAILURE {
+        if let Err(error) = journal.abandon("source-read-preflight-failed") {
+            eprintln!("copy: cannot remove the aborted operation journal: {error}");
+        }
+        return 1;
+    }
     if result == 0 {
         if let Err(error) = journal.mark("published") {
             eprintln!("copy: transfer published but operation journal update failed: {error}");
@@ -90,6 +137,8 @@ pub(crate) fn run_local_transfer(request: LocalTransferRequest<'_>) -> i32 {
             eprintln!("copy: transfer succeeded but operation journal cleanup failed: {error}");
             return 1;
         }
+    } else if let Err(error) = journal.mark("failed") {
+        eprintln!("copy: cannot persist failed operation state: {error}");
     }
     result
 }
@@ -237,9 +286,16 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
     if src_obj_kind == SrcObjKind::Dir {
         let source_real = realpath_allow_missing(&src_mnt);
         let destination_real = realpath_allow_missing(&dst_mnt);
-        if source_real == destination_real
-            || (destination_real != Path::new("/") && source_real.starts_with(&destination_real))
-        {
+        let ancestor_overlap = destination_real != Path::new("/")
+            && source_real.starts_with(&destination_real)
+            && !source_already_in_destination
+            && !merge_child_into_parent
+            && !overwrite_parent_from_child;
+        let same_path_overlap = source_real == destination_real
+            && !source_already_in_destination
+            && !merge_child_into_parent
+            && !overwrite_parent_from_child;
+        if same_path_overlap || ancestor_overlap {
             log(
                 requested_mode,
                 "Source and destination overlap; refusing ancestor replacement.",
@@ -587,6 +643,7 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
         HashSet::new()
     };
     let has_itemized_changes = prescan.has_itemized_changes;
+    let has_planned_changes = prescan.has_planned_changes;
 
     let (manifest_cleanup_files, manifest_cleanup_bytes) = if is_move {
         if let Some(m) = transfer_manifest.as_ref() {
@@ -799,6 +856,7 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
     let sync_delete_requires_action =
         args.sync_mode && (uncollided_files > 0 || uncollided_dirs > 0);
     let emphasize_preview_root = has_itemized_changes
+        || has_planned_changes
         || planned_bytes > 0
         || overwrite_requires_action
         || sync_delete_requires_action
@@ -915,7 +973,7 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
         && !source_already_in_destination
         && existing_same_name_target
         && planned_bytes == 0
-        && !has_itemized_changes
+        && !has_planned_changes
         && !overwrite_requires_action;
 
     let mut likely_cleanup_files = if is_move && !source_already_in_destination {
@@ -1036,10 +1094,26 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
         return 0;
     }
 
+    run_test_hook("after-preview-before-preflight", &src_mnt);
+
+    // Every operation must be able to read planned regular files before the
+    // user approves it. A move may use rename for non-colliding entries, but
+    // merged/colliding entries still copy bytes and can otherwise fail after
+    // the rename fast path has already mutated the destination.
+    if !use_sudo && has_planned_changes {
+        let planned_sources =
+            planned_regular_source_paths(&src_mnt, src_obj_kind, transfer_manifest.as_ref());
+        let failures = preflight_source_file_reads(&planned_sources);
+        if !failures.is_empty() {
+            report_source_read_preflight_failures(requested_mode, &failures);
+            return NONMUTATING_PREFLIGHT_FAILURE;
+        }
+    }
+
     let move_requires_material_action =
         is_move && !source_already_in_destination && !existing_same_name_target;
     let no_changes_planned = source_already_in_destination
-        || ((planned_bytes == 0 && !has_itemized_changes && !overwrite_requires_action)
+        || ((planned_bytes == 0 && !has_planned_changes && !overwrite_requires_action)
             && !sync_delete_requires_action
             && !move_cleanup_only
             && !move_requires_material_action);
@@ -1109,6 +1183,8 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
         );
         return 0;
     }
+
+    run_test_hook("after-preflight-before-execution", &src_mnt);
 
     // Allow fast rename for contents-only moves when destination is a brand-new
     // directory path. In this case, moving source children into a new target dir
@@ -1314,9 +1390,20 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
                     LogLevel::Info,
                 );
 
+                // A directory source without a trailing slash carries its
+                // basename into the destination.  The staging directory is
+                // already the replacement root, so preserve the source
+                // contents directly inside it; otherwise publication would
+                // create `target/source/source/...`.
+                let staged_source_path = if src_obj_kind == SrcObjKind::Dir {
+                    format!("{}/", src_path.trim_end_matches('/'))
+                } else {
+                    src_path.clone()
+                };
+
                 let transfer = match backend {
                     TransferBackend::Rsync => run_rsync_transfer(
-                        &src_path,
+                        &staged_source_path,
                         &stage_path.display().to_string(),
                         planned_bytes,
                         use_sudo,
@@ -1325,7 +1412,7 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
                         !args.sync_mode,
                     ),
                     TransferBackend::Rust => run_rust_transfer(
-                        &src_path,
+                        &staged_source_path,
                         &stage_path.display().to_string(),
                         src_obj_kind,
                         is_move,
@@ -1356,7 +1443,15 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
                             .clone()
                             .or_else(|| backup_base_path(otp));
                         if let Some(bb) = backup_base {
-                            if backup_path_with_base(otp, use_sudo, &bb, requested_mode).is_none() {
+                            if let Some(backup_path) =
+                                backup_path_with_base(otp, use_sudo, &bb, requested_mode)
+                            {
+                                log(
+                                    requested_mode,
+                                    &format!("Backup saved as: {}", backup_path.display()),
+                                    LogLevel::Info,
+                                );
+                            } else {
                                 let _ =
                                     remove_path_recursive(&stage_path, use_sudo, requested_mode);
                                 return 1;

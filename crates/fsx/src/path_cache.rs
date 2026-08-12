@@ -20,6 +20,8 @@ pub struct RawPathCache {
     files_temp: PathBuf,
     dirs_final: PathBuf,
     files_final: PathBuf,
+    lock_path: PathBuf,
+    _lock: File,
 }
 
 impl RawPathCache {
@@ -32,15 +34,34 @@ impl RawPathCache {
             .as_nanos();
         let dirs_final = cache_dir.join(format!("universal-last-dirs-{pid}"));
         let files_final = cache_dir.join(format!("universal-last-files-{pid}"));
+        let lock_path = cache_dir.join(format!(".universal-last-{pid}.lock"));
         let dirs_temp = cache_dir.join(format!(".universal-last-dirs-{pid}.{nonce}.tmp"));
         let files_temp = cache_dir.join(format!(".universal-last-files-{pid}.{nonce}.tmp"));
+        let lock = acquire_cache_lock(&lock_path)?;
+        let dirs_file = match open_secure_file(&dirs_temp) {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = std::fs::remove_file(&lock_path);
+                return Err(error);
+            }
+        };
+        let files_file = match open_secure_file(&files_temp) {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = std::fs::remove_file(&dirs_temp);
+                let _ = std::fs::remove_file(&lock_path);
+                return Err(error);
+            }
+        };
         Ok(Self {
-            dirs: BufWriter::new(open_secure_file(&dirs_temp)?),
-            files: BufWriter::new(open_secure_file(&files_temp)?),
+            dirs: BufWriter::new(dirs_file),
+            files: BufWriter::new(files_file),
             dirs_temp,
             files_temp,
             dirs_final,
             files_final,
+            lock_path,
+            _lock: lock,
         })
     }
 
@@ -82,6 +103,7 @@ impl Drop for RawPathCache {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.dirs_temp);
         let _ = std::fs::remove_file(&self.files_temp);
+        let _ = std::fs::remove_file(&self.lock_path);
     }
 }
 
@@ -104,11 +126,25 @@ fn write_path(writer: &mut BufWriter<File>, path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
-        writer.write_all(path.as_os_str().as_bytes())?;
+        let bytes = path.as_os_str().as_bytes();
+        if bytes.iter().any(|byte| *byte == b'\n' || *byte == b'\r') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "raw path cache cannot represent newline-containing paths",
+            ));
+        }
+        writer.write_all(bytes)?;
     }
     #[cfg(not(unix))]
     {
-        writer.write_all(path.to_string_lossy().as_bytes())?;
+        let text = path.to_string_lossy();
+        if text.contains(['\n', '\r']) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "raw path cache cannot represent newline-containing paths",
+            ));
+        }
+        writer.write_all(text.as_bytes())?;
     }
     writer.write_all(b"\n")
 }
@@ -176,6 +212,42 @@ fn open_secure_file(path: &Path) -> io::Result<File> {
     {
         options.open(path)
     }
+}
+
+fn acquire_cache_lock(path: &Path) -> io::Result<File> {
+    for _ in 0..3 {
+        match open_secure_file(path) {
+            Ok(mut file) => {
+                writeln!(file, "{}", std::process::id())?;
+                file.sync_all()?;
+                return Ok(file);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let observed = std::fs::read_to_string(path).unwrap_or_default();
+                let pid = observed.trim().parse::<u32>().ok();
+                #[cfg(target_os = "linux")]
+                let owner_alive =
+                    pid.is_some_and(|pid| Path::new(&format!("/proc/{pid}")).exists());
+                #[cfg(not(target_os = "linux"))]
+                let owner_alive = false;
+                if owner_alive {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "raw path cache is already being written",
+                    ));
+                }
+                if std::fs::read_to_string(path).unwrap_or_default() != observed {
+                    continue;
+                }
+                let _ = std::fs::remove_file(path);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "raw path cache lock is busy",
+    ))
 }
 
 fn set_private_directory(path: &Path) -> io::Result<()> {

@@ -1,0 +1,14 @@
+<ROOT>/src
+├── empty/
+├── sub/
+│   ├── deep/
+│   ├── a-hardlink.txt
+│   └── b.txt
+├── .hidden
+├── a.txt
+├── dangling@
+├── dir-link@
+├── leading-dash
+├── link@
+├── run.sh*
+└── space name.txt

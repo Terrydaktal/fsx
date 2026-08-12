@@ -59,6 +59,13 @@ copy/
   - Local Rust backend only. Verification is opt-in because it performs a second read pass over each regular file.
 - `--replace-dest-symlink`
   - Replace the destination link itself; without it, a destination symlink is followed for regular-file copies.
+- `--collision POLICY`
+  - Select the winner for file-vs-file conflicts inside local directory merges.
+  - Copy defaults to `source:metadata-differs`: replace a colliding destination when its type, size, or modification time differs from the source.
+  - Move defaults to `source:always`: transfer the explicitly supplied source before source cleanup.
+  - `source:size-differs`, `source:newer`, and other conditional policies remain available explicitly.
+  - Preview `Mod`/`Ident` classification is policy-independent: regular files are `Ident` only when destination type, size, and modification time match. The selected collision policy separately controls whether they are transferred.
+  - Sync uses its own exact-mirror quick check and rejects `--collision`.
 - `-v`, `--verbose`, `--showall`
   - Show hierarchical preview: up to 5 changed entries per level (modified first), expand only modified folders, and abbreviate remaining new/modified/unchanged/removed counts.
 - `--preview`
@@ -76,8 +83,8 @@ copy/
   filenames are preserved. Remote endpoint syntax remains UTF-8 text by definition.
 - Rust regular-file and symlink replacements are staged and published atomically; interrupted copies leave only disposable `.copy-rs-partial-*` files.
 - Final regular-file creation and atomic publication use descriptor-relative, no-follow parent opens on Linux. A symlinked ancestor is rejected rather than allowing a path race to redirect the transfer; an existing final destination symlink keeps the documented follow-or-replace policy.
-- Every local operation, including multi-source batches, has a durable journal under `$XDG_STATE_HOME/copy-rs` (or `$HOME/.local/state/copy-rs`). Journal records are mode 0600 and fsynced through `planned`, `transferring`, `published`, and `complete` states. A crash leaves the journal for inspection and the next operation reports it; staging and the idempotent planner make retrying safe without silently resuming an unknown partial transfer.
-- The Rust backend handles `SIGINT` and `SIGTERM` at copy-buffer checkpoints, returns a non-zero interrupted status, and skips move cleanup when the transfer was interrupted. Remote and rsync-backed modes keep rsync's signal handling.
+- Every local operation, including multi-source batches, has a durable journal under `$XDG_STATE_HOME/copy-rs` (or `$HOME/.local/state/copy-rs`). Journal records are mode 0600 and fsynced through `planned`, `transferring`, `published`, `failed`, and `complete` states. Only journals that stop during an active transfer or publication are reported as interrupted; validated failures are retained for diagnostics without creating a false crash warning. A crash leaves the journal for inspection and the next operation reports it; staging and the idempotent planner make retrying safe without silently resuming an unknown partial transfer.
+- The Rust backend handles `SIGINT` and `SIGTERM` at copy-buffer checkpoints, returns a non-zero interrupted status, and skips move cleanup when the transfer was interrupted. Rsync-backed modes also terminate and reap their child process when the wrapper receives either signal.
 - Rsync uses `--partial` and `--protect-args`, but exit status 24 is treated as an incomplete transfer and never committed as a move.
 - Incomplete source or destination scans fail closed before sync deletion or move cleanup.
 - Local move cleanup validates source identity and destination content before deletion, then flushes the source filesystem separately.
@@ -96,6 +103,7 @@ copy/
 - `SOURCE/*` is treated as contents-only mode (same as `-c` on `SOURCE/`).
 - Parent/self-overlap safety is enforced.
 - Local mode performs a destination free-space preflight using filesystem stats before transfer (no sudo required).
+- Local Rust copy/sync opens every planned regular source before confirmation and aborts without destination writes if any file is unreadable.
 - Move mode cleans empty source directories after transferred files are removed.
 - Directory and file atime/mtime are preserved; hard-linked regular files are recreated as hard links when the manifest identifies them.
 - HDD scheduler changes are disabled by default because they are system-wide and cannot be safely restored after interruption. Set `COPY_RS_SET_HDD_SCHEDULER=1` to opt in.
@@ -118,5 +126,15 @@ The launcher `./copy` auto-builds the workspace binary at `../../target/release/
 ## Test
 
 ```bash
-python3 -m unittest discover -s tests -v
+python3 -m unittest discover -s tools/copy/tests -v
 ```
+
+This includes real localhost SSH/rsync round trips, process-level signal tests, every hard-crash
+journal/publication boundary, corruption checks, and adversarial mutation between preview,
+preflight, execution, and publication. `tests/coverage.sh` records workspace LCOV output and makes
+CI enforce measured line and branch floors. Tests that genuinely
+need authority remain explicit opt-ins: run `COPY_RS_RUN_PKEXEC_TEST=1` in an interactive Polkit
+session for the real `pkexec` path, and run the isolated loopback-filesystem harness once through
+`pkexec bash -c 'COPY_RS_RUN_ROOT_FAULT_TESTS=1 /absolute/path/to/test_copy_linux_faults.sh'` for
+ENOSPC, read-only, and removed-device failures. The harness only creates a temporary image and loop
+mount beneath `/tmp` and validates its exact targets before cleanup.

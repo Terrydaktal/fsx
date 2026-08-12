@@ -7,7 +7,7 @@ edition = "2024"
 [dependencies]
 chrono = "0.4.44"
 clap = { version = "4.6.0", features = ["derive"] }
-fsx = { workspace = true, features = ["colors", "git", "index", "ntfs", "terminal"] }
+fsx = { workspace = true, features = ["colors", "git", "index", "ntfs", "scan", "terminal"] }
 jemallocator = "0.5.4"
 jwalk = "0.8.1"
 libc = "0.2.183"

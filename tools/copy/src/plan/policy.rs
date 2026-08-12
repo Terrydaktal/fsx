@@ -6,6 +6,19 @@ use crate::domain::{
 };
 use std::time::SystemTime;
 
+pub(crate) fn mtimes_equal_precision_aware(a: SystemTime, b: SystemTime) -> bool {
+    if a == b {
+        return true;
+    }
+    let Ok(a) = a.duration_since(SystemTime::UNIX_EPOCH) else {
+        return false;
+    };
+    let Ok(b) = b.duration_since(SystemTime::UNIX_EPOCH) else {
+        return false;
+    };
+    (a.subsec_nanos() == 0 || b.subsec_nanos() == 0) && a.as_secs() == b.as_secs()
+}
+
 pub(crate) fn parse_merge_collision_policy(raw: &str) -> Result<MergeCollisionPolicy, String> {
     let (winner_raw, expr_raw) = raw
         .split_once(':')
@@ -40,15 +53,21 @@ pub(crate) fn parse_merge_collision_policy(raw: &str) -> Result<MergeCollisionPo
             "newer" => predicates.newer = true,
             "larger" => predicates.larger = true,
             "size-differs" => predicates.size_differs = true,
+            "metadata-differs" => predicates.metadata_differs = true,
             "" => return Err("collision rule contains an empty condition".to_string()),
             other => {
                 return Err(format!(
-                    "unknown collision condition '{other}'; expected always, newer, larger, or size-differs"
+                    "unknown collision condition '{other}'; expected always, newer, larger, size-differs, or metadata-differs"
                 ))
             }
         }
     }
-    if !predicates.always && !predicates.newer && !predicates.larger && !predicates.size_differs {
+    if !predicates.always
+        && !predicates.newer
+        && !predicates.larger
+        && !predicates.size_differs
+        && !predicates.metadata_differs
+    {
         return Err("collision rule must contain at least one condition".to_string());
     }
     Ok(MergeCollisionPolicy {
@@ -133,8 +152,28 @@ pub(crate) fn regular_file_collision_change(
     } else {
         None
     };
+    let eval_metadata_differs = if policy.predicates.metadata_differs {
+        Some(match (dst_size, src_mtime, dst_mtime) {
+            (Some(dst_size), Some(src_mtime), Some(dst_mtime)) => {
+                if src_size != dst_size || !mtimes_equal_precision_aware(src_mtime, dst_mtime) {
+                    PredicateResult::True
+                } else {
+                    PredicateResult::False
+                }
+            }
+            _ => PredicateResult::Unknown,
+        })
+    } else {
+        None
+    };
 
-    let predicate_results = [eval_always, eval_newer, eval_larger, eval_size_differs];
+    let predicate_results = [
+        eval_always,
+        eval_newer,
+        eval_larger,
+        eval_size_differs,
+        eval_metadata_differs,
+    ];
     let match_selected_winner = match policy.combine {
         CollisionCombineMode::Any => {
             if predicate_results
@@ -164,7 +203,7 @@ pub(crate) fn regular_file_collision_change(
     }
 }
 
-pub(crate) fn sync_regular_file_change(
+pub(crate) fn regular_file_relation_change(
     src_size: u64,
     src_mtime: Option<SystemTime>,
     dst_is_regular_file: bool,
@@ -176,7 +215,7 @@ pub(crate) fn sync_regular_file_change(
     }
 
     let same_size = dst_size == Some(src_size);
-    let same_mtime = matches!((src_mtime, dst_mtime), (Some(src), Some(dst)) if src == dst);
+    let same_mtime = matches!((src_mtime, dst_mtime), (Some(src), Some(dst)) if mtimes_equal_precision_aware(src, dst));
     if same_size && same_mtime {
         None
     } else {
@@ -194,7 +233,16 @@ pub(crate) fn classify_file_relation(
     let src_mtime = src_mtime?;
     let dst_mtime = dst_mtime?;
     let mut out = FileRelationBreakdown::default();
-    match src_mtime.cmp(&dst_mtime) {
+    // Match the transfer relation policy: filesystems commonly expose one
+    // timestamp with sub-second precision and the other truncated to seconds.
+    // Treat those values as equal for both planning and the human-readable
+    // preview, otherwise the summary claims a newer file while the operation
+    // correctly skips it.
+    match if mtimes_equal_precision_aware(src_mtime, dst_mtime) {
+        std::cmp::Ordering::Equal
+    } else {
+        src_mtime.cmp(&dst_mtime)
+    } {
         std::cmp::Ordering::Equal => match src_size.cmp(&dst_size) {
             std::cmp::Ordering::Equal => out.same_time_same_size = 1,
             std::cmp::Ordering::Greater => out.same_time_source_larger = 1,
@@ -212,4 +260,24 @@ pub(crate) fn classify_file_relation(
         },
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mtimes_equal_precision_aware;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn treats_filesystem_truncated_mtime_as_equal() {
+        let precise = SystemTime::UNIX_EPOCH + Duration::new(42, 987_654_321);
+        let truncated = SystemTime::UNIX_EPOCH + Duration::new(42, 0);
+        assert!(mtimes_equal_precision_aware(precise, truncated));
+    }
+
+    #[test]
+    fn does_not_hide_second_level_mtime_changes() {
+        let first = SystemTime::UNIX_EPOCH + Duration::new(42, 0);
+        let second = SystemTime::UNIX_EPOCH + Duration::new(43, 0);
+        assert!(!mtimes_equal_precision_aware(first, second));
+    }
 }

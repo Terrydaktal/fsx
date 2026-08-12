@@ -361,6 +361,7 @@ pub(crate) fn try_render_large_dir_fast_path(
                 &painted,
                 &ctx.cwd,
                 &ctx.hyperlink_cache,
+                entry.display_name == "..",
             ));
         } else {
             out.push_str(&painted);
@@ -684,6 +685,7 @@ pub(crate) fn try_render_large_dir_long_fast_path(
                     &painted_name,
                     &ctx.cwd,
                     &ctx.hyperlink_cache,
+                    e.display_name == "..",
                 ));
             } else {
                 out.push_str(&painted_name);
@@ -1008,18 +1010,28 @@ pub(crate) fn get_styled_name(
         };
 
         if ctx.hyperlink {
-            return ctx.hyperlink_cache.borrow_mut().split_path_link(
-                &abs_path,
-                &styled_prefix,
-                &styled_basename,
-            );
+            return ctx
+                .hyperlink_cache
+                .borrow_mut()
+                .split_path_link_with_leaf_selection(
+                    &abs_path,
+                    &styled_prefix,
+                    &styled_basename,
+                    display_name == "..",
+                );
         }
 
         return format!("{}{}", styled_prefix, styled_basename);
     }
     let painted = paint_text_with_lscolors(&name, actual_path, metadata, ctx);
     if ctx.hyperlink {
-        return hyperlink_path(actual_path, &painted, &ctx.cwd, &ctx.hyperlink_cache);
+        return hyperlink_path(
+            actual_path,
+            &painted,
+            &ctx.cwd,
+            &ctx.hyperlink_cache,
+            display_name == "..",
+        );
     }
     painted
 }
@@ -1124,9 +1136,14 @@ fn hyperlink_path(
     text: &str,
     cwd: &Path,
     cache: &std::cell::RefCell<fsx::terminal::HyperlinkCache>,
+    select_entry: bool,
 ) -> String {
     let abs = normalize_path_lexical(&to_full_path_with_cwd(path, cwd));
-    cache.borrow_mut().direct_link(&abs, text)
+    if select_entry {
+        cache.borrow_mut().select_link(&abs, text)
+    } else {
+        cache.borrow_mut().direct_link(&abs, text)
+    }
 }
 
 pub(crate) fn write_cache_raw_paths(
@@ -1206,11 +1223,15 @@ pub(crate) fn get_symlink_target_display(
         };
 
         if ctx.hyperlink {
-            return ctx.hyperlink_cache.borrow_mut().split_path_link(
-                path,
-                &styled_prefix,
-                &styled_basename,
-            );
+            return ctx
+                .hyperlink_cache
+                .borrow_mut()
+                .split_path_link_with_leaf_selection(
+                    path,
+                    &styled_prefix,
+                    &styled_basename,
+                    false,
+                );
         }
 
         if styled_prefix.is_empty() {
@@ -1352,12 +1373,29 @@ mod tests {
             "folder/",
             Path::new("/tmp"),
             &cache,
+            false,
         );
         assert_eq!(
             rendered,
             "\x1b]8;;file:///tmp/fsx/folder\x1b\\folder/\x1b]8;;\x1b\\"
         );
         assert!(!rendered.contains("?select="));
+    }
+
+    #[test]
+    fn parent_entry_hyperlink_selects_the_parent_in_its_parent() {
+        let cache = std::cell::RefCell::new(fsx::terminal::HyperlinkCache::default());
+        let rendered = hyperlink_path(
+            Path::new("/tmp/fsx"),
+            "../",
+            Path::new("/tmp/fsx/folder"),
+            &cache,
+            true,
+        );
+        assert_eq!(
+            rendered,
+            "\x1b]8;;file:///tmp/?select=/tmp/fsx\x1b\\../\x1b]8;;\x1b\\"
+        );
     }
 
     #[test]

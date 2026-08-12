@@ -201,13 +201,14 @@ pub(crate) fn render_multiple_paths(cli: Cli) -> io::Result<()> {
 
         let (recursive_sizes, recursive_counts, root_true_size, root_recursive_counts) =
             if is_actual_dir || (cli.dereference && is_target_dir) {
-                collect_recursive_stats(
+                collect_recursive_stats_checked(
                     &actual_path,
                     true,
                     cli.dedupe_hardlinks,
                     cli.true_size,
                     need_counts,
                 )
+                .unwrap_or_else(|| (HashMap::new(), HashMap::new(), None, None))
             } else {
                 (HashMap::new(), HashMap::new(), None, None)
             };
@@ -340,13 +341,14 @@ pub(crate) fn render_path(cli: Cli) -> io::Result<()> {
     let stats_target_is_dir = input_is_dir || (cli.dereference && input_target_is_dir);
     let (recursive_sizes, recursive_counts, root_true_size, root_recursive_counts) =
         if stats_target_is_dir {
-            collect_recursive_stats(
+            collect_recursive_stats_checked(
                 input_path,
                 true,
                 cli.dedupe_hardlinks,
                 cli.true_size,
                 need_counts,
             )
+            .unwrap_or_else(|| (HashMap::new(), HashMap::new(), None, None))
         } else {
             (HashMap::new(), HashMap::new(), None, None)
         };
@@ -807,13 +809,23 @@ pub(crate) fn create_entry_info(
 }
 
 pub(crate) fn run(cli: Cli) -> io::Result<()> {
+    reset_recursive_scan_status();
     if cli.paths.len() > 1 {
-        return render_multiple_paths(cli);
+        render_multiple_paths(cli)?;
+        return if recursive_scan_incomplete() {
+            Err(io::Error::other("recursive scan incomplete"))
+        } else {
+            Ok(())
+        };
     }
     for path in cli.paths.iter().cloned() {
         let mut path_cli = cli.clone();
         path_cli.path = path;
         render_path(path_cli)?;
     }
-    Ok(())
+    if recursive_scan_incomplete() {
+        Err(io::Error::other("recursive scan incomplete"))
+    } else {
+        Ok(())
+    }
 }

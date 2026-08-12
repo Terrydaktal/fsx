@@ -4,7 +4,7 @@
 //! collision decisions, progress policy, and cleanup remain in their modules.
 
 use crate::domain::{ManifestDirTimeEntry, MediaKind};
-use crate::plan::{map_dir_dest_path, normalize_rel};
+use crate::plan::{map_dir_dest_path, map_dir_dest_relative_path, normalize_rel};
 use crate::runtime::copy_chunk_bytes_for_file;
 use filetime::{set_file_times, FileTime};
 use jwalk::WalkDir;
@@ -23,6 +23,34 @@ use tempfile::TempPath;
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 static INSTALL_INTERRUPT_HANDLER: Once = Once::new();
 
+pub(crate) fn run_test_hook(name: &str, path: &Path) {
+    if std::env::var("COPY_RS_TEST_CRASH_AT").as_deref() == Ok(name) {
+        // Test-only failpoint: preserve the exact on-disk state at this
+        // publication boundary by deliberately skipping destructors.
+        unsafe { nix::libc::_exit(86) }
+    }
+    let Ok(hook) = std::env::var("COPY_RS_TEST_HOOK") else {
+        return;
+    };
+    let mut command = std::process::Command::new(hook);
+    command.env("COPY_RS_TEST_HOOK_POINT", name);
+    command.env("COPY_RS_TEST_HOOK_PATH", path);
+    let _ = command.status();
+}
+
+fn mark_test_transfer_started(destination: &Path) {
+    let Some(marker) = std::env::var_os("COPY_RS_TEST_TRANSFER_MARKER") else {
+        return;
+    };
+    let _ = fs::write(marker, destination.as_os_str().as_bytes());
+    if let Some(milliseconds) = std::env::var("COPY_RS_TEST_TRANSFER_PAUSE_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        std::thread::sleep(std::time::Duration::from_millis(milliseconds));
+    }
+}
+
 #[cfg(unix)]
 extern "C" fn handle_interrupt(_: nix::libc::c_int) {
     INTERRUPTED.store(true, Ordering::Relaxed);
@@ -32,7 +60,7 @@ pub(crate) fn install_interrupt_handler() {
     INSTALL_INTERRUPT_HANDLER.call_once(|| {
         #[cfg(unix)]
         unsafe {
-            let handler = handle_interrupt as nix::libc::sighandler_t;
+            let handler = handle_interrupt as *const () as nix::libc::sighandler_t;
             let _ = nix::libc::signal(nix::libc::SIGINT, handler);
             let _ = nix::libc::signal(nix::libc::SIGTERM, handler);
         }
@@ -134,6 +162,20 @@ pub(crate) fn open_source_noatime(path: &Path) -> io::Result<File> {
         }
         Err(err) => Err(err),
     }
+}
+
+/// Prove that every regular source selected by the transfer plan can be opened
+/// before any destination writes begin. Metadata scans alone cannot detect an
+/// unreadable file because `stat(2)` does not require read access to its data.
+pub(crate) fn preflight_source_file_reads(paths: &[PathBuf]) -> Vec<(PathBuf, String)> {
+    paths
+        .iter()
+        .filter_map(|path| {
+            open_source_noatime(path)
+                .err()
+                .map(|error| (path.clone(), error.to_string()))
+        })
+        .collect()
 }
 
 pub(crate) fn ensure_no_symlink_ancestors(path: &Path) -> io::Result<()> {
@@ -252,6 +294,7 @@ fn open_destination_for_update(destination: &Path) -> io::Result<File> {
 
 #[cfg(target_os = "linux")]
 fn persist_temp_path(staged: TempPath, destination: &Path) -> io::Result<()> {
+    run_test_hook("before-publication", destination);
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     let temp_name = staged
         .file_name()
@@ -282,12 +325,16 @@ fn persist_temp_path(staged: TempPath, destination: &Path) -> io::Result<()> {
         return Err(error);
     }
     std::mem::forget(staged);
+    run_test_hook("after-publication", destination);
     Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
 fn persist_temp_path(staged: TempPath, destination: &Path) -> io::Result<()> {
-    staged.persist(destination).map_err(|error| error.error)
+    run_test_hook("before-publication", destination);
+    staged.persist(destination).map_err(|error| error.error)?;
+    run_test_hook("after-publication", destination);
+    Ok(())
 }
 
 pub(crate) fn apply_file_metadata_fd(file: &File, meta: &fs::Metadata) -> io::Result<()> {
@@ -559,13 +606,14 @@ where
         on_bytes,
     )?;
 
-    if fs::symlink_metadata(dst)
-        .map(|meta| meta.file_type().is_dir())
-        .unwrap_or(false)
-    {
-        fs::remove_dir_all(dst)?;
+    let rollback = move_directory_to_rollback(dst)?;
+    if let Err(error) = persist_temp_path(staged, dst) {
+        restore_rollback_path(rollback.as_deref(), dst);
+        return Err(error);
     }
-    persist_temp_path(staged, dst)?;
+    if let Some(rollback) = rollback {
+        remove_path_local_if_exists(&rollback)?;
+    }
     Ok(copied)
 }
 
@@ -597,6 +645,7 @@ where
     }
     let mut in_file = open_source_noatime(src)?;
     let mut out_file = open_destination_for_update(dst)?;
+    mark_test_transfer_started(dst);
     advise_sequential(&in_file);
 
     let desired = copy_chunk_bytes_for_file(media, meta.len()).max(64 * 1024);
@@ -791,13 +840,14 @@ pub(crate) fn copy_symlink_atomic(src: &Path, dst: &Path) -> io::Result<()> {
     fs::remove_file(staged_path)?;
     symlink(target, staged_path)?;
 
-    if fs::symlink_metadata(dst)
-        .map(|meta| meta.file_type().is_dir())
-        .unwrap_or(false)
-    {
-        fs::remove_dir_all(dst)?;
+    let rollback = move_directory_to_rollback(dst)?;
+    if let Err(error) = persist_temp_path(staged, dst) {
+        restore_rollback_path(rollback.as_deref(), dst);
+        return Err(error);
     }
-    persist_temp_path(staged, dst)?;
+    if let Some(rollback) = rollback {
+        remove_path_local_if_exists(&rollback)?;
+    }
     Ok(())
 }
 
@@ -812,14 +862,46 @@ pub(crate) fn copy_hardlink_atomic(existing: &Path, dst: &Path) -> io::Result<()
     let staged_path: &Path = staged.as_ref();
     fs::remove_file(staged_path)?;
     fs::hard_link(existing, staged_path)?;
-    if fs::symlink_metadata(dst)
-        .map(|meta| meta.file_type().is_dir())
-        .unwrap_or(false)
-    {
-        fs::remove_dir_all(dst)?;
+    let rollback = move_directory_to_rollback(dst)?;
+    if let Err(error) = persist_temp_path(staged, dst) {
+        restore_rollback_path(rollback.as_deref(), dst);
+        return Err(error);
     }
-    persist_temp_path(staged, dst)?;
+    if let Some(rollback) = rollback {
+        remove_path_local_if_exists(&rollback)?;
+    }
     Ok(())
+}
+
+fn reserve_rollback_path(parent: &Path) -> io::Result<PathBuf> {
+    let path = tempfile::Builder::new()
+        .prefix(".copy-rs-rollback-")
+        .tempdir_in(parent)?
+        .keep();
+    fs::remove_dir(&path)?;
+    Ok(path)
+}
+
+fn move_directory_to_rollback(destination: &Path) -> io::Result<Option<PathBuf>> {
+    let is_directory = fs::symlink_metadata(destination)
+        .map(|metadata| metadata.file_type().is_dir())
+        .unwrap_or(false);
+    if !is_directory {
+        return Ok(None);
+    }
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    let rollback = reserve_rollback_path(parent)?;
+    if let Err(error) = fs::rename(destination, &rollback) {
+        let _ = fs::remove_dir(&rollback);
+        return Err(error);
+    }
+    Ok(Some(rollback))
+}
+
+fn restore_rollback_path(rollback: Option<&Path>, destination: &Path) {
+    if let Some(rollback) = rollback {
+        let _ = fs::rename(rollback, destination);
+    }
 }
 
 pub(crate) fn ensure_directory_target(path: &Path, replace_conflict: bool) -> io::Result<()> {
@@ -829,8 +911,16 @@ pub(crate) fn ensure_directory_target(path: &Path, replace_conflict: bool) -> io
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_dir() => Ok(()),
         Ok(_) if replace_conflict => {
-            remove_path_local_if_exists(path)?;
-            fs::create_dir_all(path)
+            let parent = path.parent().unwrap_or_else(|| Path::new("."));
+            let rollback = reserve_rollback_path(parent)?;
+            fs::rename(path, &rollback)?;
+            match fs::create_dir_all(path) {
+                Ok(()) => remove_path_local_if_exists(&rollback),
+                Err(error) => {
+                    restore_rollback_path(Some(&rollback), path);
+                    Err(error)
+                }
+            }
         }
         Ok(_) => fs::create_dir_all(path),
         Err(err) if err.kind() == io::ErrorKind::NotFound => fs::create_dir_all(path),
@@ -874,7 +964,8 @@ pub(crate) fn preserve_directory_times_tree(
     if let Some(entries) = dir_times {
         // Manifest entries are stored in postorder so child timestamps are set first.
         for entry in entries {
-            let dst_dir = map_dir_dest_path(include_root, src_base, &entry.rel, dst_base);
+            let dst_dir =
+                map_dir_dest_relative_path(include_root, src_base, &entry.relative_path, dst_base);
             set_directory_times_checked(&dst_dir, entry.atime, entry.mtime)?;
         }
         return Ok(());
@@ -948,5 +1039,66 @@ mod tests {
         verify_regular_file_pair(&source, &destination).expect("matching files verify");
         fs::write(&destination, b"corrupt").expect("corrupt destination");
         assert!(verify_regular_file_pair(&source, &destination).is_err());
+    }
+
+    #[test]
+    fn sparse_copy_preserves_logical_length_and_hole_when_supported() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let source = root.path().join("sparse-source");
+        let destination = root.path().join("sparse-destination");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&source)
+            .expect("create sparse source");
+        file.seek(SeekFrom::Start(1024 * 1024))
+            .expect("seek sparse hole");
+        file.write_all(b"tail").expect("write sparse tail");
+        file.flush().expect("flush sparse source");
+        let source_blocks = source.metadata().expect("source metadata").blocks();
+        if source_blocks * 512 >= source.metadata().expect("source metadata").len() {
+            return;
+        }
+        copy_file_preserve(&source, &destination).expect("copy sparse source");
+        assert_eq!(
+            destination.metadata().expect("destination metadata").len(),
+            1024 * 1024 + 4
+        );
+        assert_eq!(
+            destination
+                .metadata()
+                .expect("destination metadata")
+                .blocks(),
+            source_blocks
+        );
+        verify_regular_file_pair(&source, &destination).expect("verify sparse copy");
+    }
+
+    #[test]
+    fn cancellation_is_observed_before_writing() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let source = root.path().join("source");
+        let destination = root.path().join("destination");
+        fs::write(&source, b"cancelled").expect("write source");
+        let cancelled = AtomicBool::new(true);
+        let mut buffer = vec![0u8; 4096];
+        let mut callback = |_| {};
+        let source_file = File::open(&source).expect("open source");
+        let destination_file = File::create(&destination).expect("create destination");
+        let error = copy_buffered(
+            &mut source_file.try_clone().expect("clone source"),
+            &mut destination_file.try_clone().expect("clone destination"),
+            &mut buffer,
+            MediaKind::Other,
+            Some(&cancelled),
+            &mut callback,
+        )
+        .expect_err("cancelled copy must fail");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(
+            destination.metadata().expect("destination metadata").len(),
+            0
+        );
     }
 }

@@ -16,6 +16,15 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::time::Instant;
 
+fn remote_confirmation_accepted(answer: &str, sync_mode: bool) -> bool {
+    let answer = answer.trim().to_ascii_lowercase();
+    if sync_mode {
+        answer == "delete"
+    } else {
+        answer == "y" || answer == "yes"
+    }
+}
+
 pub(crate) fn run_remote_transfer_mode(
     requested_mode: TransferMode,
     source_input: &str,
@@ -153,7 +162,14 @@ pub(crate) fn run_remote_transfer_mode(
         return 0;
     }
 
-    print!("Proceed with {}? [Y/n]: ", requested_mode.word());
+    if sync_mode {
+        print!(
+            "Proceed with {}? This will delete destination-only entries; type DELETE to continue: ",
+            requested_mode.word()
+        );
+    } else {
+        print!("Proceed with {}? [Y/n]: ", requested_mode.word());
+    }
     let _ = io::stdout().flush();
     let mut ans = String::new();
     if let Err(err) = io::stdin().read_line(&mut ans) {
@@ -172,8 +188,7 @@ pub(crate) fn run_remote_transfer_mode(
         );
         return 1;
     }
-    let ans = ans.trim().to_ascii_lowercase();
-    if !ans.is_empty() && ans != "y" && ans != "yes" {
+    if !remote_confirmation_accepted(&ans, sync_mode) {
         println!("{FAIL}Cancelled.{ENDC}");
         return 0;
     }
@@ -264,4 +279,17 @@ pub(crate) fn run_remote_transfer_mode(
     );
     print_summary_rate_line("Overall throughput", avg_total_bps, total_elapsed_s, true);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::remote_confirmation_accepted;
+
+    #[test]
+    fn remote_confirmation_requires_explicit_answer() {
+        assert!(!remote_confirmation_accepted("\n", false));
+        assert!(remote_confirmation_accepted(" yes ", false));
+        assert!(!remote_confirmation_accepted("yes", true));
+        assert!(remote_confirmation_accepted("DELETE", true));
+    }
 }

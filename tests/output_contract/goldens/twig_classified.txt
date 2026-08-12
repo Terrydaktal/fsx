@@ -1,0 +1,12 @@
+./
+../
+dir-link@
+empty/
+sub/
+dangling@
+link@
+.hidden
+a.txt
+leading-dash
+run.sh*
+space name.txt

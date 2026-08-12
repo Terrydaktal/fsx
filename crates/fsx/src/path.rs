@@ -9,11 +9,11 @@ pub fn encode_lossless_path(path: &Path) -> String {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
-        return encode_lossless_bytes(path.as_os_str().as_bytes());
+        encode_lossless_bytes(path.as_os_str().as_bytes())
     }
     #[cfg(not(unix))]
     {
-        return path.to_string_lossy().replace('%', "%25");
+        path.to_string_lossy().replace('%', "%25")
     }
 }
 
@@ -71,7 +71,7 @@ pub fn decode_lossless_path(encoded: &str) -> PathBuf {
             bytes.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
             index += character.len_utf8();
         }
-        return PathBuf::from(std::ffi::OsString::from_vec(bytes));
+        PathBuf::from(std::ffi::OsString::from_vec(bytes))
     }
     #[cfg(not(unix))]
     {

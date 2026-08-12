@@ -9,7 +9,7 @@ use crate::domain::{
 };
 use crate::plan::{
     classify_file_relation, realpath_allow_missing, regular_file_collision_change,
-    sync_regular_file_change,
+    regular_file_relation_change,
 };
 use crate::runtime::{dev_media_kind, symlink_targets_equal};
 use filetime::FileTime;
@@ -173,13 +173,15 @@ pub(crate) fn build_destination_index(destination_root: &Path) -> DestinationInd
             .path()
             .strip_prefix(destination_root)
             .ok()
-            .filter(|p| path_components_are_utf8(p))
-            .map(normalize_rel)
+            .map(|p| {
+                if path_components_are_utf8(p) {
+                    normalize_rel(p)
+                } else {
+                    lossless_rel(p)
+                }
+            })
             .unwrap_or_default();
         if rel.is_empty() {
-            if ent.depth() > 0 && !path_components_are_utf8(&ent.path()) {
-                complete = false;
-            }
             continue;
         }
 
@@ -279,6 +281,10 @@ fn path_components_are_utf8(path: &Path) -> bool {
     path.iter().all(|component| component.to_str().is_some())
 }
 
+fn lossless_rel(path: &Path) -> String {
+    fsx::encode_lossless_path(path)
+}
+
 pub(crate) fn map_dir_dest_path(
     include_root: bool,
     src_base: &str,
@@ -293,6 +299,19 @@ pub(crate) fn map_dir_dest_path(
         }
     } else if rel.is_empty() {
         dst_base.to_path_buf()
+    } else {
+        dst_base.join(rel)
+    }
+}
+
+pub(crate) fn map_dir_dest_relative_path(
+    include_root: bool,
+    src_base: &str,
+    rel: &Path,
+    dst_base: &Path,
+) -> PathBuf {
+    if include_root {
+        dst_base.join(src_base).join(rel)
     } else {
         dst_base.join(rel)
     }
@@ -424,10 +443,6 @@ pub(crate) fn pre_scan_new_tree_lite(
                 continue;
             }
         };
-        if !path_components_are_utf8(&entry.path()) {
-            scan_complete = false;
-            continue;
-        }
         if entry.depth() == 0 {
             continue;
         }
@@ -437,7 +452,15 @@ pub(crate) fn pre_scan_new_tree_lite(
                 .map(|depth| entry.depth() <= depth + usize::from(include_root))
                 .unwrap_or(true);
         let rel = needs_rel
-            .then(|| entry.path().strip_prefix(src_root).ok().map(normalize_rel))
+            .then(|| {
+                entry.path().strip_prefix(src_root).ok().map(|relative| {
+                    if path_components_are_utf8(relative) {
+                        normalize_rel(relative)
+                    } else {
+                        lossless_rel(relative)
+                    }
+                })
+            })
             .flatten();
         if rel
             .as_deref()
@@ -488,6 +511,7 @@ pub(crate) fn pre_scan_new_tree_lite(
     out.add_files = files;
     out.add_dirs = dirs;
     out.has_itemized_changes = !preview.is_empty();
+    out.has_planned_changes = out.has_itemized_changes;
     out.change_preview.extend(
         preview
             .into_iter()
@@ -498,6 +522,7 @@ pub(crate) fn pre_scan_new_tree_lite(
 
 pub(crate) struct ScannedFileEntry {
     rel: Arc<str>,
+    relative_path: PathBuf,
     source_path: Option<PathBuf>,
     size: u64,
     is_symlink: bool,
@@ -541,12 +566,15 @@ pub(crate) fn scan_source_entries(
                 }
             };
             let path = entry.path();
-            if !path_components_are_utf8(&path) {
-                scan_complete = false;
-                continue;
-            }
+            let path_is_lossless = !path_components_are_utf8(&path);
             let rel = match path.strip_prefix(src_root) {
-                Ok(rel) => normalize_rel(rel),
+                Ok(rel) => {
+                    if path_is_lossless {
+                        lossless_rel(rel)
+                    } else {
+                        normalize_rel(rel)
+                    }
+                }
                 Err(_) => {
                     scan_complete = false;
                     continue;
@@ -569,6 +597,10 @@ pub(crate) fn scan_source_entries(
                 if collect_dir_times {
                     dir_times.push(ManifestDirTimeEntry {
                         rel: rel.clone(),
+                        relative_path: path
+                            .strip_prefix(src_root)
+                            .unwrap_or(Path::new(""))
+                            .to_path_buf(),
                         atime: FileTime::from_last_access_time(&meta),
                         mtime: FileTime::from_last_modification_time(&meta),
                     });
@@ -579,7 +611,11 @@ pub(crate) fn scan_source_entries(
             } else if meta.is_file() {
                 files.push(ScannedFileEntry {
                     rel: rel.into(),
-                    source_path: None,
+                    relative_path: path
+                        .strip_prefix(src_root)
+                        .unwrap_or(Path::new(""))
+                        .to_path_buf(),
+                    source_path: Some(path.clone()),
                     size: meta.len(),
                     is_symlink: false,
                     dev: meta.dev(),
@@ -590,6 +626,10 @@ pub(crate) fn scan_source_entries(
             } else if meta.file_type().is_symlink() {
                 files.push(ScannedFileEntry {
                     rel: rel.into(),
+                    relative_path: path
+                        .strip_prefix(src_root)
+                        .unwrap_or(Path::new(""))
+                        .to_path_buf(),
                     source_path: Some(path),
                     size: 0,
                     is_symlink: true,
@@ -609,6 +649,7 @@ pub(crate) fn scan_source_entries(
     let mut dir_times: Vec<ManifestDirTimeEntry> = Vec::new();
 
     fn walk_source_entries(
+        src_root: &Path,
         current: &Path,
         current_meta: Option<fs::Metadata>,
         rel: &str,
@@ -619,9 +660,6 @@ pub(crate) fn scan_source_entries(
         collect_dir_times: bool,
     ) -> bool {
         let mut complete = true;
-        if !path_components_are_utf8(current) {
-            return false;
-        }
         let meta = match current_meta {
             Some(meta) => meta,
             None => match fs::symlink_metadata(current) {
@@ -633,6 +671,10 @@ pub(crate) fn scan_source_entries(
             if collect_dir_times {
                 dir_times.push(ManifestDirTimeEntry {
                     rel: rel.to_string(),
+                    relative_path: current
+                        .strip_prefix(src_root)
+                        .unwrap_or(Path::new(""))
+                        .to_path_buf(),
                     atime: FileTime::from_last_access_time(&meta),
                     mtime: FileTime::from_last_modification_time(&meta),
                 });
@@ -653,13 +695,16 @@ pub(crate) fn scan_source_entries(
                     }
                 };
                 let child_path = entry.path();
-                let child_name = match child_path.file_name().and_then(|name| name.to_str()) {
-                    Some(n) => n.to_string(),
-                    None => {
-                        complete = false;
-                        continue;
-                    }
-                };
+                let child_name = child_path
+                    .file_name()
+                    .map(|name| {
+                        if let Some(name) = name.to_str() {
+                            name.to_string()
+                        } else {
+                            lossless_rel(Path::new(name)).replace('/', "_")
+                        }
+                    })
+                    .unwrap_or_else(|| "<unknown>".to_string());
                 let child_rel = if rel.is_empty() {
                     child_name.clone()
                 } else {
@@ -680,6 +725,7 @@ pub(crate) fn scan_source_entries(
                 };
                 if child_meta.is_dir() {
                     complete &= walk_source_entries(
+                        src_root,
                         &child_path,
                         Some(child_meta),
                         &child_rel,
@@ -692,7 +738,11 @@ pub(crate) fn scan_source_entries(
                 } else if child_meta.is_file() {
                     files.push(ScannedFileEntry {
                         rel: child_rel.into(),
-                        source_path: None,
+                        relative_path: child_path
+                            .strip_prefix(src_root)
+                            .unwrap_or(Path::new(""))
+                            .to_path_buf(),
+                        source_path: Some(child_path.clone()),
                         size: child_meta.len(),
                         is_symlink: false,
                         dev: child_meta.dev(),
@@ -703,6 +753,10 @@ pub(crate) fn scan_source_entries(
                 } else if child_meta.file_type().is_symlink() {
                     files.push(ScannedFileEntry {
                         rel: child_rel.into(),
+                        relative_path: child_path
+                            .strip_prefix(src_root)
+                            .unwrap_or(Path::new(""))
+                            .to_path_buf(),
                         source_path: Some(child_path),
                         size: 0,
                         is_symlink: true,
@@ -720,6 +774,7 @@ pub(crate) fn scan_source_entries(
     }
 
     let scan_complete = walk_source_entries(
+        src_root,
         src_root,
         None,
         "",
@@ -882,6 +937,7 @@ pub(crate) fn pre_scan_directory(
                 bounded_preview_depth,
             );
             out.has_itemized_changes = true;
+            out.has_planned_changes = true;
         }
     }
 
@@ -919,6 +975,7 @@ pub(crate) fn pre_scan_directory(
                 bounded_preview_depth,
             );
             out.has_itemized_changes = true;
+            out.has_planned_changes = true;
         }
     }
 
@@ -945,7 +1002,7 @@ pub(crate) fn pre_scan_directory(
         mut manifest_copy_files,
         mut manifest_identical_files,
         mut changed_parent_dirs,
-        _overlap_count,
+        planned_change_count,
         file_relation_breakdown,
     ): FileReduce = files
         .par_iter()
@@ -970,12 +1027,15 @@ pub(crate) fn pre_scan_directory(
                 let is_symlink = entry.is_symlink;
                 let dst_idx = destination_index.as_ref();
                 let mut dst_file: Option<PathBuf> = None;
-                let change = if destination_missing
+                // Keep presentation independent from execution: relation_change always uses
+                // type/size/mtime, while planned_change follows the selected collision policy.
+                let (planned_change, relation_change) = if destination_missing
                     || (has_missing_subtrees && parent_rel_in_set(rel, &missing_dir_prefixes))
                 {
-                    Some(ChangeKind::NewFile)
+                    let change = Some(ChangeKind::NewFile);
+                    (change, change)
                 } else if is_symlink {
-                    match src_file.as_deref() {
+                    let change = match src_file.as_deref() {
                         Some(src_link) => {
                             if let Some(idx) = dst_idx {
                                 if matches!(
@@ -1030,12 +1090,10 @@ pub(crate) fn pre_scan_directory(
                             }
                         }
                         None => Some(ChangeKind::ModFile),
-                    }
+                    };
+                    (change, change)
                 } else {
-                    let needs_mtime = sync_mode
-                        || merge_collision_policy.requires_mtime()
-                        || collect_file_relation_breakdown;
-                    let src_mtime = needs_mtime.then_some(entry.mtime).flatten();
+                    let src_mtime = entry.mtime;
                     let dst_exists = if let Some(idx) = dst_idx {
                         idx.path_exists(rel.as_ref())
                     } else {
@@ -1071,7 +1129,7 @@ pub(crate) fn pre_scan_directory(
                     };
                     let dst_mtime = if replace_dest_symlink && dst_is_symlink {
                         None
-                    } else if needs_mtime {
+                    } else {
                         dst_entry.and_then(|entry| entry.mtime).or_else(|| {
                             if dst_idx.is_none() {
                                 fs::metadata(dst_path).ok().and_then(|m| m.modified().ok())
@@ -1079,8 +1137,6 @@ pub(crate) fn pre_scan_directory(
                                 None
                             }
                         })
-                    } else {
-                        None
                     };
                     if collect_file_relation_breakdown && dst_exists && !dst_is_symlink {
                         if let Some(breakdown) =
@@ -1089,14 +1145,19 @@ pub(crate) fn pre_scan_directory(
                             acc.8.add_assign(breakdown);
                         }
                     }
-                    if sync_mode {
-                        sync_regular_file_change(
+                    let relation_change = if dst_exists {
+                        regular_file_relation_change(
                             size,
                             src_mtime,
-                            dst_exists && !dst_is_symlink && dst_size.is_some(),
+                            !dst_is_symlink && dst_size.is_some(),
                             dst_size,
                             dst_mtime,
                         )
+                    } else {
+                        Some(ChangeKind::NewFile)
+                    };
+                    let planned_change = if sync_mode {
+                        relation_change
                     } else {
                         regular_file_collision_change(
                             merge_collision_policy,
@@ -1106,23 +1167,30 @@ pub(crate) fn pre_scan_directory(
                             dst_size,
                             dst_mtime,
                         )
-                    }
+                    };
+                    (planned_change, relation_change)
                 };
-                let is_overlap = !matches!(change, Some(ChangeKind::NewFile));
-                if is_overlap {
-                    acc.7 += 1;
-                }
-                if let Some(kind) = change {
+                if let Some(kind) = relation_change {
                     if !is_symlink {
                         match kind {
                             ChangeKind::NewFile => acc.0 += 1,
                             _ => acc.1 += 1,
                         }
+                    }
+                    let display_rel = map_display_rel(include_root, &src_base, rel);
+                    insert_preview_change(&mut acc.3, display_rel, kind, bounded_preview_depth);
+                    add_parent_dir_chain(rel, include_root, &mut acc.6);
+                }
+                if planned_change.is_some() {
+                    acc.7 += 1;
+                    if !is_symlink {
                         acc.2 += size;
                     }
                     if build_manifest {
                         acc.4.push(ManifestFileEntry {
                             rel: rel.clone(),
+                            source_path: src_file.clone(),
+                            relative_path: Some(entry.relative_path.clone()),
                             size,
                             dev: entry.dev,
                             ino: entry.ino,
@@ -1131,14 +1199,11 @@ pub(crate) fn pre_scan_directory(
                             mtime: entry.mtime,
                         });
                     }
-                    {
-                        let display_rel = map_display_rel(include_root, &src_base, rel);
-                        insert_preview_change(&mut acc.3, display_rel, kind, bounded_preview_depth);
-                    }
-                    add_parent_dir_chain(rel, include_root, &mut acc.6);
                 } else if build_manifest && retain_identical_manifest {
                     acc.5.push(ManifestFileEntry {
                         rel: rel.clone(),
+                        source_path: src_file.clone(),
+                        relative_path: Some(entry.relative_path.clone()),
                         size,
                         dev: entry.dev,
                         ino: entry.ino,
@@ -1332,6 +1397,9 @@ pub(crate) fn pre_scan_directory(
     {
         out.has_itemized_changes = true;
     }
+    if planned_change_count > 0 || !sync_delete_files.is_empty() || !sync_delete_dirs.is_empty() {
+        out.has_planned_changes = true;
+    }
 
     directory_preview_changes.extend(detailed_changes);
     out.change_preview.extend(
@@ -1378,10 +1446,6 @@ pub(crate) fn pre_scan_file(
     destination_index: Option<&DestinationIndex>,
 ) -> PreScan {
     let mut out = PreScan::default();
-    if !path_components_are_utf8(src_mnt) {
-        out.scan_complete = false;
-        return out;
-    }
     let src_lmd = match fs::symlink_metadata(src_mnt) {
         Ok(m) => m,
         Err(_) => {
@@ -1481,14 +1545,15 @@ pub(crate) fn pre_scan_file(
             .insert(display_rel.trim_end_matches('/').to_string());
     }
 
-    let change = if src_is_symlink {
-        match fs::symlink_metadata(&dst_file) {
+    let (planned_change, relation_change) = if src_is_symlink {
+        let change = match fs::symlink_metadata(&dst_file) {
             Ok(dm) if dm.file_type().is_symlink() && symlink_targets_equal(src_mnt, &dst_file) => {
                 None
             }
             Ok(_) => Some(ChangeKind::ModFile),
             Err(_) => Some(ChangeKind::NewFile),
-        }
+        };
+        (change, change)
     } else {
         let dst_lmd = fs::symlink_metadata(&dst_file).ok();
         let dst_is_symlink = dst_lmd
@@ -1508,19 +1573,34 @@ pub(crate) fn pre_scan_file(
                 out.file_relation_breakdown = breakdown;
             }
         }
-        regular_file_collision_change(
+        let relation_change = if dst_exists {
+            regular_file_relation_change(
+                size,
+                src_mtime,
+                !dst_is_symlink && dst_meta.is_some(),
+                dst_size,
+                dst_mtime,
+            )
+        } else {
+            Some(ChangeKind::NewFile)
+        };
+        let planned_change = regular_file_collision_change(
             merge_collision_policy,
             size,
             src_mtime,
             dst_exists,
             dst_size,
             dst_mtime,
-        )
+        );
+        (planned_change, relation_change)
     };
 
-    if let Some(ch) = change {
-        out.has_itemized_changes = true;
+    if planned_change.is_some() {
+        out.has_planned_changes = true;
         out.planned_bytes = if src_is_symlink { 0 } else { size };
+    }
+    if let Some(ch) = relation_change {
+        out.has_itemized_changes = true;
         match ch {
             ChangeKind::NewFile => {
                 if !src_is_symlink {

@@ -130,6 +130,7 @@ pub(crate) fn run_rsync_transfer(
     delete_destination_extras: bool,
     size_only: bool,
 ) -> TransferOutcome {
+    super::copy_engine::install_interrupt_handler();
     let mut cmd: Vec<String> = vec![
         "rsync".to_string(),
         "-aH".to_string(),
@@ -205,6 +206,11 @@ pub(crate) fn run_rsync_transfer(
     let mut progress_line_active = false;
 
     let rc: i32 = loop {
+        if super::copy_engine::interrupted() {
+            let _ = child.kill();
+            let _ = child.wait();
+            break 130;
+        }
         match event_rx.recv_timeout(Duration::from_millis(200)) {
             Ok(RsyncStreamEvent::Progress(bytes)) => {
                 if bytes > done_bytes {

@@ -6,9 +6,11 @@ use super::cleanup::{
     prune_move_source_duplicates, remove_single_file,
 };
 use super::command::run_command_capture;
+use super::content::regular_file_contents_equal;
 use super::copy_engine::{
-    copy_file_preserve_with_progress_buffer, copy_symlink, interrupted,
-    preserve_directory_times_tree, remove_path_local_if_exists, verify_regular_file_pair,
+    copy_file_preserve_atomic_with_progress_buf, copy_file_preserve_with_progress_buffer,
+    copy_symlink, interrupted, preflight_source_file_reads, preserve_directory_times_tree,
+    remove_path_local_if_exists, verify_regular_file_pair,
 };
 use super::journal::TransferJournal;
 use super::rsync::run_rsync_transfer_sources;
@@ -31,8 +33,8 @@ use crate::plan::{
     resolve_destination_for_dir_path, resolve_source_path, to_real_path_os, DestinationKind,
 };
 use crate::runtime::{
-    acquire_file_write_permit, configure_rayon_threads_for_media, dev_media_kind,
-    inflight_max_bytes_for_media, option_u64_saturating_add, symlink_targets_equal,
+    acquire_file_write_permit, configure_rayon_threads_for_media, copy_chunk_bytes_for_media,
+    dev_media_kind, inflight_max_bytes_for_media, option_u64_saturating_add, symlink_targets_equal,
     transfer_media_kind, transfer_profile_key,
 };
 use rayon::prelude::*;
@@ -47,12 +49,48 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+const NONMUTATING_PREFLIGHT_FAILURE: i32 = 2;
+
+pub(crate) fn report_source_read_preflight_failures(
+    requested_mode: TransferMode,
+    failures: &[(PathBuf, String)],
+) {
+    const DISPLAY_LIMIT: usize = 20;
+    for (path, error) in failures.iter().take(DISPLAY_LIMIT) {
+        log(
+            requested_mode,
+            &format!("Source file is not readable: '{}': {error}", path.display()),
+            LogLevel::Error,
+        );
+    }
+    if failures.len() > DISPLAY_LIMIT {
+        log(
+            requested_mode,
+            &format!(
+                "... and {} more unreadable planned source files.",
+                failures.len() - DISPLAY_LIMIT
+            ),
+            LogLevel::Error,
+        );
+    }
+    log(
+        requested_mode,
+        &format!(
+            "Source-read preflight failed for {} planned file{}; no destination files were changed by this invocation. Fix the source permissions or rerun with --sudo.",
+            failures.len(),
+            if failures.len() == 1 { "" } else { "s" }
+        ),
+        LogLevel::Error,
+    );
+}
+
 pub(crate) fn run_rust_file_batch(
     items: &[(PathBuf, u64, bool)],
     destination: &Path,
     planned_bytes: u64,
     media: MediaKind,
     replace_dest_symlink: bool,
+    merge_collision_policy: MergeCollisionPolicy,
     requested_mode: TransferMode,
     verify: bool,
 ) -> TransferOutcome {
@@ -185,7 +223,23 @@ pub(crate) fn run_rust_file_batch(
                 )
             })?;
             let target = destination.join(name);
-            if !*needs_copy {
+            let dest_is_symlink = fs::symlink_metadata(&target)
+                .map(|meta| meta.file_type().is_symlink())
+                .unwrap_or(false);
+            let mut needs_copy = *needs_copy;
+            if !needs_copy
+                && merge_collision_policy.requires_content_identity_check()
+                && source_meta.is_file()
+                && !dest_is_symlink
+                && fs::symlink_metadata(&target)
+                    .map(|meta| meta.file_type().is_file())
+                    .unwrap_or(false)
+            {
+                needs_copy = !regular_file_contents_equal(source, &target).map_err(|err| {
+                    format!("compare file contents '{}': {err}", source.display())
+                })?;
+            }
+            if !needs_copy {
                 if verify && source_meta.is_file() {
                     verify_regular_file_pair(source, &target)
                         .map_err(|err| format!("verify file '{}': {err}", source.display()))?;
@@ -204,19 +258,31 @@ pub(crate) fn run_rust_file_batch(
 
             let size = source_meta.len();
             let _permit = acquire_file_write_permit(limiter.as_ref(), size, media);
-            if replace_dest_symlink
-                && fs::symlink_metadata(&target)
-                    .map(|meta| meta.file_type().is_symlink())
-                    .unwrap_or(false)
-            {
+            if replace_dest_symlink && dest_is_symlink {
                 remove_path_local_if_exists(&target)
                     .map_err(|err| format!("remove destination '{}': {err}", target.display()))?;
             }
 
-            copy_file_preserve_with_progress_buffer(source, &target, media, buffer, |count| {
-                done.fetch_add(count, Ordering::Relaxed);
-            })
-            .map_err(|err| format!("copy file '{}': {err}", source.display()))?;
+            let copy_result = if replace_dest_symlink || !dest_is_symlink {
+                // Regular destination replacements are staged so a failed
+                // worker cannot truncate the published file. Existing final
+                // symlinks intentionally retain their documented follow
+                // semantics and therefore remain in-place writes.
+                copy_file_preserve_atomic_with_progress_buf(
+                    source,
+                    &target,
+                    media,
+                    copy_chunk_bytes_for_media(media),
+                    |count| {
+                        done.fetch_add(count, Ordering::Relaxed);
+                    },
+                )
+            } else {
+                copy_file_preserve_with_progress_buffer(source, &target, media, buffer, |count| {
+                    done.fetch_add(count, Ordering::Relaxed);
+                })
+            };
+            copy_result.map_err(|err| format!("copy file '{}': {err}", source.display()))?;
             if verify {
                 verify_regular_file_pair(source, &target)
                     .map_err(|err| format!("verify file '{}': {err}", source.display()))?;
@@ -350,6 +416,12 @@ pub(crate) fn run_multi_source_file_batch(
         merge_collision_policy,
         verify,
     );
+    if result == NONMUTATING_PREFLIGHT_FAILURE {
+        if let Err(error) = journal.abandon("source-read-preflight-failed") {
+            eprintln!("copy: cannot remove the aborted operation journal: {error}");
+        }
+        return 1;
+    }
     if result == 0 {
         if let Err(error) = journal.mark("published") {
             eprintln!("copy: transfer published but operation journal update failed: {error}");
@@ -359,6 +431,8 @@ pub(crate) fn run_multi_source_file_batch(
             eprintln!("copy: transfer succeeded but operation journal cleanup failed: {error}");
             return 1;
         }
+    } else if let Err(error) = journal.mark("failed") {
+        eprintln!("copy: cannot persist failed operation state: {error}");
     }
     result
 }
@@ -401,7 +475,7 @@ fn run_multi_source_file_batch_inner(
     let mut mod_files: u64 = 0;
     let mut display_change_preview: Vec<ChangeItem> = Vec::new();
     let mut source_top_entries: HashSet<String> = HashSet::new();
-    let mut has_itemized_changes = false;
+    let mut has_planned_changes = false;
     let mut source_rel_files: HashSet<String> = HashSet::default();
     let mut file_relation_breakdown = FileRelationBreakdown::default();
     let destination_index = build_destination_index(&dst_mnt);
@@ -468,11 +542,11 @@ fn run_multi_source_file_batch_inner(
         display_change_preview.extend(ps.change_preview);
         source_top_entries.insert(src_name.clone());
         file_relation_breakdown.add_assign(ps.file_relation_breakdown);
-        if ps.has_itemized_changes {
-            has_itemized_changes = true;
+        if ps.has_planned_changes {
+            has_planned_changes = true;
         }
         source_rel_files.insert(src_name.clone());
-        batch_items.push((src_mnt, ps.planned_bytes, ps.has_itemized_changes));
+        batch_items.push((src_mnt, ps.planned_bytes, ps.has_planned_changes));
     }
 
     let uncollided_files = destination_index
@@ -526,7 +600,24 @@ fn run_multi_source_file_batch_inner(
         return 0;
     }
 
-    let no_changes_planned = planned_bytes == 0 && !has_itemized_changes;
+    if !use_sudo && has_planned_changes {
+        let planned_sources: Vec<PathBuf> = batch_items
+            .iter()
+            .filter(|(_, _, planned)| *planned)
+            .filter_map(|(source, _, _)| {
+                fs::symlink_metadata(source)
+                    .map(|metadata| (!metadata.file_type().is_symlink()).then(|| source.clone()))
+                    .unwrap_or_else(|_| Some(source.clone()))
+            })
+            .collect();
+        let failures = preflight_source_file_reads(&planned_sources);
+        if !failures.is_empty() {
+            report_source_read_preflight_failures(requested_mode, &failures);
+            return NONMUTATING_PREFLIGHT_FAILURE;
+        }
+    }
+
+    let no_changes_planned = planned_bytes == 0 && !has_planned_changes;
     if no_changes_planned && !is_move {
         log(
             requested_mode,
@@ -722,6 +813,7 @@ fn run_multi_source_file_batch_inner(
             planned_bytes,
             media,
             replace_dest_symlink,
+            merge_collision_policy,
             requested_mode,
             verify,
         );

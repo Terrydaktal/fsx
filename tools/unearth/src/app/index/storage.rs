@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::OnceLock;
 pub(crate) fn snapshot_cache_dir() -> Option<PathBuf> {
     fsx::index::cache_dir().map(|dir| dir.join("snapshots"))
 }
@@ -7,27 +8,50 @@ pub(crate) fn unearth_cache_dir() -> Option<PathBuf> {
     fsx::index::cache_dir()
 }
 
+fn build_unearth_internal_index_paths() -> Vec<(String, String)> {
+    let Some(cache_dir) = unearth_cache_dir() else {
+        return Vec::new();
+    };
+    let mut paths = vec![cache_dir.clone()];
+    if let Ok(canonical) = cache_dir.canonicalize() {
+        if canonical != cache_dir {
+            paths.push(canonical);
+        }
+    }
+    let mut internal = paths
+        .into_iter()
+        .map(|path| {
+            let exact = normalize_index_dir(&path);
+            let prefix = index_path_prefix(&exact);
+            (exact, prefix)
+        })
+        .collect::<Vec<_>>();
+
+    let Some(database) = index_db_path() else {
+        return internal;
+    };
+    let mut sidecars = vec![database.clone()];
+    let mut wal = database.as_os_str().to_os_string();
+    wal.push("-wal");
+    sidecars.push(PathBuf::from(wal));
+    let mut shm = database.as_os_str().to_os_string();
+    shm.push("-shm");
+    sidecars.push(PathBuf::from(shm));
+    if let Some(socket) = query_socket_path() {
+        sidecars.push(socket);
+    }
+    for path in sidecars {
+        let exact = fsx::encode_lossless_path(&path);
+        // File paths must match exactly; using a directory-style prefix
+        // would accidentally exclude unrelated names sharing a prefix.
+        internal.push((exact.clone(), format!("{exact}\0")));
+    }
+    internal
+}
+
 pub(crate) fn unearth_internal_index_paths() -> &'static [(String, String)] {
     static PATHS: OnceLock<Vec<(String, String)>> = OnceLock::new();
-    PATHS.get_or_init(|| {
-        let Some(cache_dir) = unearth_cache_dir() else {
-            return Vec::new();
-        };
-        let mut paths = vec![cache_dir.clone()];
-        if let Ok(canonical) = cache_dir.canonicalize() {
-            if canonical != cache_dir {
-                paths.push(canonical);
-            }
-        }
-        paths
-            .into_iter()
-            .map(|path| {
-                let exact = normalize_index_dir(&path);
-                let prefix = index_path_prefix(&exact);
-                (exact, prefix)
-            })
-            .collect()
-    })
+    PATHS.get_or_init(build_unearth_internal_index_paths)
 }
 
 pub(crate) fn is_unearth_internal_index_path(path: &str) -> bool {
@@ -45,11 +69,17 @@ pub(crate) fn legacy_index_db_path() -> Option<PathBuf> {
 }
 
 pub(crate) fn query_socket_path() -> Option<PathBuf> {
-    Some(
-        fsx::index::cache_dir()?
-            .join("index")
-            .join(QUERY_SOCKET_NAME),
-    )
+    let directory = fsx::index::cache_dir()?.join("index");
+    let name = if std::env::var_os("FSX_INDEX_DB").is_some() {
+        let database = index_db_path()?;
+        format!(
+            "fsxd-{:016x}.sock",
+            stable_root_hash(&fsx::encode_lossless_path(&database))
+        )
+    } else {
+        QUERY_SOCKET_NAME.to_string()
+    };
+    Some(directory.join(name))
 }
 
 pub(crate) fn watch_state_covers_root(conn: &Connection, root_key: &str) -> Result<bool, String> {
@@ -202,7 +232,7 @@ pub(crate) fn print_watch_status() -> Result<(), String> {
 fn mark_dead_watch_states(conn: &Connection) -> Result<(), String> {
     let mut stmt = conn
         .prepare(
-            "SELECT root, watcher_pid, owner_boot_id, owner_starttime
+            "SELECT root, watcher_pid, owner_boot_id, owner_starttime, heartbeat
              FROM watch_state WHERE online = 1",
         )
         .map_err(|e| e.to_string())?;
@@ -213,14 +243,17 @@ fn mark_dead_watch_states(conn: &Connection) -> Result<(), String> {
                 row.get::<_, Option<i64>>(1)?,
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
             ))
         })
         .map_err(|e| e.to_string())?
         .filter_map(|row| row.ok())
-        .filter(|(_, pid, boot, starttime)| {
-            !watcher_owner_is_alive(*pid, boot.as_deref(), *starttime)
+        .filter(|(_, pid, boot, starttime, heartbeat)| {
+            let heartbeat_stale =
+                heartbeat.is_none_or(|value| unix_now().saturating_sub(value) > 30);
+            heartbeat_stale && !watcher_owner_is_alive(*pid, boot.as_deref(), *starttime)
         })
-        .map(|(root, _, _, _)| root)
+        .map(|(root, _, _, _, _)| root)
         .collect::<Vec<_>>();
     drop(stmt);
     for root in stale {
@@ -233,6 +266,65 @@ fn mark_dead_watch_states(conn: &Connection) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod watch_state_tests {
+    use super::*;
+
+    fn state_connection(heartbeat: i64) -> Connection {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE watch_state (
+                    root TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    dirty INTEGER NOT NULL,
+                    online INTEGER NOT NULL,
+                    watcher_pid INTEGER,
+                    owner_boot_id TEXT,
+                    owner_starttime INTEGER,
+                    heartbeat INTEGER,
+                    error TEXT
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO watch_state VALUES (
+                    '/tmp/root', 'running', 0, 1, 999999999,
+                    'wrong-boot', 1, ?1, NULL
+                )",
+                [heartbeat],
+            )
+            .unwrap();
+        connection
+    }
+
+    #[test]
+    fn fresh_heartbeat_prevents_false_dead_owner_transition() {
+        let connection = state_connection(unix_now());
+        mark_dead_watch_states(&connection).unwrap();
+        let state: (String, i64, i64) = connection
+            .query_row("SELECT status, dirty, online FROM watch_state", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(state, ("running".to_string(), 0, 1));
+    }
+
+    #[test]
+    fn stale_heartbeat_allows_dead_owner_transition() {
+        let connection = state_connection(unix_now() - 31);
+        mark_dead_watch_states(&connection).unwrap();
+        let state: (String, i64, i64) = connection
+            .query_row("SELECT status, dirty, online FROM watch_state", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(state, ("stopped".to_string(), 1, 0));
+    }
 }
 
 pub(crate) fn index_state_path(root_key: &str, suffix: &str) -> Option<PathBuf> {
@@ -620,7 +712,10 @@ pub(crate) fn path_age_at_least(path: &Path, min_age: Duration) -> bool {
 }
 
 pub(crate) fn write_stamp(path: &Path) {
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         let _ = fs::create_dir_all(parent);
     }
     if File::create(path).is_ok() {
@@ -630,13 +725,29 @@ pub(crate) fn write_stamp(path: &Path) {
 
 pub(crate) fn initialize_index_db() -> Result<Connection, String> {
     let path = index_db_path().ok_or_else(|| "Could not determine fsx cache dir".to_string())?;
-    if let Some(parent) = path.parent() {
+    let custom_database = std::env::var_os("FSX_INDEX_DB").is_some();
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        let parent_existed = fs::symlink_metadata(parent).is_ok();
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-            .map_err(|e| e.to_string())?;
-        if let Some(cache_root) = parent.parent() {
-            fs::set_permissions(cache_root, fs::Permissions::from_mode(0o700))
+        let metadata = fs::symlink_metadata(parent).map_err(|e| e.to_string())?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err("index database parent must be a real directory".to_string());
+        }
+        // The default cache owns its directory hierarchy. A custom database
+        // may live in a project/shared directory; never chmod an arbitrary
+        // existing ancestor just because FSX_INDEX_DB points there.
+        if !custom_database || !parent_existed {
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
                 .map_err(|e| e.to_string())?;
+        }
+        if !custom_database {
+            if let Some(cache_root) = parent.parent() {
+                fs::set_permissions(cache_root, fs::Permissions::from_mode(0o700))
+                    .map_err(|e| e.to_string())?;
+            }
         }
     }
     migrate_legacy_index(&path)?;

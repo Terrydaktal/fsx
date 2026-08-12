@@ -5,14 +5,15 @@ use crate::cli::parse_args;
 use crate::domain::{LogLevel, MergeCollisionPolicy, TransferMode};
 use crate::output::log;
 use crate::plan::{
-    create_destination_parents_path, enrich_remote_spec, parse_remote_spec, to_real_path_os,
+    create_destination_parents_path, enrich_remote_spec, parse_remote_spec,
+    reject_symlink_parent_ancestors, to_real_path_os,
 };
 use crate::transfer::{run_multi_source_file_batch, run_remote_transfer_mode};
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub(crate) fn run() -> i32 {
-    let args = match parse_args() {
+    let mut args = match parse_args() {
         Ok(a) => a,
         Err(code) => return code,
     };
@@ -23,6 +24,9 @@ pub(crate) fn run() -> i32 {
         TransferMode::Copy
     };
     let is_move = requested_mode == TransferMode::Move;
+    if is_move && !args.merge_collision_policy_explicit {
+        args.merge_collision_policy = MergeCollisionPolicy::source_always();
+    }
 
     let batch_sources: Vec<OsString> = std::iter::once(args.source.clone())
         .chain(args.extra.iter().cloned())
@@ -63,6 +67,14 @@ pub(crate) fn run() -> i32 {
         .and_then(parse_remote_spec)
         .map(enrich_remote_spec);
 
+    if destination_remote.is_none() {
+        if let Err(code) =
+            reject_symlink_parent_ancestors(Path::new(&destination_os), requested_mode)
+        {
+            return code;
+        }
+    }
+
     if args.create_destination_parents && (source_remote.is_some() || destination_remote.is_some())
     {
         log(
@@ -73,7 +85,7 @@ pub(crate) fn run() -> i32 {
         return 1;
     }
 
-    if (args.replace_dest_symlink || args.merge_collision_policy != MergeCollisionPolicy::default())
+    if (args.replace_dest_symlink || args.merge_collision_policy_explicit)
         && (use_sudo || source_remote.is_some() || destination_remote.is_some())
     {
         log(
@@ -109,10 +121,7 @@ pub(crate) fn run() -> i32 {
         );
         return 1;
     }
-    if args.sync_mode
-        && (args.replace_dest_symlink
-            || args.merge_collision_policy != MergeCollisionPolicy::default())
-    {
+    if args.sync_mode && (args.replace_dest_symlink || args.merge_collision_policy_explicit) {
         log(
             requested_mode,
             "--sync cannot be combined with collision/symlink replacement flags.",

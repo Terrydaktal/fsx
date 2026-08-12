@@ -1,5 +1,6 @@
 use super::model::{ContainsAllSpec, MountInfo, Options, SearchDirMode, SearchResult, TypeFlag};
 use super::patterns::parse_search_dir;
+use super::scan_status::record_scan_error;
 use super::{NTFS_FS_TYPES, ROOT_SIZE_SKIP_TREES};
 use crossbeam_channel::Sender;
 use jwalk::{Parallelism, WalkDir};
@@ -13,6 +14,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
 pub(crate) struct PathInfo {
     pub(crate) path: PathBuf,
     pub(crate) is_dir: bool,
@@ -119,6 +121,7 @@ fn walk_fast_inner(
         return;
     }
     let Ok(read_dir) = fs::read_dir(&dir) else {
+        record_scan_error();
         return;
     };
     let ignore_rules = if respect_ignore {
@@ -129,13 +132,17 @@ fn walk_fast_inner(
     let mut subdirs = Vec::new();
     let mut local_buf = Vec::with_capacity(512);
     for entry_res in read_dir {
-        let Ok(entry) = entry_res else { continue };
+        let Ok(entry) = entry_res else {
+            record_scan_error();
+            continue;
+        };
         let name = entry.file_name();
         let name_bytes = name.as_bytes();
         if visible_only && name_bytes.starts_with(b".") {
             continue;
         }
         let Ok(file_type) = entry.file_type() else {
+            record_scan_error();
             continue;
         };
         let path = entry.path();
@@ -299,6 +306,7 @@ fn walk_rayon_worker_inner(
         return;
     }
     let Ok(read_dir) = fs::read_dir(&dir) else {
+        record_scan_error();
         return;
     };
     let ignore_rules = if opts.respect_ignore {
@@ -309,13 +317,17 @@ fn walk_rayon_worker_inner(
     let mut subdirs = Vec::new();
     let mut local_buf = Vec::with_capacity(256);
     for entry_res in read_dir {
-        let Ok(entry) = entry_res else { continue };
+        let Ok(entry) = entry_res else {
+            record_scan_error();
+            continue;
+        };
         let name = entry.file_name();
         let name_lossy = name.to_string_lossy();
         if opts.visible_only && name_lossy.starts_with('.') {
             continue;
         }
         let Ok(file_type) = entry.file_type() else {
+            record_scan_error();
             continue;
         };
         let path = entry.path();
@@ -367,7 +379,13 @@ fn walk_rayon_worker_inner(
                     is_dir,
                     is_symlink,
                     metadata: if needs_metadata {
-                        fs::symlink_metadata(&path).ok()
+                        match fs::symlink_metadata(&path) {
+                            Ok(metadata) => Some(metadata),
+                            Err(_) => {
+                                record_scan_error();
+                                None
+                            }
+                        }
                     } else {
                         None
                     },

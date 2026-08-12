@@ -25,6 +25,7 @@ pub(crate) struct CliArgs {
     pub(crate) preview_lite: bool,
     pub(crate) replace_dest_symlink: bool,
     pub(crate) merge_collision_policy: MergeCollisionPolicy,
+    pub(crate) merge_collision_policy_explicit: bool,
 }
 pub(crate) fn usage() {
     eprintln!(
@@ -33,14 +34,13 @@ pub(crate) fn usage() {
 }
 
 fn set_merge_collision_policy(args: &mut CliArgs, policy: MergeCollisionPolicy) -> Result<(), i32> {
-    if args.merge_collision_policy != MergeCollisionPolicy::default()
-        && args.merge_collision_policy != policy
-    {
+    if args.merge_collision_policy_explicit && args.merge_collision_policy != policy {
         usage();
         eprintln!("copy: error: collision policy options are mutually exclusive");
         return Err(1);
     }
     args.merge_collision_policy = policy;
+    args.merge_collision_policy_explicit = true;
     Ok(())
 }
 
@@ -54,6 +54,7 @@ pub(crate) fn print_help() {
     println!("Supports local paths and one-sided remote rsync endpoints like user@host:/path or host:/path.");
     println!("Remote mode reads ~/.ssh/config for Host/User matching and uses rsync over SSH.");
     println!("Local mode preflight checks destination free space against planned transfer bytes (no sudo required).");
+    println!("Local Rust copy/sync also checks every planned regular source is readable before confirmation.");
     println!();
     println!("positional arguments:");
     println!("  source                Source path (file or directory). Multiple files are supported when they all map to the same destination directory.");
@@ -87,10 +88,13 @@ pub(crate) fn print_help() {
     println!("  --collision policy   Collision policy for file-vs-file conflicts inside local Rust merges.");
     println!("                        Syntax: winner:conditions");
     println!("                        winner: source | dest");
-    println!("                        conditions: always | newer | larger | size-differs");
+    println!("                        conditions: always | newer | larger | size-differs | metadata-differs");
     println!("                        Use ',' for OR and '+' for AND.");
-    println!("                        Default: source:size-differs");
-    println!("                        Examples: --collision source:always");
+    println!("                        Default for copy: source:metadata-differs");
+    println!("                        Default for move: source:always");
+    println!("                        Preview identity always compares type, size, and modification time;");
+    println!("                        the collision policy separately controls transfer.");
+    println!("                        Examples: --collision source:size-differs");
     println!("                                  --collision source:newer,larger");
     println!("                                  --collision dest:newer+larger");
     println!("  -L depth              Max depth of preview tree (default: 1).");
@@ -137,13 +141,12 @@ What is S?
   |    |   create file at T
   |    +-- existing file
   |    |   apply file collision policy:
-  |    |     default: --collision source:size-differs
-  |    |       if size(S) != size(T):
-  |    |         replace T with S
-  |    |       else:
-  |    |         keep T
+	  |    |     copy default: --collision source:metadata-differs
+	  |    |       if type, size, or modification time differs: replace T with S
+	  |    |     move default: --collision source:always
+	  |    |       replace T with S before source cleanup
   |    |     other examples:
-  |    |       --collision source:always
+  |    |       --collision source:size-differs
   |    |       --collision source:newer,larger
   |    |       --collision dest:newer+larger
   |    +-- existing directory

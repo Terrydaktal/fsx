@@ -115,6 +115,10 @@ pub(crate) struct SearchResult {
 pub(crate) struct SearchRun {
     pub(crate) lines: Vec<String>,
     pub(crate) timed_out: bool,
+    /// A filesystem walk can return usable results while skipping entries it
+    /// could not read.  Keep that distinction visible to the CLI instead of
+    /// presenting a partial result set as complete.
+    pub(crate) incomplete: bool,
 }
 
 #[derive(Clone, Debug)]

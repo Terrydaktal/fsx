@@ -478,14 +478,8 @@ pub(crate) fn color_code_for_path<'a>(
     res: &SearchResult,
     colors: &'a ColorSpec,
 ) -> Option<&'a str> {
-    let target_is_dir = res
-        .metadata
-        .as_ref()
-        .is_some_and(|metadata| metadata.is_dir());
-    let executable = res
-        .metadata
-        .as_ref()
-        .is_some_and(|metadata| metadata.permissions().mode() & 0o111 != 0);
+    let target_is_dir = target_is_dir_for_render(res);
+    let executable = executable_for_render(res);
     fsx::colors::color_code_for_path(
         &res.path,
         res.is_dir,
@@ -494,6 +488,41 @@ pub(crate) fn color_code_for_path<'a>(
         executable,
         colors,
     )
+}
+
+fn target_is_dir_for_render(res: &SearchResult) -> bool {
+    if res.is_dir {
+        return true;
+    }
+    if res.is_symlink {
+        if let Ok(metadata) = fs::metadata(result_path(&res.path, res.path_encoded)) {
+            return metadata.is_dir();
+        }
+    }
+    res.metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.is_dir())
+}
+
+fn executable_for_render(res: &SearchResult) -> bool {
+    if res.is_dir {
+        return false;
+    }
+    if let Some(metadata) = res.metadata.as_ref() {
+        return metadata.permissions().mode() & 0o111 != 0;
+    }
+
+    // Indexed results intentionally omit mode bits. Recover them only for the
+    // entries that are actually rendered, keeping indexed search metadata-light
+    // while preserving ls/tree executable classification.
+    let metadata = if res.is_symlink {
+        fs::metadata(result_path(&res.path, res.path_encoded))
+    } else {
+        fs::symlink_metadata(result_path(&res.path, res.path_encoded))
+    };
+    metadata
+        .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
 }
 
 pub(crate) fn decorator_for_res(res: &SearchResult) -> Option<char> {
@@ -518,6 +547,8 @@ pub(crate) fn decorator_for_res(res: &SearchResult) -> Option<char> {
         if m.permissions().mode() & 0o111 != 0 {
             return Some('*');
         }
+    } else if executable_for_render(res) {
+        return Some('*');
     }
     None
 }

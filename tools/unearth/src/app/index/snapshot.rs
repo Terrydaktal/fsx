@@ -104,11 +104,17 @@ fn acquire_snapshot_lock(path: &Path) -> io::Result<File> {
                 return Ok(file);
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                let stale = fs::read_to_string(path)
-                    .map(|contents| !snapshot_owner_is_alive(&contents))
-                    .unwrap_or(true);
-                if stale {
-                    let _ = fs::remove_file(path);
+                let observed = fs::read_to_string(path).unwrap_or_default();
+                if snapshot_owner_is_alive(&observed) {
+                    return Err(error);
+                }
+                // A second reader closes the stale-owner TOCTOU window: do
+                // not remove a lock that another refresher replaced after
+                // the first read.
+                if fs::read_to_string(path).unwrap_or_default() != observed {
+                    continue;
+                }
+                if fs::remove_file(path).is_ok() {
                     continue;
                 }
                 return Err(error);

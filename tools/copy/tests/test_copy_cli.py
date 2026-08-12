@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-COPY_BIN = ROOT / "copy"
+COPY_BIN = Path(os.environ.get("COPY_RS_COPY_BIN", ROOT / "copy"))
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 BACKUP_SUFFIX_RE = re.compile(r"^\d{8}-\d{6}(?:\.\d+)?$")
 
@@ -19,18 +19,21 @@ def strip_ansi(text):
 
 def run_copy(args, cwd=None, confirm=False, env=None):
     merged_env = os.environ.copy()
-    # Integration tests must not mutate the user's persisted ETA priors.
+    # Integration tests must not mutate the user's persisted ETA priors or
+    # operation journals.
     merged_env.setdefault("COPY_RS_DISABLE_ETA_PRIORS", "1")
-    if env:
-        merged_env.update(env)
-    proc = subprocess.run(
-        [str(COPY_BIN), *args],
-        cwd=str(cwd) if cwd else None,
-        input=("y\n" if confirm else "n\n"),
-        text=True,
-        capture_output=True,
-        env=merged_env,
-    )
+    with tempfile.TemporaryDirectory(prefix="copy-rs-test-state-") as state_dir:
+        merged_env["XDG_STATE_HOME"] = state_dir
+        if env:
+            merged_env.update(env)
+        proc = subprocess.run(
+            [str(COPY_BIN), *args],
+            cwd=str(cwd) if cwd else None,
+            input=("y\n" if confirm else "n\n"),
+            text=True,
+            capture_output=True,
+            env=merged_env,
+        )
     combined = f"{proc.stdout}\n{proc.stderr}".strip()
     return proc.returncode, strip_ansi(combined), proc.stdout
 
@@ -65,7 +68,10 @@ class CopyCliIntegrationTests(unittest.TestCase):
         self.assertIn("--verbose", out)
         self.assertIn("--showall", out)
         self.assertIn("--collision policy", out)
-        self.assertIn("Default: source:size-differs", out)
+        self.assertIn("Default for copy: source:metadata-differs", out)
+        self.assertIn("Default for move: source:always", out)
+        self.assertIn("metadata-differs", out)
+        self.assertIn("--collision source:size-differs", out)
         self.assertIn("--collision source:newer,larger", out)
         self.assertIn("--collision dest:newer+larger", out)
         self.assertIn("--sync", out)
@@ -109,6 +115,88 @@ class CopyCliIntegrationTests(unittest.TestCase):
                 out,
                 r"Files\s+\|\s*0\s+\|\s*0\s+\|\s*0\s+\|\s*0\s+\|\s*1\s+\|\s*0\s+\|\s*0",
                 )
+
+    def test_default_copy_skips_metadata_identical_collision(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src" / "A"
+            dst = Path(td) / "dst" / "A"
+            write_file(src / "same.txt", "source\n")
+            write_file(dst / "same.txt", "target\n")
+            same_ts = 1_700_000_000
+            os.utime(src / "same.txt", (same_ts, same_ts))
+            os.utime(dst / "same.txt", (same_ts, same_ts))
+
+            rc, out, _ = run_copy([str(src), str(dst), "-c"], confirm=True)
+            self.assertEqual(rc, 0, out)
+            self.assertEqual((dst / "same.txt").read_text(encoding="utf-8"), "target\n")
+            self.assertRegex(
+                out,
+                r"Files\s+\|\s*0\s+\|\s*0\s+\|\s*1\s+\|\s*0\s+\|\s*0\s+\|\s*0",
+            )
+            self.assertIn("Planned transfer bytes: 0 (0 B)", out)
+            self.assertIn("No changes detected; nothing to copy.", out)
+
+    def test_explicit_source_always_replaces_metadata_identical_collision(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src" / "A"
+            dst = Path(td) / "dst" / "A"
+            write_file(src / "same.txt", "source\n")
+            write_file(dst / "same.txt", "target\n")
+            same_ts = 1_700_000_000
+            os.utime(src / "same.txt", (same_ts, same_ts))
+            os.utime(dst / "same.txt", (same_ts, same_ts))
+
+            rc, out, _ = run_copy(
+                [str(src), str(dst), "-c", "--collision", "source:always"],
+                confirm=True,
+            )
+            self.assertEqual(rc, 0, out)
+            self.assertEqual((dst / "same.txt").read_text(encoding="utf-8"), "source\n")
+            self.assertRegex(
+                out,
+                r"Files\s+\|\s*0\s+\|\s*0\s+\|\s*1\s+\|\s*0\s+\|\s*0\s+\|\s*0",
+            )
+            self.assertIn("Planned transfer bytes: 7 (7 B)", out)
+
+    def test_default_copy_replaces_same_size_collision_when_mtime_differs(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src" / "A"
+            dst = Path(td) / "dst" / "A"
+            write_file(src / "same.txt", "source\n")
+            write_file(dst / "same.txt", "target\n")
+            os.utime(src / "same.txt", (1_700_000_100, 1_700_000_100))
+            os.utime(dst / "same.txt", (1_700_000_000, 1_700_000_000))
+
+            rc, out, _ = run_copy([str(src), str(dst), "-c"], confirm=True)
+            self.assertEqual(rc, 0, out)
+            self.assertEqual((dst / "same.txt").read_text(encoding="utf-8"), "source\n")
+            self.assertRegex(
+                out,
+                r"Files\s+\|\s*0\s+\|\s*1\s+\|\s*0\s+\|\s*0\s+\|\s*0\s+\|\s*0",
+            )
+
+    def test_copy_rejects_unreadable_planned_source_before_writing(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src" / "A"
+            dst = Path(td) / "dst"
+            write_file(src / "readable.txt", "readable\n")
+            unreadable = src / "unreadable.txt"
+            write_file(unreadable, "unreadable\n")
+            dst.mkdir(parents=True)
+            unreadable.chmod(0)
+
+            try:
+                rc, out, _ = run_copy([str(src), str(dst)], confirm=True)
+            finally:
+                unreadable.chmod(0o600)
+
+            self.assertEqual(rc, 1, out)
+            self.assertIn(f"Source file is not readable: '{unreadable}'", out)
+            self.assertIn("Source-read preflight failed for 1 planned file", out)
+            self.assertIn("no destination files were changed by this invocation", out)
+            self.assertIn("rerun with --sudo", out)
+            self.assertNotIn("Proceed with copy?", out)
+            self.assertFalse((dst / "A").exists())
 
     def test_copy_fails_preflight_when_destination_space_is_insufficient(self):
         with tempfile.TemporaryDirectory() as td:
@@ -364,6 +452,20 @@ class CopyCliIntegrationTests(unittest.TestCase):
             self.assertEqual(rc, 1, out)
             self.assertIn("--sync currently supports copy mode only", out)
 
+    def test_sync_mode_rejects_explicit_default_collision_policy(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src" / "A"
+            dst = Path(td) / "dst"
+            write_file(src / "f.txt", "x\n")
+            dst.mkdir(parents=True, exist_ok=True)
+            rc, out, _ = run_copy(
+                [str(src), str(dst), "--sync", "--collision", "source:always"]
+            )
+            self.assertEqual(rc, 1, out)
+            self.assertIn(
+                "--sync cannot be combined with collision/symlink replacement flags", out
+            )
+
     def test_sync_mode_rejects_file_source(self):
         with tempfile.TemporaryDirectory() as td:
             src = Path(td) / "src.txt"
@@ -390,6 +492,27 @@ class CopyCliIntegrationTests(unittest.TestCase):
             self.assertRegex(raw, rf"\x1b\[93m{re.escape(str(dst))}/\x1b\[0m")
             self.assertRegex(raw, r"\x1b\[92mone\.mkv\x1b\[0m")
             self.assertRegex(raw, r"\x1b\[92mtwo\.mkv\x1b\[0m")
+
+    def test_copy_multiple_files_preflights_all_sources_before_writing(self):
+        with tempfile.TemporaryDirectory() as td:
+            src1 = Path(td) / "readable.mkv"
+            src2 = Path(td) / "unreadable.mkv"
+            dst = Path(td) / "Videos"
+            write_file(src1, "a\n")
+            write_file(src2, "b\n")
+            dst.mkdir(parents=True, exist_ok=True)
+            src2.chmod(0)
+
+            try:
+                rc, out, _ = run_copy([str(src1), str(src2), str(dst)], confirm=True)
+            finally:
+                src2.chmod(0o600)
+
+            self.assertEqual(rc, 1, out)
+            self.assertIn(f"Source file is not readable: '{src2}'", out)
+            self.assertNotIn("Proceed with copy?", out)
+            self.assertFalse((dst / src1.name).exists())
+            self.assertFalse((dst / src2.name).exists())
 
     def test_move_multiple_files_same_fs_uses_batch_fast_rename(self):
         with tempfile.TemporaryDirectory() as td:
@@ -421,7 +544,7 @@ class CopyCliIntegrationTests(unittest.TestCase):
             self.assertFalse(src.exists(), out)
             self.assertTrue((dst / "clip.mkv").exists(), out)
 
-    def test_move_multiple_identical_files_performs_cleanup_not_noop(self):
+    def test_explicit_size_differs_move_performs_identical_cleanup_not_noop(self):
         with tempfile.TemporaryDirectory() as td:
             src1 = Path(td) / "one.mkv"
             src2 = Path(td) / "two.mkv"
@@ -430,8 +553,21 @@ class CopyCliIntegrationTests(unittest.TestCase):
             write_file(src2, "same-b\n")
             write_file(dst / "one.mkv", "same-a\n")
             write_file(dst / "two.mkv", "same-b\n")
+            same_ts = 1_700_000_000
+            for path in [src1, src2, dst / "one.mkv", dst / "two.mkv"]:
+                os.utime(path, (same_ts, same_ts))
 
-            rc, out, _ = run_copy(["--move", str(src1), str(src2), str(dst)], confirm=True)
+            rc, out, _ = run_copy(
+                [
+                    "--move",
+                    "--collision",
+                    "source:size-differs",
+                    str(src1),
+                    str(src2),
+                    str(dst),
+                ],
+                confirm=True,
+            )
             self.assertEqual(rc, 0, out)
             self.assertFalse(src1.exists(), out)
             self.assertFalse(src2.exists(), out)
@@ -525,22 +661,25 @@ class CopyCliIntegrationTests(unittest.TestCase):
             self.assertTrue((videos / "obs" / "keep.txt").exists(), out)
             self.assertFalse((videos / "obs" / "obs").exists(), out)
 
-    def test_move_merge_identical_destination_still_removes_source(self):
+    def test_move_default_replaces_same_size_collision_before_source_cleanup(self):
         with tempfile.TemporaryDirectory() as td:
             src = Path(td) / "src" / "A"
             dst_root = Path(td) / "dst"
             dst = dst_root / "A"
-            write_file(src / "same.txt", "payload\n")
-            write_file(dst / "same.txt", "payload\n")
+            write_file(src / "same.txt", "source\n")
+            write_file(dst / "same.txt", "target\n")
+            same_ts = 1_700_000_000
+            os.utime(src / "same.txt", (same_ts, same_ts))
+            os.utime(dst / "same.txt", (same_ts, same_ts))
 
             rc, out, _ = run_copy(["--move", str(src), str(dst_root)], confirm=True)
             self.assertEqual(rc, 0, out)
             self.assertRegex(out, r"Files\s+\|\s*0\s+\|\s*0\s+\|\s*1\s+\|\s*0\s+\|\s*1\s+\|\s*0")
             self.assertFalse(src.exists(), out)
             self.assertTrue((dst / "same.txt").exists(), out)
-            self.assertIn("Starting move cleanup:", out)
-            self.assertNotIn("Starting move (", out)
-            self.assertNotIn("Progress: ---%", out)
+            self.assertEqual((dst / "same.txt").read_text(encoding="utf-8"), "source\n")
+            self.assertIn("Starting cleanup", out)
+            self.assertIn("Starting move (rust backend)", out)
             self.assertIn("Delete", out)
             self.assertIn("Cleanup Duration:", out)
             self.assertIn("Cleanup Flush Duration:", out)
@@ -627,7 +766,16 @@ class CopyCliIntegrationTests(unittest.TestCase):
             dst.mkdir(parents=True, exist_ok=True)
             os.symlink("target.txt", dst / "link.txt")
 
-            rc, out, _ = run_copy(["--move", str(src), str(dst_root)], confirm=True)
+            rc, out, _ = run_copy(
+                [
+                    "--move",
+                    "--collision",
+                    "source:size-differs",
+                    str(src),
+                    str(dst_root),
+                ],
+                confirm=True,
+            )
             self.assertEqual(rc, 0, out)
             self.assertIn("Starting move cleanup:", out)
             self.assertFalse(src.exists(), out)
@@ -676,6 +824,18 @@ class CopyCliIntegrationTests(unittest.TestCase):
             self.assertEqual(rc, 0, out)
             self.assertTrue((dst / "new.txt").exists())
             self.assertFalse((dst / "old.txt").exists())
+
+    def test_copy_overwrite_nested_target_does_not_duplicate_basename(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src" / "poo"
+            dst = Path(td) / "dst" / "root" / "poo"
+            write_file(src / "new.txt", "new\n")
+            write_file(dst / "old.txt", "old\n")
+            rc, out, _ = run_copy(["-o", str(src), str(dst.parent)], confirm=True)
+            self.assertEqual(rc, 0, out)
+            self.assertTrue((dst / "new.txt").exists(), out)
+            self.assertFalse((dst / "poo" / "new.txt").exists(), out)
+            self.assertFalse((dst / "old.txt").exists(), out)
 
     def test_overwrite_explicit_destination_with_contents_only_replaces_path(self):
         with tempfile.TemporaryDirectory() as td:
@@ -837,8 +997,20 @@ class CopyCliIntegrationTests(unittest.TestCase):
             write_file(src / "new.txt", "new\n")
             write_file(dst / "same.txt", "same\n")
             write_file(dst / "extra.txt", "extra\n")
+            same_ts = 1_700_000_000
+            os.utime(src / "same.txt", (same_ts, same_ts))
+            os.utime(dst / "same.txt", (same_ts, same_ts))
 
-            rc, out, raw = run_copy([str(src), str(dst), "-c", "--showall", "-L", "1"])
+            rc, out, raw = run_copy(
+                [
+                    str(src),
+                    str(dst),
+                    "-c",
+                    "--showall",
+                    "-L",
+                    "1",
+                ]
+            )
             self.assertEqual(rc, 0, out)
             self.assertIn("same.txt", out)
             self.assertIn("extra.txt", out)
@@ -855,9 +1027,23 @@ class CopyCliIntegrationTests(unittest.TestCase):
                 write_file(src / f"n{i:02d}.txt", "new\n")
                 write_file(src / f"i{i:02d}.txt", "same\n")
                 write_file(dst / f"i{i:02d}.txt", "same\n")
+                same_ts = 1_700_000_000
+                os.utime(src / f"i{i:02d}.txt", (same_ts, same_ts))
+                os.utime(dst / f"i{i:02d}.txt", (same_ts, same_ts))
                 write_file(dst / f"u{i:02d}.txt", "unchanged\n")
 
-            rc, out, _ = run_copy([str(src), str(dst), "-c", "--showall", "-L", "1", "-T", "100"])
+            rc, out, _ = run_copy(
+                [
+                    str(src),
+                    str(dst),
+                    "-c",
+                    "--showall",
+                    "-L",
+                    "1",
+                    "-T",
+                    "100",
+                ]
+            )
             self.assertEqual(rc, 0, out)
             rows = [
                 line[4:]
@@ -908,8 +1094,19 @@ class CopyCliIntegrationTests(unittest.TestCase):
             write_file(src / "new.txt", "new\n")
             write_file(dst / "same.txt", "same\n")
             write_file(dst / "extra.txt", "extra\n")
+            same_ts = 1_700_000_000
+            os.utime(src / "same.txt", (same_ts, same_ts))
+            os.utime(dst / "same.txt", (same_ts, same_ts))
 
-            rc, out, _ = run_copy([str(src), str(dst), "-c", "-L", "1"])
+            rc, out, _ = run_copy(
+                [
+                    str(src),
+                    str(dst),
+                    "-c",
+                    "-L",
+                    "1",
+                ]
+            )
             self.assertEqual(rc, 0, out)
             self.assertIn("new.txt", out)
             self.assertNotIn("same.txt", out)
@@ -1031,6 +1228,9 @@ class CopyCliIntegrationTests(unittest.TestCase):
             write_file(dst / "data" / "same.txt", "same\n")
             write_file(dst / "other" / "keep1.txt", "k1\n")
             write_file(dst / "other" / "keep2.txt", "k2\n")
+            same_ts = 1_700_000_000
+            os.utime(src / "data" / "same.txt", (same_ts, same_ts))
+            os.utime(dst / "data" / "same.txt", (same_ts, same_ts))
 
             rc, out, _ = run_copy([str(src), str(dst), "-c"])
             self.assertEqual(rc, 0, out)

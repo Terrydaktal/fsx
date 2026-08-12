@@ -74,6 +74,75 @@ pub(crate) fn realpath_allow_missing(input: &Path) -> PathBuf {
     fsx::path::realpath_preserve_final_symlink(input)
 }
 
+/// Reject an intermediate destination symlink before canonicalisation.
+/// Existing final symlinks remain supported unless replacement is requested,
+/// but following a parent symlink can redirect writes outside the requested tree.
+pub(crate) fn reject_symlink_parent_ancestors(value: &Path, mode: TransferMode) -> Result<(), i32> {
+    let expanded = if value.is_relative() {
+        env::current_dir()
+            .map(|cwd| cwd.join(value))
+            .unwrap_or_else(|_| value.to_path_buf())
+    } else {
+        value.to_path_buf()
+    };
+    let expanded = fsx::path::normalize_lexical(&expanded);
+    let parent = expanded.parent().unwrap_or_else(|| Path::new("/"));
+    let mut current = if parent.is_absolute() {
+        PathBuf::from("/")
+    } else {
+        PathBuf::from(".")
+    };
+    for component in parent.components() {
+        use std::path::Component;
+        match component {
+            Component::RootDir | Component::Prefix(_) | Component::CurDir => continue,
+            Component::ParentDir => {
+                current.pop();
+                continue;
+            }
+            Component::Normal(name) => current.push(name),
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                log(
+                    mode,
+                    &format!(
+                        "Destination parent contains a symlink; refusing to follow: {}",
+                        current.display()
+                    ),
+                    LogLevel::Error,
+                );
+                return Err(1);
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                log(
+                    mode,
+                    &format!(
+                        "Destination parent is not a directory: {}",
+                        current.display()
+                    ),
+                    LogLevel::Error,
+                );
+                return Err(1);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+            Err(error) => {
+                log(
+                    mode,
+                    &format!(
+                        "Could not inspect destination parent {}: {error}",
+                        current.display()
+                    ),
+                    LogLevel::Error,
+                );
+                return Err(1);
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn to_real_path(value: &str) -> PathBuf {
     let expanded = expand_user(value);
     realpath_allow_missing(Path::new(&expanded))

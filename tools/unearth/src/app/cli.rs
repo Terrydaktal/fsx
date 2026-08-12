@@ -256,9 +256,9 @@ fn inline_option_value(value: &OsString, option: &str) -> Option<OsString> {
     {
         let prefix = format!("{option}=");
         let bytes = value.as_os_str().as_bytes();
-        return bytes
+        bytes
             .strip_prefix(prefix.as_bytes())
-            .map(|value| OsString::from_vec(value.to_vec()));
+            .map(|value| OsString::from_vec(value.to_vec()))
     }
     #[cfg(not(unix))]
     {
@@ -948,7 +948,7 @@ pub(crate) fn cli_main() -> ExitCode {
     };
     match result {
         Ok(run) => {
-            if (opts.snapshot_cache || opts.snapshot_refresh) && !run.timed_out {
+            if (opts.snapshot_cache || opts.snapshot_refresh) && !run.timed_out && !run.incomplete {
                 if let Some(path) = snapshot_path.as_deref() {
                     if let Err(e) = write_snapshot_cache(path, &run.lines) {
                         eprintln!("unearth: failed to write snapshot cache: {}", e);
@@ -959,7 +959,7 @@ pub(crate) fn cli_main() -> ExitCode {
                 if let Some(path) = snapshot_path.as_deref() {
                     let _ = fs::remove_file(snapshot_lock_path(path));
                 }
-                return if run.timed_out {
+                return if run.timed_out || run.incomplete {
                     ExitCode::from(1)
                 } else {
                     ExitCode::SUCCESS
@@ -990,6 +990,9 @@ pub(crate) fn cli_main() -> ExitCode {
             }
             if run.timed_out {
                 eprintln!("unearth: search timed out; results are incomplete");
+                ExitCode::from(1)
+            } else if run.incomplete {
+                eprintln!("unearth: search could not read every entry; results are incomplete");
                 ExitCode::from(1)
             } else {
                 ExitCode::SUCCESS

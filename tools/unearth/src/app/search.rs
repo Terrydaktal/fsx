@@ -12,6 +12,7 @@ use super::presentation::{
     final_transform, init_raw_cache_state, render_styled_path, style_enabled, RenderCache,
     RenderContext,
 };
+use super::{live_scan_incomplete, reset_live_scan_errors};
 use crossbeam_channel::{bounded, Sender};
 use rayon::prelude::*;
 use regex::{Regex, RegexBuilder};
@@ -55,6 +56,7 @@ pub(crate) fn run_standard(
     cache: &mut DirStatsCache,
     colors: &ColorSpec,
 ) -> Result<SearchRun, String> {
+    reset_live_scan_errors();
     let stdout_is_tty = io::stdout().is_terminal();
     let use_style = style_enabled(opts, stdout_is_tty);
     let name = parse_name_pattern(&opts.positional[0], opts.regex_mode);
@@ -213,6 +215,7 @@ pub(crate) fn run_standard(
         return Ok(SearchRun {
             lines: Vec::new(),
             timed_out: timeout_triggered.load(Ordering::Relaxed) && !stopped_by_limit,
+            incomplete: live_scan_incomplete(),
         });
     }
 
@@ -326,6 +329,7 @@ pub(crate) fn run_standard(
             highlight_spec.as_ref(),
         ),
         timed_out: timeout_triggered.load(Ordering::Relaxed),
+        incomplete: live_scan_incomplete(),
     })
 }
 
@@ -335,6 +339,7 @@ pub(crate) fn run_contains_all(
     cache: &mut DirStatsCache,
     colors: &ColorSpec,
 ) -> Result<SearchRun, String> {
+    reset_live_scan_errors();
     let stdout_is_tty = io::stdout().is_terminal();
     let use_style = style_enabled(opts, stdout_is_tty);
     let timeout_triggered = Arc::new(AtomicBool::new(false));
@@ -364,6 +369,7 @@ pub(crate) fn run_contains_all(
         return Ok(SearchRun {
             lines: Vec::new(),
             timed_out: false,
+            incomplete: live_scan_incomplete(),
         });
     }
     let compiled_regexes: Vec<Regex> = regexes
@@ -442,6 +448,7 @@ pub(crate) fn run_contains_all(
             highlight_spec.as_ref(),
         ),
         timed_out: timeout_triggered.load(Ordering::Relaxed),
+        incomplete: live_scan_incomplete(),
     })
 }
 
@@ -450,6 +457,7 @@ pub(crate) fn run_full(
     cache: &mut DirStatsCache,
     colors: &ColorSpec,
 ) -> Result<SearchRun, String> {
+    reset_live_scan_errors();
     let stdout_is_tty = io::stdout().is_terminal();
     let use_style = style_enabled(opts, stdout_is_tty);
     let mut search_root = ".".to_string();
@@ -482,6 +490,7 @@ pub(crate) fn run_full(
         return Ok(SearchRun {
             lines: Vec::new(),
             timed_out: false,
+            incomplete: false,
         });
     }
     let compiled_regexes: Vec<Regex> = pattern_specs
@@ -583,6 +592,7 @@ pub(crate) fn run_full(
         return Ok(SearchRun {
             lines: Vec::new(),
             timed_out: timeout_triggered.load(Ordering::Relaxed) && !stopped_by_limit,
+            incomplete: live_scan_incomplete(),
         });
     }
     let mut rows = Vec::new();
@@ -625,5 +635,6 @@ pub(crate) fn run_full(
             highlight_spec.as_ref(),
         ),
         timed_out: timeout_triggered.load(Ordering::Relaxed),
+        incomplete: live_scan_incomplete(),
     })
 }

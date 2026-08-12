@@ -5,7 +5,10 @@ use super::command::run_command_capture;
 use super::copy_engine::{ensure_no_symlink_ancestors, remove_path_local_if_exists};
 use crate::domain::{DeleteCleanupOutcome, LogLevel, SrcObjKind, TransferManifest, TransferMode};
 use crate::output::log;
-use crate::plan::{map_dir_dest_path, normalize_rel, rel_matches_prefix};
+use crate::plan::{
+    map_dir_dest_path, map_dir_dest_relative_path, mtimes_equal_precision_aware, normalize_rel,
+    rel_matches_prefix,
+};
 use crate::runtime::symlink_targets_equal;
 use jwalk::WalkDir;
 use std::fs;
@@ -130,7 +133,10 @@ pub(crate) fn delete_sync_destination_extras(
                     meta.dev() == entry.dev
                         && meta.ino() == entry.ino
                         && meta.len() == entry.size
-                        && (entry.mtime.is_none() || meta.modified().ok() == entry.mtime)
+                        && (entry.mtime.is_none()
+                            || meta.modified().ok().zip(entry.mtime).is_some_and(
+                                |(actual, expected)| mtimes_equal_precision_aware(actual, expected),
+                            ))
                 };
                 if !same_identity {
                     return Err(io::Error::other(format!(
@@ -329,7 +335,13 @@ pub(crate) fn cleanup_source_dirs_from_manifest(
         {
             continue;
         }
-        if let Err(err) = fs::remove_dir(src_root.join(rel)) {
+        let source_dir = manifest
+            .dir_times
+            .iter()
+            .find(|entry| entry.rel == *rel)
+            .map(|entry| src_root.join(&entry.relative_path))
+            .unwrap_or_else(|| src_root.join(rel));
+        if let Err(err) = fs::remove_dir(source_dir) {
             if err.kind() != io::ErrorKind::NotFound
                 && err.kind() != io::ErrorKind::DirectoryNotEmpty
             {
@@ -463,9 +475,22 @@ pub(crate) fn prune_move_source_duplicates(
                         {
                             continue;
                         }
-                        let src_file = src_root.join(entry.rel.as_ref());
-                        let dst_item =
-                            map_dir_dest_path(include_root, &src_base, &entry.rel, dst_base);
+                        let src_file = entry.source_path.clone().unwrap_or_else(|| {
+                            entry
+                                .relative_path
+                                .as_deref()
+                                .map(|path| src_root.join(path))
+                                .unwrap_or_else(|| src_root.join(entry.rel.as_ref()))
+                        });
+                        let dst_item = entry
+                            .relative_path
+                            .as_deref()
+                            .map(|rel| {
+                                map_dir_dest_relative_path(include_root, &src_base, rel, dst_base)
+                            })
+                            .unwrap_or_else(|| {
+                                map_dir_dest_path(include_root, &src_base, &entry.rel, dst_base)
+                            });
                         if src_file == dst_item {
                             continue;
                         }
@@ -481,7 +506,11 @@ pub(crate) fn prune_move_source_duplicates(
                             && (entry.is_symlink || src_md.len() == entry.size)
                             && (entry.is_symlink
                                 || entry.mtime.is_none()
-                                || src_md.modified().ok() == entry.mtime);
+                                || src_md.modified().ok().zip(entry.mtime).is_some_and(
+                                    |(actual, expected)| {
+                                        mtimes_equal_precision_aware(actual, expected)
+                                    },
+                                ));
                         if !source_unchanged {
                             continue;
                         }

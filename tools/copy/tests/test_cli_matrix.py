@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import os
 import re
 import subprocess
 import tempfile
@@ -7,7 +8,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-COPY_BIN = ROOT / "copy"
+COPY_BIN = Path(os.environ.get("COPY_RS_COPY_BIN", ROOT / "copy"))
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
@@ -16,13 +17,18 @@ def strip_ansi(text):
 
 
 def run_copy(args, cwd=None):
-    proc = subprocess.run(
-        [str(COPY_BIN), *args],
-        cwd=str(cwd) if cwd else None,
-        input="n\n",
-        text=True,
-        capture_output=True,
-    )
+    env = os.environ.copy()
+    env.setdefault("COPY_RS_DISABLE_ETA_PRIORS", "1")
+    with tempfile.TemporaryDirectory(prefix="copy-rs-test-state-") as state_dir:
+        env["XDG_STATE_HOME"] = state_dir
+        proc = subprocess.run(
+            [str(COPY_BIN), *args],
+            cwd=str(cwd) if cwd else None,
+            input="n\n",
+            text=True,
+            capture_output=True,
+            env=env,
+        )
     combined = f"{proc.stdout}\n{proc.stderr}".strip()
     return proc.returncode, strip_ansi(combined), proc.stdout
 

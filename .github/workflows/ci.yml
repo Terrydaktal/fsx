@@ -12,21 +12,60 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Test workspace
         run: cargo test --workspace --all-targets --all-features
-      - name: Clippy
-        # The legacy tools intentionally retain a few layout-oriented and
-        # type-complexity patterns; keep CI informative without making those
-        # non-safety lints block builds.
-        run: cargo clippy --workspace --all-targets --all-features -- -W clippy::all
+      - name: Measure line and branch coverage
+        run: bash tools/copy/tests/coverage.sh
+      - name: Clippy (strict workspace)
+        # Keep correctness and safety lints blocking. The explicit exceptions
+        # are the legacy presentation-style patterns being removed as the
+        # oversized Tree/Twig modules are decomposed; they do not hide new
+        # lint classes or the shared fsx policy boundary.
+        run: >-
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          -A clippy::collapsible-if
+          -A clippy::default-constructed-unit-structs
+          -A clippy::write-literal
+          -A clippy::type-complexity
+          -A clippy::too-many-arguments
+          -A clippy::manual-clamp
+          -A clippy::map-clone
+          -A clippy::redundant-closure
+          -A clippy::collapsible-else-if
+          -A clippy::needless-return
+          -A clippy::needless-borrows-for-generic-args
+          -A clippy::unnecessary-filter-map
+          -A clippy::question-mark
+          -A clippy::unnecessary-cast
       - name: Release build
         run: cargo build --workspace --all-targets --all-features --release
+      - name: Copy integration tests
+        run: python3 -m unittest discover -s tools/copy/tests -v
+      - name: Copy privileged fault harness (syntax and safety gate)
+        run: bash tools/copy/tests/test_copy_linux_faults.sh
+      - name: Output contract integration tests
+        run: python3 -m unittest discover -s tests/output_contract -v
+      - name: Unearth integration tests
+        run: |
+          bash tools/unearth/tests/help_matrix.sh
+          bash tools/unearth/tests/live_watcher.sh
+      - name: Dependency audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
 
   shell:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Check shell scripts
-        run: shellcheck tools/copy/copy
+        run: >-
+          shellcheck tools/copy/copy tools/copy/tests/test_copy_linux_faults.sh
+          tools/copy/tests/coverage.sh
+          tools/unearth/tests/help_matrix.sh tools/unearth/tests/live_watcher.sh

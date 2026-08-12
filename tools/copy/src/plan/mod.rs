@@ -5,18 +5,19 @@ mod resolve;
 mod scanner;
 
 pub(crate) use policy::{
-    classify_file_relation, parse_merge_collision_policy, regular_file_collision_change,
-    sync_regular_file_change,
+    classify_file_relation, mtimes_equal_precision_aware, parse_merge_collision_policy,
+    regular_file_collision_change, regular_file_relation_change,
 };
 pub(crate) use resolve::{
     can_fast_rename_same_fs, create_destination_parents_path, destination_available_bytes,
     endpoint_to_rsync, enrich_remote_spec, existing_probe_path, parse_remote_spec,
-    realpath_allow_missing, resolve_destination_for_dir, resolve_destination_for_dir_path,
-    resolve_destination_for_file, resolve_destination_for_file_path, resolve_source,
-    resolve_source_path, to_real_path, to_real_path_os,
+    realpath_allow_missing, reject_symlink_parent_ancestors, resolve_destination_for_dir,
+    resolve_destination_for_dir_path, resolve_destination_for_file,
+    resolve_destination_for_file_path, resolve_source, resolve_source_path, to_real_path,
+    to_real_path_os,
 };
 pub(crate) use scanner::{
-    build_destination_index, count_tree_any, map_dir_dest, map_dir_dest_path, normalize_rel,
-    pre_scan_directory, pre_scan_file, rel_matches_prefix, top_level_rel_component,
-    DestinationKind,
+    build_destination_index, count_tree_any, map_dir_dest, map_dir_dest_path,
+    map_dir_dest_relative_path, normalize_rel, pre_scan_directory, pre_scan_file,
+    rel_matches_prefix, top_level_rel_component, DestinationKind,
 };

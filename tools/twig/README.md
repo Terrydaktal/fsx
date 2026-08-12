@@ -11,7 +11,7 @@
 3. `--cache-raw` writes full directory/file path lists to `/tmp/fzf-history-$USER/universal-last-{dirs,files}-<fish_pid>`, allowing quick access to listed files with a fuzzy picker.
 4. `-c`, `--counts` – recursive directory/file count columns. Supports `--sort dircount` and `--sort filecount`.
 5. `eza` `--git-repos` and `--git` are combined into a smart `--git` flag that shows either or both columns when relevant
-6. Hyperlinks use the shared Unearth-compatible `file://` format. In `-X` / `--absolute`, `twig` splits the prefix and basename into separate links: the prefix selects the entry in its parent and the basename opens the entry. Basename-only listings link directly to the entry.
+6. Hyperlinks use the shared Unearth-compatible `file://` format. The synthetic `../` entry uses PCManFM's `?select=` form so the grandparent opens with the parent directory highlighted; ordinary entries link directly to themselves. In `-X` / `--absolute`, `twig` splits the prefix and basename into separate links while preserving that `../` special case.
 7. `-x`, `--show-targets` – explicit flag to display symlink targets (usable outside long mode).
 8. Symlink targets are rendered/styled separately and can be hyperlinked independently. The hyperlink is also split; the prefix is coloured white and styled separately from the `LS_COLORS` scheme.
 9. Column order follows flag order from `argv`, including compact short bundles. `-l` is expanded into ordered `p,s,o,t` at parse time, so later flags append after it.
@@ -250,7 +250,7 @@ Shown only for directory entries that are Git roots:
   - Basename uses `LS_COLORS`
   - If `-F` and target is a directory, target suffix `/` is shown
 - Broken symlink rows are highlighted with red background and white foreground.
-- Hyperlink mode can hyperlink link name and target path independently.
+- Hyperlink mode can hyperlink link name and target path independently. Ordinary directory links open directly; only the synthetic `../` entry selects its target in the target's parent using PCManFM's `?select=` URI form.
 
 ## LS_COLORS Integration
 

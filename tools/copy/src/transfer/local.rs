@@ -1,6 +1,7 @@
 //! Local Rust-backend transfer execution and worker coordination.
 #![allow(clippy::too_many_arguments)]
 
+use super::content::regular_file_contents_equal;
 use super::copy_engine::{
     copy_file_preserve_atomic_with_progress_buf, copy_file_preserve_with_progress_buf,
     copy_hardlink_atomic, copy_symlink_atomic, ensure_directory_target, interrupted,
@@ -16,8 +17,8 @@ use crate::output::{
     log, print_transfer_columns_header, print_transfer_progress_bars, TransferEtaEstimator,
 };
 use crate::plan::{
-    map_dir_dest, normalize_rel, regular_file_collision_change, rel_matches_prefix,
-    sync_regular_file_change,
+    map_dir_dest, map_dir_dest_relative_path, normalize_rel, regular_file_collision_change,
+    regular_file_relation_change, rel_matches_prefix,
 };
 use crate::runtime::{
     acquire_file_write_permit, copy_chunk_bytes_for_media, inflight_max_bytes_for_media,
@@ -313,7 +314,7 @@ pub(crate) fn run_rust_transfer(
             };
             let dst_size = dst_meta.as_ref().map(|m| m.len());
             let dst_mtime = dst_meta.as_ref().and_then(|m| m.modified().ok());
-            let needs_copy = regular_file_collision_change(
+            let mut needs_copy = regular_file_collision_change(
                 merge_collision_policy,
                 src_meta.len(),
                 src_mtime,
@@ -322,6 +323,24 @@ pub(crate) fn run_rust_transfer(
                 dst_mtime,
             )
             .is_some();
+            if !needs_copy
+                && merge_collision_policy.requires_content_identity_check()
+                && dst_exists
+                && !dst_is_symlink
+            {
+                match regular_file_contents_equal(src, dst) {
+                    Ok(equal) => needs_copy = !equal,
+                    Err(err) => {
+                        remember_transfer_error(
+                            &transfer_errors,
+                            "compare file contents",
+                            src,
+                            &err,
+                        );
+                        finish_transfer!(1);
+                    }
+                }
+            }
             if needs_copy {
                 let _permit =
                     acquire_file_write_permit(inflight_limiter.as_ref(), src_meta.len(), media);
@@ -392,8 +411,23 @@ pub(crate) fn run_rust_transfer(
             }
 
             if let Some(m) = manifest {
+                let dir_paths: FxHashMap<&str, &Path> = m
+                    .dir_times
+                    .iter()
+                    .map(|entry| (entry.rel.as_str(), entry.relative_path.as_path()))
+                    .collect();
                 for (dir_index, rel) in m.dirs.iter().enumerate() {
-                    let (dst_dir, _) = map_dir_dest(include_root, &src_base, rel, dst_base);
+                    let dst_dir = dir_paths
+                        .get(rel.as_str())
+                        .map(|relative_path| {
+                            map_dir_dest_relative_path(
+                                include_root,
+                                &src_base,
+                                relative_path,
+                                dst_base,
+                            )
+                        })
+                        .unwrap_or_else(|| map_dir_dest(include_root, &src_base, rel, dst_base).0);
                     if let Err(err) = ensure_directory_target(&dst_dir, sync_mode) {
                         remember_transfer_error(
                             &transfer_errors,
@@ -416,9 +450,27 @@ pub(crate) fn run_rust_transfer(
                     .par_iter()
                     .enumerate()
                     .map(|(file_index, entry)| {
-                        let src_file = src_root.join(&*entry.rel);
+                        let src_file = entry.source_path.clone().unwrap_or_else(|| {
+                            entry
+                                .relative_path
+                                .as_deref()
+                                .map(|path| src_root.join(path))
+                                .unwrap_or_else(|| src_root.join(entry.rel.as_ref()))
+                        });
                         let (dst_item, _) =
-                            map_dir_dest(include_root, &src_base, &entry.rel, dst_base);
+                            if let Some(relative_path) = entry.relative_path.as_deref() {
+                                (
+                                    map_dir_dest_relative_path(
+                                        include_root,
+                                        &src_base,
+                                        relative_path,
+                                        dst_base,
+                                    ),
+                                    String::new(),
+                                )
+                            } else {
+                                map_dir_dest(include_root, &src_base, &entry.rel, dst_base)
+                            };
                         let src_md = match fs::symlink_metadata(&src_file) {
                             Ok(md) => md,
                             Err(err) => {
@@ -531,8 +583,8 @@ pub(crate) fn run_rust_transfer(
                             };
                             let dst_size = dst_meta.as_ref().map(|m| m.len());
                             let dst_mtime = dst_meta.as_ref().and_then(|m| m.modified().ok());
-                            let needs_copy = if sync_mode {
-                                sync_regular_file_change(
+                            let mut needs_copy = if sync_mode {
+                                regular_file_relation_change(
                                     src_md.len(),
                                     src_mtime,
                                     dst_is_regular_file,
@@ -551,6 +603,25 @@ pub(crate) fn run_rust_transfer(
                                 )
                                 .is_some()
                             };
+                            if !needs_copy
+                                && !sync_mode
+                                && merge_collision_policy.requires_content_identity_check()
+                                && dst_is_regular_file
+                                && !dst_is_symlink
+                            {
+                                match regular_file_contents_equal(&src_file, &dst_item) {
+                                    Ok(equal) => needs_copy = !equal,
+                                    Err(err) => {
+                                        remember_transfer_error(
+                                            &transfer_errors,
+                                            "compare file contents",
+                                            &src_file,
+                                            &err,
+                                        );
+                                        return false;
+                                    }
+                                }
+                            }
                             if !needs_copy {
                                 if verify {
                                     if let Err(err) = verify_regular_file_pair(&src_file, &dst_item)

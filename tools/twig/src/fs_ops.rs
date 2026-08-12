@@ -7,9 +7,24 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+#[path = "fsx_scan.rs"]
+mod fsx_scan;
+pub(crate) use fsx_scan::{RecursiveStats, collect_recursive_stats_checked};
+
 const NTFS_FS_TYPES: [&str; 3] = ["ntfs", "ntfs3", "fuseblk"];
+
+static RECURSIVE_SCAN_INCOMPLETE: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn reset_recursive_scan_status() {
+    RECURSIVE_SCAN_INCOMPLETE.store(false, Ordering::Relaxed);
+}
+
+pub(crate) fn recursive_scan_incomplete() -> bool {
+    RECURSIVE_SCAN_INCOMPLETE.load(Ordering::Relaxed)
+}
 
 #[derive(Clone)]
 pub(crate) struct MountInfo {
@@ -757,18 +772,13 @@ fn collect_recursive_stats_ntfs(
     )
 }
 
-pub(crate) fn collect_recursive_stats(
+fn collect_recursive_stats_legacy(
     base_path: &Path,
     show_hidden: bool,
     dedupe_hardlinks: bool,
     need_sizes: bool,
     need_counts: bool,
-) -> (
-    HashMap<OsString, u64>,
-    HashMap<OsString, (u64, u64)>,
-    Option<u64>,
-    Option<(u64, u64)>,
-) {
+) -> RecursiveStats {
     if !need_sizes && !need_counts {
         return (HashMap::new(), HashMap::new(), None, None);
     }
@@ -1162,12 +1172,12 @@ mod tests {
         fs::write(root.join("a/data"), b"shared inode").unwrap();
         fs::hard_link(root.join("a/data"), root.join("b/data")).unwrap();
 
-        let (sizes, _, root_size, _) = collect_recursive_stats(&root, true, true, true, false);
+        let (sizes, _, root_size, _) =
+            collect_recursive_stats_checked(&root, true, true, true, false).unwrap();
         let root_allocated = on_disk_size(&fs::symlink_metadata(&root).unwrap());
         let a_allocated = on_disk_size(&fs::symlink_metadata(root.join("a")).unwrap());
         let b_allocated = on_disk_size(&fs::symlink_metadata(root.join("b")).unwrap());
         let data_allocated = on_disk_size(&fs::symlink_metadata(root.join("a/data")).unwrap());
-
         assert_eq!(
             sizes.get(OsStr::new("a")).copied(),
             Some(a_allocated + data_allocated)

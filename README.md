@@ -30,11 +30,13 @@ Twig and Unearth also share the `ls`-style modified/activity timestamp layout
 and dim terminal style, so equivalent long-output columns do not drift between
 the listing and search tools.
 
-Traversal remains specialized by design. Tree keeps its hierarchical
-`process_read_dir` scan, Twig keeps its shallow parallel and NTFS/MFT
-aggregation, Unearth keeps its streaming/indexed search pipeline, and Copy
-keeps its one-pass transfer planner. fsx supplies the shared facts and policies
-without forcing these different workloads through one generic walker.
+Traversal policy is shared wherever the workload permits it. Twig's ordinary
+filesystem aggregation now consumes `fsx::scan`, including its symlink,
+hardlink, and completion/error contract; Unearth's live walker exposes the same
+incomplete-result distinction. Tree's hierarchical renderer, Twig's NTFS/MFT
+fast path, Unearth's streaming/indexed pipeline, and Copy's one-pass planner
+retain specialized traversal where their output or transfer semantics require
+it, but they no longer silently invent different ordinary-walk error policies.
 
 The live index owner is the `fsxd` daemon. Its canonical database and socket
 live under `$XDG_CACHE_HOME/fsx/index` or `~/.cache/fsx/index`; the old
@@ -61,7 +63,8 @@ The feature matrix is intentionally narrow:
 Raw path output is written to `/tmp/fzf-history-$USER/universal-last-dirs-$fish_pid`
 and `universal-last-files-$fish_pid` with private directory/file permissions.
 `FISH_PID` is accepted as a compatibility fallback when the shell does not
-export fish's lowercase variable.
+export fish's lowercase variable. Writers serialize per shell PID and skip
+newline-containing names rather than corrupting the line-delimited cache.
 
 Copy's local backend additionally uses durable operation journals under
 `$XDG_STATE_HOME/copy-rs` (or `$HOME/.local/state/copy-rs`) and descriptor-relative

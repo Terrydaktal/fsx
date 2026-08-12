@@ -9,6 +9,7 @@ mod index;
 mod model;
 mod patterns;
 mod presentation;
+mod scan_status;
 mod search;
 
 pub(crate) use cli::{cli_main, fsxd_main};
@@ -18,6 +19,7 @@ pub(crate) use index::*;
 pub(crate) use model::*;
 pub(crate) use patterns::*;
 pub(crate) use presentation::*;
+pub(crate) use scan_status::{live_scan_incomplete, reset_live_scan_errors};
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]

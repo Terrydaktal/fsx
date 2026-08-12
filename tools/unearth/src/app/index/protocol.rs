@@ -5,10 +5,17 @@ use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "watcher")]
 use std::sync::Arc;
+
+#[cfg(feature = "watcher")]
+#[path = "query_lock.rs"]
+mod query_lock;
+#[cfg(feature = "watcher")]
+use query_lock::acquire_query_start_lock;
 #[cfg(feature = "watcher")]
 pub(crate) struct QueryServerHandle {
     stop: Arc<AtomicBool>,
     socket: PathBuf,
+    lock: PathBuf,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -21,6 +28,7 @@ impl Drop for QueryServerHandle {
             let _ = join.join();
         }
         let _ = fs::remove_file(&self.socket);
+        let _ = fs::remove_file(&self.lock);
     }
 }
 
@@ -384,10 +392,19 @@ pub(crate) fn start_query_server() -> Result<QueryServerHandle, String> {
             }
         }
     }
+    let lock = socket.with_file_name(format!(
+        "{}.lock",
+        socket
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("fsxd.sock")
+    ));
+    let lock_guard = acquire_query_start_lock(&lock, &socket)?;
     let listener = match UnixListener::bind(&socket) {
         Ok(listener) => listener,
         Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
             if UnixStream::connect(&socket).is_ok() {
+                drop(lock_guard);
                 return Err("another fsxd query server is already running".to_string());
             }
             fs::remove_file(&socket).map_err(|e| e.to_string())?;
@@ -395,16 +412,25 @@ pub(crate) fn start_query_server() -> Result<QueryServerHandle, String> {
         }
         Err(error) => return Err(error.to_string()),
     };
-    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
+    if let Err(error) = fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)) {
+        let _ = fs::remove_file(&socket);
+        drop(lock_guard);
+        return Err(error.to_string());
+    }
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
     let join = std::thread::Builder::new()
         .name("fsxd-query".to_string())
         .spawn(move || query_server_loop(listener, thread_stop))
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            let _ = fs::remove_file(&socket);
+            e.to_string()
+        })?;
+    drop(lock_guard);
     Ok(QueryServerHandle {
         stop,
         socket,
+        lock,
         join: Some(join),
     })
 }

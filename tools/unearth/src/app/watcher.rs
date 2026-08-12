@@ -1,7 +1,7 @@
 use super::*;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::{CString, OsStr};
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
@@ -15,6 +15,12 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rayon::ThreadPoolBuilder;
+
+#[path = "watcher_policy.rs"]
+mod watcher_policy;
+use watcher_policy::periodic_reconcile_interval;
+#[cfg(test)]
+use watcher_policy::periodic_reconcile_interval_from;
 
 const EVENT_CREATE: i64 = 1;
 const EVENT_MODIFY: i64 = 2;
@@ -94,11 +100,10 @@ impl MetricsCounters {
     }
 }
 
-#[derive(Default)]
 struct DbCaches {
-    dirs: HashMap<String, i64>,
-    names: HashMap<String, i64>,
-    actors: HashMap<String, CachedActor>,
+    dirs: ClockCache<i64>,
+    names: ClockCache<i64>,
+    actors: ClockCache<CachedActor>,
 }
 
 #[derive(Clone, Copy)]
@@ -114,21 +119,7 @@ impl DbCaches {
         self.actors.clear();
     }
 
-    fn insert(map: &mut HashMap<String, i64>, key: String, value: i64) {
-        if !map.contains_key(&key) && map.len() >= LIVE_ID_CACHE_CAPACITY {
-            if let Some(evicted) = map.keys().next().cloned() {
-                map.remove(&evicted);
-            }
-        }
-        map.insert(key, value);
-    }
-
     fn insert_actor(&mut self, key: String, actor: CachedActor) {
-        if !self.actors.contains_key(&key) && self.actors.len() >= LIVE_ID_CACHE_CAPACITY {
-            if let Some(evicted) = self.actors.keys().next().cloned() {
-                self.actors.remove(&evicted);
-            }
-        }
         self.actors.insert(key, actor);
     }
 
@@ -139,7 +130,86 @@ impl DbCaches {
             format!("{path}/")
         };
         self.dirs
-            .retain(|key, _| key != path && !key.starts_with(&prefix));
+            .retain(|key| key != path && !key.starts_with(&prefix));
+    }
+}
+
+impl Default for DbCaches {
+    fn default() -> Self {
+        Self {
+            dirs: ClockCache::new(LIVE_ID_CACHE_CAPACITY),
+            names: ClockCache::new(LIVE_ID_CACHE_CAPACITY),
+            actors: ClockCache::new(LIVE_ID_CACHE_CAPACITY),
+        }
+    }
+}
+
+struct ClockCache<V> {
+    capacity: usize,
+    entries: HashMap<String, (V, bool)>,
+    clock: VecDeque<String>,
+}
+
+impl<V> ClockCache<V> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            entries: HashMap::with_capacity(capacity),
+            clock: VecDeque::with_capacity(capacity),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.clock.clear();
+    }
+
+    fn get(&mut self, key: &str) -> Option<&V> {
+        let (value, referenced) = self.entries.get_mut(key)?;
+        *referenced = true;
+        Some(value)
+    }
+
+    fn get_mut(&mut self, key: &str) -> Option<&mut V> {
+        let (value, referenced) = self.entries.get_mut(key)?;
+        *referenced = true;
+        Some(value)
+    }
+
+    fn contains_key(&self, key: &str) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    fn insert(&mut self, key: String, value: V) {
+        if let Some((current, referenced)) = self.entries.get_mut(&key) {
+            *current = value;
+            *referenced = true;
+            return;
+        }
+        while self.entries.len() >= self.capacity.max(1) {
+            let Some(candidate) = self.clock.pop_front() else {
+                break;
+            };
+            let referenced = self
+                .entries
+                .get(&candidate)
+                .is_some_and(|(_, referenced)| *referenced);
+            if referenced {
+                if let Some((_, referenced)) = self.entries.get_mut(&candidate) {
+                    *referenced = false;
+                }
+                self.clock.push_back(candidate);
+            } else {
+                self.entries.remove(&candidate);
+            }
+        }
+        self.clock.push_back(key.clone());
+        self.entries.insert(key, (value, true));
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        self.entries.retain(|key, _| keep(key));
+        self.clock.retain(|key| self.entries.contains_key(key));
     }
 }
 
@@ -399,8 +469,9 @@ extern "C" fn handle_watch_signal(_signal: libc::c_int) {
 #[cfg(unix)]
 fn install_watch_signal_handlers() {
     unsafe {
-        libc::signal(libc::SIGINT, handle_watch_signal as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, handle_watch_signal as libc::sighandler_t);
+        let handler = handle_watch_signal as *const () as libc::sighandler_t;
+        libc::signal(libc::SIGINT, handler);
+        libc::signal(libc::SIGTERM, handler);
     }
 }
 
@@ -460,6 +531,95 @@ struct FsEvent {
     scanned_entries: Option<Arc<Vec<ScannedIndexEntry>>>,
 }
 
+#[derive(Clone)]
+struct EventSender {
+    inner: Sender<FsEvent>,
+    pending_modifies: Arc<Mutex<HashSet<PathBuf>>>,
+}
+
+struct EventReceiver {
+    inner: Receiver<FsEvent>,
+    pending_modifies: Arc<Mutex<HashSet<PathBuf>>>,
+}
+
+fn event_queue(capacity: usize) -> (EventSender, EventReceiver) {
+    let (sender, receiver) = bounded(capacity);
+    let pending_modifies = Arc::new(Mutex::new(HashSet::new()));
+    (
+        EventSender {
+            inner: sender,
+            pending_modifies: Arc::clone(&pending_modifies),
+        },
+        EventReceiver {
+            inner: receiver,
+            pending_modifies,
+        },
+    )
+}
+
+impl EventSender {
+    fn send(&self, event: FsEvent) -> Result<(), ()> {
+        let coalescible = event.action == Action::Upsert && event.event_kind == EVENT_MODIFY;
+        if coalescible {
+            let mut pending = self
+                .pending_modifies
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !pending.insert(event.path.clone()) {
+                return Ok(());
+            }
+        } else {
+            // Structural and recovery events are ordering barriers. Permit a
+            // later modify to enter the queue even when an older modify for
+            // the same path has not been consumed yet.
+            self.pending_modifies
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+        }
+        let path = coalescible.then(|| event.path.clone());
+        match self.inner.send(event) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if let Some(path) = path {
+                    self.pending_modifies
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&path);
+                }
+                let _ = error;
+                Err(())
+            }
+        }
+    }
+}
+
+impl EventReceiver {
+    fn mark_dequeued(&self, event: &FsEvent) {
+        if event.action == Action::Upsert && event.event_kind == EVENT_MODIFY {
+            self.pending_modifies
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&event.path);
+        }
+    }
+
+    fn recv_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<FsEvent, crossbeam_channel::RecvTimeoutError> {
+        let event = self.inner.recv_timeout(timeout)?;
+        self.mark_dequeued(&event);
+        Ok(event)
+    }
+
+    fn try_recv(&self) -> Result<FsEvent, crossbeam_channel::TryRecvError> {
+        let event = self.inner.try_recv()?;
+        self.mark_dequeued(&event);
+        Ok(event)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct RootState {
     key: String,
@@ -467,7 +627,7 @@ struct RootState {
 }
 
 type InitialScans = HashMap<String, Vec<ScannedIndexEntry>>;
-type StartedBackend = (Receiver<FsEvent>, String, Option<String>, InitialScans);
+type StartedBackend = (EventReceiver, String, Option<String>, InitialScans);
 
 #[derive(Clone, Debug)]
 struct WatcherOwner {
@@ -704,19 +864,6 @@ impl Drop for WatchStateGuard {
     fn drop(&mut self) {
         shutdown_states(&self.roots);
     }
-}
-
-fn periodic_reconcile_interval() -> Option<Duration> {
-    match std::env::var("UNEARTH_WATCH_RECONCILE_SECS") {
-        Ok(value) => periodic_reconcile_interval_from(Some(&value)),
-        Err(_) => Some(Duration::from_secs(300)),
-    }
-}
-
-fn periodic_reconcile_interval_from(value: Option<&str>) -> Option<Duration> {
-    value
-        .and_then(|value| value.parse::<u64>().ok())
-        .and_then(|seconds| (seconds > 0).then_some(Duration::from_secs(seconds)))
 }
 
 #[allow(dead_code)]
@@ -1036,7 +1183,7 @@ pub(crate) fn run(opts: &Options) -> Result<(), String> {
         {
             for root in &roots {
                 let started = Instant::now();
-                let result = reconcile_subtree(&root.path, opts, &mut db_caches);
+                let result = reconcile_subtree(&mut event_conn, &root.path, opts, &mut db_caches);
                 metric_add(
                     metrics_counters
                         .as_deref()
@@ -1327,6 +1474,8 @@ fn process_batch(
     let mut reconcile = HashSet::<PathBuf>::new();
     let mut reconcile_scans = HashMap::<PathBuf, Arc<Vec<ScannedIndexEntry>>>::new();
     let mut recovery_roots = HashSet::<String>::new();
+    let mut touched_roots = HashMap::<String, i64>::new();
+    let mut touched_parents = HashSet::<PathBuf>::new();
     let db_started = Instant::now();
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -1344,10 +1493,11 @@ fn process_batch(
                 recovery_roots.insert(root.key.clone());
                 tx.execute(
                     "UPDATE watch_state SET dirty=1, status='recovering', last_event=?2,
-                     generation=generation+1 WHERE root=?1",
+                     online=1 WHERE root=?1",
                     params![root.key, now],
                 )
                 .map_err(|e| e.to_string())?;
+                record_state_touch(&mut touched_roots, &root.key, event.at);
             }
             continue;
         }
@@ -1377,31 +1527,33 @@ fn process_batch(
                     (old_root.unwrap(), event.old_path.as_deref().unwrap()),
                     (new_root.unwrap(), event.path.as_path()),
                 ] {
-                    upsert_parent_directory(
+                    upsert_parent_directory_once(
                         &tx,
                         root,
                         path,
                         &event.actor,
                         event.event_kind,
                         db_caches,
+                        &mut touched_parents,
                     )?;
                     changed_roots.insert(root.key.clone());
                 }
                 for root in changed_roots {
-                    touch_state(&tx, &root, event.at)?;
+                    record_state_touch(&mut touched_roots, &root, event.at);
                 }
                 continue;
             }
             if let (Some(old_path), Some(root)) = (event.old_path.as_deref(), old_root) {
                 if old_is_indexed {
                     remove_path(&tx, old_path, event.is_dir, db_caches)?;
-                    upsert_parent_directory(
+                    upsert_parent_directory_once(
                         &tx,
                         root,
                         old_path,
                         &event.actor,
                         event.event_kind,
                         db_caches,
+                        &mut touched_parents,
                     )?;
                     changed_roots.insert(root.key.clone());
                 }
@@ -1422,19 +1574,20 @@ fn process_batch(
                             reconcile_scans.insert(event.path.clone(), Arc::clone(entries));
                         }
                     }
-                    upsert_parent_directory(
+                    upsert_parent_directory_once(
                         &tx,
                         root,
                         &event.path,
                         &event.actor,
                         event.event_kind,
                         db_caches,
+                        &mut touched_parents,
                     )?;
                     changed_roots.insert(root.key.clone());
                 }
             }
             for root in changed_roots {
-                touch_state(&tx, &root, event.at)?;
+                record_state_touch(&mut touched_roots, &root, event.at);
             }
             continue;
         }
@@ -1464,30 +1617,32 @@ fn process_batch(
                             IndexedPathState::Missing | IndexedPathState::NonDirectory => {}
                         }
                     }
-                    upsert_parent_directory(
+                    upsert_parent_directory_once(
                         &tx,
                         root,
                         &event.path,
                         &event.actor,
                         EVENT_RECONCILE,
                         db_caches,
+                        &mut touched_parents,
                     )?;
                 } else {
                     full_refresh.insert(root.key.clone());
                 }
                 tx.execute(
                     "UPDATE watch_state SET dirty=1, status='recovering', last_event=?2,
-                     generation=generation+1 WHERE root=?1",
+                     online=1 WHERE root=?1",
                     params![root.key, now],
                 )
                 .map_err(|e| e.to_string())?;
+                record_state_touch(&mut touched_roots, &root.key, event.at);
             }
             Action::Reconcile => {
                 metric_add(metrics.map(|metrics| &metrics.reconciles), 1);
                 recovery_roots.insert(root.key.clone());
                 tx.execute(
                     "UPDATE watch_state SET dirty=1, status='recovering', last_event=?2,
-                     generation=generation+1 WHERE root=?1",
+                     online=1 WHERE root=?1",
                     params![root.key, now],
                 )
                 .map_err(|e| e.to_string())?;
@@ -1522,16 +1677,17 @@ fn process_batch(
                     recovery_roots.insert(root.key.clone());
                 }
                 if event.path != root.path {
-                    upsert_parent_directory(
+                    upsert_parent_directory_once(
                         &tx,
                         root,
                         &event.path,
                         &event.actor,
                         EVENT_RECONCILE,
                         db_caches,
+                        &mut touched_parents,
                     )?;
                 }
-                touch_state(&tx, &root.key, event.at)?;
+                record_state_touch(&mut touched_roots, &root.key, event.at);
             }
             Action::Upsert => {
                 metric_add(metrics.map(|metrics| &metrics.upserts), 1);
@@ -1544,33 +1700,36 @@ fn process_batch(
                     db_caches,
                 )?;
                 if event.event_kind == EVENT_CREATE {
-                    upsert_parent_directory(
+                    upsert_parent_directory_once(
                         &tx,
                         root,
                         &event.path,
                         &event.actor,
                         event.event_kind,
                         db_caches,
+                        &mut touched_parents,
                     )?;
                 }
-                touch_state(&tx, &root.key, event.at)?;
+                record_state_touch(&mut touched_roots, &root.key, event.at);
             }
             Action::Remove => {
                 metric_add(metrics.map(|metrics| &metrics.removes), 1);
                 remove_path(&tx, &event.path, event.is_dir, db_caches)?;
-                upsert_parent_directory(
+                upsert_parent_directory_once(
                     &tx,
                     root,
                     &event.path,
                     &event.actor,
                     event.event_kind,
                     db_caches,
+                    &mut touched_parents,
                 )?;
-                touch_state(&tx, &root.key, event.at)?;
+                record_state_touch(&mut touched_roots, &root.key, event.at);
             }
             Action::Move => unreachable!(),
         }
     }
+    touch_states(&tx, touched_roots)?;
     tx.commit().map_err(|e| e.to_string())?;
     metric_add(metrics.map(|metrics| &metrics.db_transactions), 1);
     metric_elapsed(metrics.map(|metrics| &metrics.db_nanos), db_started);
@@ -1584,9 +1743,9 @@ fn process_batch(
                 Ok(entries) => entries,
                 Err(entries) => entries.as_ref().clone(),
             };
-            reconcile_subtree_from_entries(&path, entries, db_caches)
+            reconcile_subtree_from_entries(conn, &path, entries, db_caches)
         } else {
-            reconcile_subtree(&path, opts, db_caches)
+            reconcile_subtree(conn, &path, opts, db_caches)
         };
         metric_add(metrics.map(|metrics| &metrics.subtree_scans), 1);
         metric_elapsed(metrics.map(|metrics| &metrics.subtree_scan_nanos), started);
@@ -1716,14 +1875,25 @@ fn collapse_reconcile_paths(paths: HashSet<PathBuf>) -> Vec<PathBuf> {
     collapsed
 }
 
-fn touch_state(tx: &Transaction<'_>, root: &str, at: i64) -> Result<(), String> {
-    tx.prepare_cached(
-        "UPDATE watch_state SET last_event=?2, generation=generation+1,
+fn record_state_touch(touched: &mut HashMap<String, i64>, root: &str, at: i64) {
+    touched
+        .entry(root.to_string())
+        .and_modify(|latest| *latest = (*latest).max(at))
+        .or_insert(at);
+}
+
+fn touch_states(tx: &Transaction<'_>, touched: HashMap<String, i64>) -> Result<(), String> {
+    let mut statement = tx
+        .prepare_cached(
+            "UPDATE watch_state SET last_event=?2, generation=generation+1,
          online=1 WHERE root=?1",
-    )
-    .map_err(|e| e.to_string())?
-    .execute(params![root, at / 1_000_000_000])
-    .map_err(|e| e.to_string())?;
+        )
+        .map_err(|e| e.to_string())?;
+    for (root, at) in touched {
+        statement
+            .execute(params![root, at / 1_000_000_000])
+            .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -1786,7 +1956,7 @@ fn ensure_dir_cached(
         .map_err(|e| e.to_string())?
         .query_row([path], |row| row.get(0))
         .map_err(|e| e.to_string())?;
-    DbCaches::insert(&mut caches.dirs, path.to_string(), id);
+    caches.dirs.insert(path.to_string(), id);
     Ok(id)
 }
 
@@ -1807,7 +1977,7 @@ fn ensure_name_cached(
         .map_err(|e| e.to_string())?
         .query_row([name], |row| row.get(0))
         .map_err(|e| e.to_string())?;
-    DbCaches::insert(&mut caches.names, name.to_string(), id);
+    caches.names.insert(name.to_string(), id);
     Ok(id)
 }
 
@@ -1929,11 +2099,32 @@ fn upsert_parent_directory(
     Ok(())
 }
 
+fn upsert_parent_directory_once(
+    tx: &Transaction<'_>,
+    root: &RootState,
+    path: &Path,
+    actor: &Actor,
+    event_kind: i64,
+    caches: &mut DbCaches,
+    touched: &mut HashSet<PathBuf>,
+) -> Result<(), String> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    if !touched.insert(parent.to_path_buf()) {
+        return Ok(());
+    }
+    upsert_parent_directory(tx, root, path, actor, event_kind, caches)
+}
+
 fn ensure_dir_chain_encoded(
     tx: &Transaction<'_>,
     key: &str,
     caches: &mut DbCaches,
 ) -> Result<i64, String> {
+    if let Some(id) = caches.dirs.get(key).copied() {
+        return Ok(id);
+    }
     ensure_dir_cached(tx, "/", caches)?;
     if key == "/" {
         return ensure_dir_cached(tx, key, caches);
@@ -1973,7 +2164,7 @@ fn remove_path(
             .optional()
             .map_err(|e| e.to_string())?;
         if let Some(id) = id {
-            DbCaches::insert(&mut caches.names, name.to_string(), id);
+            caches.names.insert(name.to_string(), id);
         }
         id
     };
@@ -1987,7 +2178,7 @@ fn remove_path(
             .optional()
             .map_err(|e| e.to_string())?;
         if let Some(id) = id {
-            DbCaches::insert(&mut caches.dirs, parent_key.to_string(), id);
+            caches.dirs.insert(parent_key.to_string(), id);
         }
         id
     };
@@ -2103,7 +2294,12 @@ fn remove_exact_entry(
     Ok(())
 }
 
-fn reconcile_subtree(path: &Path, opts: &Options, caches: &mut DbCaches) -> Result<(), String> {
+fn reconcile_subtree(
+    conn: &mut Connection,
+    path: &Path,
+    opts: &Options,
+    caches: &mut DbCaches,
+) -> Result<(), String> {
     let path = path.to_path_buf();
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => Some(metadata),
@@ -2114,7 +2310,6 @@ fn reconcile_subtree(path: &Path, opts: &Options, caches: &mut DbCaches) -> Resu
         .as_ref()
         .is_some_and(|metadata| metadata.file_type().is_dir())
     {
-        let mut conn = open_index_db_writer()?;
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
@@ -2139,16 +2334,16 @@ fn reconcile_subtree(path: &Path, opts: &Options, caches: &mut DbCaches) -> Resu
         opts.threads_override.max(1)
     };
     let entries = scan_index_root_cancellable(&path, &root_key, threads, Some(&WATCH_STOP))?;
-    reconcile_subtree_from_entries(&path, entries, caches)
+    reconcile_subtree_from_entries(conn, &path, entries, caches)
 }
 
 fn reconcile_subtree_from_entries(
+    conn: &mut Connection,
     path: &Path,
     entries: Vec<ScannedIndexEntry>,
     caches: &mut DbCaches,
 ) -> Result<(), String> {
     let root_key = normalize_index_dir(path);
-    let mut conn = open_index_db_writer()?;
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|e| e.to_string())?;
@@ -2285,7 +2480,7 @@ fn classify_actor(pid: i32) -> Actor {
 fn start_inotify(
     roots: &[RootState],
     opts: &Options,
-) -> Result<(Receiver<FsEvent>, InitialScans), String> {
+) -> Result<(EventReceiver, InitialScans), String> {
     let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error().to_string());
@@ -2331,7 +2526,7 @@ fn start_inotify(
     if WATCH_STOP.load(Ordering::Relaxed) {
         return Err("watcher interrupted during initial metadata scan".to_string());
     }
-    let (tx, rx) = bounded(WATCH_CHANNEL_CAPACITY);
+    let (tx, rx) = event_queue(WATCH_CHANNEL_CAPACITY);
     thread::Builder::new()
         .name("unearth-inotify".to_string())
         .spawn(move || watcher.run(tx))
@@ -2343,7 +2538,7 @@ fn start_inotify(
 fn start_inotify(
     _roots: &[RootState],
     _opts: &Options,
-) -> Result<(Receiver<FsEvent>, InitialScans), String> {
+) -> Result<(EventReceiver, InitialScans), String> {
     Err("inotify is only available on Linux".to_string())
 }
 
@@ -2390,7 +2585,7 @@ fn wait_for_backend_event(fd: RawFd) -> Result<(), std::io::Error> {
 
 #[cfg(target_os = "linux")]
 impl InotifyWatcher {
-    fn expire_pending_moves(&mut self, tx: &Sender<FsEvent>) {
+    fn expire_pending_moves(&mut self, tx: &EventSender) {
         let now = std::time::Instant::now();
         let expired: Vec<u32> = self
             .pending_moves
@@ -2618,7 +2813,7 @@ impl InotifyWatcher {
         had_watch_coverage
     }
 
-    fn poll_mounts(&mut self, tx: &Sender<FsEvent>) -> Result<(), String> {
+    fn poll_mounts(&mut self, tx: &EventSender) -> Result<(), String> {
         if self.last_mount_check.elapsed() < WATCH_MOUNT_CHECK_INTERVAL {
             return Ok(());
         }
@@ -2675,7 +2870,7 @@ impl InotifyWatcher {
         Ok(())
     }
 
-    fn run(mut self, tx: Sender<FsEvent>) {
+    fn run(mut self, tx: EventSender) {
         let mut buffer = vec![0u8; 1024 * 1024];
         'watch: loop {
             self.expire_pending_moves(&tx);
@@ -3061,12 +3256,12 @@ impl Drop for InotifyWatcher {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn start_fanotify(_roots: &[RootState]) -> Result<(Receiver<FsEvent>, String), String> {
+fn start_fanotify(_roots: &[RootState]) -> Result<(EventReceiver, String), String> {
     Err("fanotify is only available on Linux".to_string())
 }
 
 #[cfg(target_os = "linux")]
-fn start_fanotify(roots: &[RootState]) -> Result<(Receiver<FsEvent>, String), String> {
+fn start_fanotify(roots: &[RootState]) -> Result<(EventReceiver, String), String> {
     let flags = libc::FAN_CLOEXEC | libc::FAN_NONBLOCK | libc::FAN_REPORT_DFID_NAME;
     let fd = unsafe {
         libc::syscall(
@@ -3164,7 +3359,7 @@ fn start_fanotify(roots: &[RootState]) -> Result<(Receiver<FsEvent>, String), St
         }
         return Err("no fanotify mount could be opened".to_string());
     }
-    let (tx, rx) = bounded(WATCH_CHANNEL_CAPACITY);
+    let (tx, rx) = event_queue(WATCH_CHANNEL_CAPACITY);
     let roots = roots.to_vec();
     let watcher = FanotifyWatcher {
         fd,
@@ -3217,7 +3412,7 @@ struct FanotifyWatcher {
 
 #[cfg(target_os = "linux")]
 impl FanotifyWatcher {
-    fn add_new_mounts(&mut self, tx: &Sender<FsEvent>) -> Result<(), String> {
+    fn add_new_mounts(&mut self, tx: &EventSender) -> Result<(), String> {
         let current_ids: HashMap<PathBuf, Option<u64>> = self
             .roots
             .iter()
@@ -3484,7 +3679,7 @@ impl FanotifyWatcher {
         (target, old, new)
     }
 
-    fn run(mut self, tx: Sender<FsEvent>) {
+    fn run(mut self, tx: EventSender) {
         let mut buffer = vec![0u8; 1024 * 1024];
         let mut last_mount_check = std::time::Instant::now();
         'watch: loop {
@@ -3871,6 +4066,68 @@ mod tests {
         )
         .unwrap();
         conn
+    }
+
+    #[test]
+    fn event_queue_coalesces_only_pending_modify_events() {
+        let path = PathBuf::from("/tmp/unearth-queue-test");
+        let (tx, rx) = event_queue(4);
+        let mut first = event(
+            Action::Upsert,
+            path.clone(),
+            false,
+            "test",
+            Actor::unknown(),
+        );
+        first.event_kind = EVENT_MODIFY;
+        tx.send(first.clone()).unwrap();
+        tx.send(first.clone()).unwrap();
+        assert_eq!(rx.inner.len(), 1);
+
+        let dequeued = rx.try_recv().unwrap();
+        assert_eq!(dequeued.path, path);
+        tx.send(first).unwrap();
+        assert_eq!(rx.inner.len(), 1);
+    }
+
+    #[test]
+    fn clock_cache_remains_bounded_and_keeps_new_entries() {
+        let mut cache = ClockCache::new(2);
+        cache.insert("old".to_string(), 1);
+        cache.insert("hot".to_string(), 2);
+        cache.insert("new".to_string(), 3);
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.get("new"), Some(&3));
+        assert!(!cache.contains_key("old"));
+    }
+
+    #[test]
+    fn batch_state_touch_uses_latest_time_and_one_generation() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE watch_state (
+                 root TEXT PRIMARY KEY,
+                 generation INTEGER NOT NULL,
+                 last_event INTEGER,
+                 online INTEGER NOT NULL
+             );
+             INSERT INTO watch_state VALUES ('/tmp/root', 7, NULL, 0);",
+        )
+        .unwrap();
+        let tx = conn.transaction().unwrap();
+        let mut touched = HashMap::new();
+        record_state_touch(&mut touched, "/tmp/root", 2_000_000_000);
+        record_state_touch(&mut touched, "/tmp/root", 1_000_000_000);
+        touch_states(&tx, touched).unwrap();
+        tx.commit().unwrap();
+        let state: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT generation, last_event, online FROM watch_state WHERE root='/tmp/root'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, (8, 2, 1));
     }
 
     #[test]

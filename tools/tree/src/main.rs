@@ -1933,7 +1933,6 @@ fn print_node(
                     .style_for_str(&child.name)
                     .or_else(|| lscolors.style_for_indicator(lscolors::Indicator::RegularFile))
             };
-            let is_extensionless_exec = is_exec_file && child.path.extension().is_none();
             let shared_code = if !child.is_dir && !child.is_symlink {
                 fsx::colors::color_code_for_path(
                     &child.path.to_string_lossy(),
@@ -1946,9 +1945,7 @@ fn print_node(
             } else {
                 None
             };
-            if is_extensionless_exec {
-                format!("\x1b[38;2;0;245;200m{}\x1b[0m", display_name)
-            } else if let Some(code) = shared_code {
+            if let Some(code) = shared_code {
                 format!("\x1b[{code}m{display_name}\x1b[0m")
             } else {
                 let ansi_style = style.map(|s| s.to_nu_ansi_term_style()).unwrap_or_default();

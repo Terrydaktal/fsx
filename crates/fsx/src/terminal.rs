@@ -106,23 +106,45 @@ impl HyperlinkCache {
     /// Render a path using Unearth's split-link behavior: the visible prefix
     /// selects the entry in its parent, while the basename opens the entry.
     pub fn split_path_link(&mut self, path: &Path, prefix: &str, leaf: &str) -> String {
+        self.split_path_link_with_leaf_selection(path, prefix, leaf, false)
+    }
+
+    /// Render a split path while optionally making the basename select the
+    /// entry in its parent instead of opening the entry directly.
+    pub fn split_path_link_with_leaf_selection(
+        &mut self,
+        path: &Path,
+        prefix: &str,
+        leaf: &str,
+        select_leaf: bool,
+    ) -> String {
         let absolute = absolute_path(path);
         let Some(leaf_uri) = self.encoded_path(&absolute) else {
             return format!("{prefix}{leaf}");
         };
         if prefix.is_empty() {
-            return osc8_wrap(&leaf_uri, leaf);
+            let uri = if select_leaf {
+                self.selection_uri(&absolute).unwrap_or(leaf_uri)
+            } else {
+                leaf_uri
+            };
+            return osc8_wrap(&uri, leaf);
         }
         let Some(parent_uri) = self.parent_uri(&absolute) else {
             return format!("{prefix}{leaf}");
         };
         let select_uri = format!("{parent_uri}?select={}", uri_path(&leaf_uri));
+        let leaf_link = if select_leaf {
+            osc8_wrap(&select_uri, leaf)
+        } else {
+            osc8_wrap(&leaf_uri, leaf)
+        };
         format!(
             "{}{}{}{}",
             osc8_wrap_open(&select_uri),
             prefix,
             osc8_wrap_close(),
-            osc8_wrap(&leaf_uri, leaf),
+            leaf_link,
         )
     }
 
@@ -217,6 +239,20 @@ mod tests {
         assert_eq!(
             cache.split_path_link(Path::new("/tmp/fsx/space name"), "/tmp/fsx/", "space name",),
             "\x1b]8;;file:///tmp/fsx/?select=/tmp/fsx/space%20name\x1b\\/tmp/fsx/\x1b]8;;\x1b\\\x1b]8;;file:///tmp/fsx/space%20name\x1b\\space name\x1b]8;;\x1b\\"
+        );
+    }
+
+    #[test]
+    fn split_link_can_select_the_leaf_entry() {
+        let mut cache = HyperlinkCache::default();
+        assert_eq!(
+            cache.split_path_link_with_leaf_selection(
+                Path::new("/tmp/fsx/space name"),
+                "/tmp/fsx/",
+                "space name",
+                true,
+            ),
+            "\x1b]8;;file:///tmp/fsx/?select=/tmp/fsx/space%20name\x1b\\/tmp/fsx/\x1b]8;;\x1b\\\x1b]8;;file:///tmp/fsx/?select=/tmp/fsx/space%20name\x1b\\space name\x1b]8;;\x1b\\"
         );
     }
 

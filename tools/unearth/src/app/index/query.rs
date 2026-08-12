@@ -380,6 +380,7 @@ pub(crate) fn run_recent_indexed(
     Ok(SearchRun {
         lines: final_transform(results, opts, use_style, stdout_is_tty, colors, cache, None),
         timed_out: false,
+        incomplete: false,
     })
 }
 
@@ -832,6 +833,7 @@ pub(crate) fn run_indexed_via_daemon(
         return Ok(Some(SearchRun {
             lines: Vec::new(),
             timed_out: false,
+            incomplete: false,
         }));
     }
     let mut results = Vec::new();
@@ -864,6 +866,7 @@ pub(crate) fn run_indexed_via_daemon(
     Ok(Some(SearchRun {
         lines: final_transform(results, opts, use_style, stdout_is_tty, colors, cache, None),
         timed_out: false,
+        incomplete: false,
     }))
 }
 
@@ -1036,6 +1039,7 @@ pub(crate) fn run_indexed(
         return Ok(SearchRun {
             lines: Vec::new(),
             timed_out: false,
+            incomplete: false,
         });
     }
 
@@ -1093,6 +1097,7 @@ pub(crate) fn run_indexed(
     Ok(SearchRun {
         lines: final_transform(results, opts, use_style, stdout_is_tty, colors, cache, None),
         timed_out: false,
+        incomplete: false,
     })
 }
 

@@ -48,6 +48,7 @@ pub(crate) struct CollisionPredicates {
     pub(crate) newer: bool,
     pub(crate) larger: bool,
     pub(crate) size_differs: bool,
+    pub(crate) metadata_differs: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -63,7 +64,7 @@ impl Default for MergeCollisionPolicy {
             winner: CollisionWinner::Source,
             combine: CollisionCombineMode::Any,
             predicates: CollisionPredicates {
-                size_differs: true,
+                metadata_differs: true,
                 ..CollisionPredicates::default()
             },
         }
@@ -71,8 +72,28 @@ impl Default for MergeCollisionPolicy {
 }
 
 impl MergeCollisionPolicy {
-    pub(crate) fn requires_mtime(self) -> bool {
-        self.predicates.newer
+    pub(crate) fn source_always() -> Self {
+        Self {
+            winner: CollisionWinner::Source,
+            combine: CollisionCombineMode::Any,
+            predicates: CollisionPredicates {
+                always: true,
+                ..CollisionPredicates::default()
+            },
+        }
+    }
+
+    /// The default source metadata policy cannot prove byte identity.  Hash
+    /// only this narrow case at transfer time; no persistent content cache is
+    /// required and other explicit policies retain their stated semantics.
+    pub(crate) fn requires_content_identity_check(self) -> bool {
+        self.winner == CollisionWinner::Source
+            && self.combine == CollisionCombineMode::Any
+            && self.predicates.metadata_differs
+            && !self.predicates.always
+            && !self.predicates.newer
+            && !self.predicates.larger
+            && !self.predicates.size_differs
     }
 }
 
@@ -151,6 +172,8 @@ pub(crate) struct ChangeItem {
 #[derive(Default, Clone)]
 pub(crate) struct ManifestFileEntry {
     pub(crate) rel: Arc<str>,
+    pub(crate) source_path: Option<PathBuf>,
+    pub(crate) relative_path: Option<PathBuf>,
     pub(crate) size: u64,
     pub(crate) dev: u64,
     pub(crate) ino: u64,
@@ -181,6 +204,7 @@ pub(crate) struct ManifestDeleteDirEntry {
 #[derive(Clone)]
 pub(crate) struct ManifestDirTimeEntry {
     pub(crate) rel: String,
+    pub(crate) relative_path: PathBuf,
     pub(crate) atime: FileTime,
     pub(crate) mtime: FileTime,
 }
@@ -210,7 +234,10 @@ pub(crate) struct PreScan {
     pub(crate) uncollided_dirs: u64,
     pub(crate) change_preview: Vec<ChangeItem>,
     pub(crate) source_display_paths: FxHashSet<String>,
+    /// The source/destination metadata relation contains visible differences.
     pub(crate) has_itemized_changes: bool,
+    /// The selected transfer policy schedules at least one filesystem action.
+    pub(crate) has_planned_changes: bool,
     pub(crate) transfer_manifest: Option<TransferManifest>,
     pub(crate) file_relation_breakdown: FileRelationBreakdown,
 }
@@ -278,6 +305,7 @@ impl Default for PreScan {
             change_preview: Vec::new(),
             source_display_paths: FxHashSet::default(),
             has_itemized_changes: false,
+            has_planned_changes: false,
             transfer_manifest: None,
             file_relation_breakdown: FileRelationBreakdown::default(),
         }

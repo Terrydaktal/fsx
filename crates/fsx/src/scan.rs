@@ -72,6 +72,10 @@ pub struct ScanSnapshot {
     pub entries: Vec<ScannedEntry>,
     pub aggregates: std::collections::HashMap<PathBuf, Aggregate>,
     pub complete: bool,
+    /// Number of entries that could not be read or inspected.  `complete`
+    /// remains a cheap compatibility flag while callers that need diagnostics
+    /// can report the magnitude of a partial walk.
+    pub errors: u64,
     pub overflowed: bool,
 }
 
@@ -80,14 +84,20 @@ pub fn scan(request: &ScanRequest) -> ScanSnapshot {
         complete: true,
         ..ScanSnapshot::default()
     };
-    if request.size_mode == SizeMode::Allocated
-        && let Ok(metadata) = std::fs::symlink_metadata(&request.root)
-    {
-        snapshot
-            .aggregates
-            .entry(request.root.clone())
-            .or_default()
-            .allocated_size = metadata_snapshot(&metadata).allocated_size;
+    if request.size_mode == SizeMode::Allocated {
+        match std::fs::symlink_metadata(&request.root) {
+            Ok(metadata) => {
+                snapshot
+                    .aggregates
+                    .entry(request.root.clone())
+                    .or_default()
+                    .allocated_size = metadata_snapshot(&metadata).allocated_size;
+            }
+            Err(_) => {
+                snapshot.complete = false;
+                snapshot.errors = snapshot.errors.saturating_add(1);
+            }
+        }
     }
     let seen_dirs = Arc::new(std::sync::Mutex::new(HashSet::<HardlinkKey>::new()));
     let seen_files = Arc::new(std::sync::Mutex::new(HashSet::<HardlinkKey>::new()));
@@ -118,6 +128,7 @@ pub fn scan(request: &ScanRequest) -> ScanSnapshot {
             Ok(entry) => entry,
             Err(_) => {
                 snapshot.complete = false;
+                snapshot.errors = snapshot.errors.saturating_add(1);
                 continue;
             }
         };
@@ -129,6 +140,7 @@ pub fn scan(request: &ScanRequest) -> ScanSnapshot {
             Ok(metadata) => metadata_snapshot(&metadata),
             Err(_) => {
                 snapshot.complete = false;
+                snapshot.errors = snapshot.errors.saturating_add(1);
                 continue;
             }
         };
@@ -168,16 +180,16 @@ pub fn scan(request: &ScanRequest) -> ScanSnapshot {
                     .allocated_size = metadata.allocated_size;
             }
             let contributes = metadata.kind == EntryKind::Directory || include_in_aggregate;
-            if contributes {
-                if add_to_ancestors(
+            if contributes
+                && add_to_ancestors(
                     &mut snapshot.aggregates,
                     &request.root,
                     &path,
                     &metadata,
                     request,
-                ) {
-                    snapshot.overflowed = true;
-                }
+                )
+            {
+                snapshot.overflowed = true;
             }
         }
     }
@@ -215,14 +227,14 @@ fn add_to_ancestors(
                     aggregate.overflowed = true;
                     overflowed = true;
                 }
-                if request.size_mode == SizeMode::Allocated {
-                    if crate::overflow::checked_add_u64(
+                if request.size_mode == SizeMode::Allocated
+                    && crate::overflow::checked_add_u64(
                         &mut aggregate.allocated_size,
                         metadata.allocated_size,
-                    ) {
-                        aggregate.overflowed = true;
-                        overflowed = true;
-                    }
+                    )
+                {
+                    aggregate.overflowed = true;
+                    overflowed = true;
                 }
             }
             EntryKind::File | EntryKind::Symlink | EntryKind::Other => {

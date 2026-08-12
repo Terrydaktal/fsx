@@ -39,7 +39,6 @@ impl TransferJournal {
         ));
         let mut file = OpenOptions::new()
             .create_new(true)
-            .write(true)
             .append(true)
             .mode(0o600)
             .open(&path)?;
@@ -55,6 +54,7 @@ impl TransferJournal {
         )?;
         writeln!(file, "state=planned")?;
         file.sync_all()?;
+        crash_test_boundary("planned");
         Ok(Self {
             path,
             file,
@@ -64,13 +64,29 @@ impl TransferJournal {
 
     pub(crate) fn mark(&mut self, state: &str) -> io::Result<()> {
         writeln!(self.file, "state={state}")?;
-        self.file.sync_all()
+        self.file.sync_all()?;
+        crash_test_boundary(state);
+        Ok(())
     }
 
     pub(crate) fn complete(mut self) -> io::Result<()> {
         self.mark("complete")?;
         self.completed = true;
         fs::remove_file(&self.path)
+    }
+
+    pub(crate) fn abandon(mut self, reason: &str) -> io::Result<()> {
+        self.mark(&format!("aborted:{reason}"))?;
+        self.completed = true;
+        fs::remove_file(&self.path)
+    }
+}
+
+fn crash_test_boundary(boundary: &str) {
+    if std::env::var("COPY_RS_TEST_CRASH_AT").as_deref() == Ok(boundary) {
+        // Test-only failpoint: `_exit` deliberately skips destructors so the
+        // integration suite observes the same journal state as a hard crash.
+        unsafe { nix::libc::_exit(86) }
     }
 }
 
@@ -98,8 +114,18 @@ fn report_stale_journals(directory: &Path) {
         if entry
             .path()
             .extension()
-            .is_some_and(|extension| extension == "journal")
+            .is_none_or(|extension| extension != "journal")
         {
+            continue;
+        }
+        let state = fs::read_to_string(entry.path()).ok().and_then(|contents| {
+            contents
+                .lines()
+                .rev()
+                .find_map(|line| line.strip_prefix("state="))
+                .map(str::to_owned)
+        });
+        if matches!(state.as_deref(), Some("transferring" | "published")) {
             eprintln!(
                 "copy: incomplete operation journal retained at {}",
                 entry.path().display()
