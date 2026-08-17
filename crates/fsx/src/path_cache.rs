@@ -224,11 +224,12 @@ fn acquire_cache_lock(path: &Path) -> io::Result<File> {
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 let observed = std::fs::read_to_string(path).unwrap_or_default();
-                let pid = observed.trim().parse::<u32>().ok();
-                #[cfg(target_os = "linux")]
-                let owner_alive =
-                    pid.is_some_and(|pid| Path::new(&format!("/proc/{pid}")).exists());
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                let owner_alive = {
+                    let pid = observed.trim().parse::<u32>().ok();
+                    pid.is_some_and(|pid| Path::new(&format!("/proc/{pid}")).exists())
+                };
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
                 let owner_alive = false;
                 if owner_alive {
                     return Err(io::Error::new(

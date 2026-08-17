@@ -55,6 +55,19 @@ pub(crate) struct IndexDeltaEntry {
     pub(crate) path: String,
 }
 
+fn reject_child_read_error(
+    path: &Path,
+    error: Option<&dyn std::fmt::Display>,
+) -> Result<(), String> {
+    match error {
+        Some(error) => Err(format!(
+            "index scan could not read directory '{}': {error}",
+            path.display()
+        )),
+        None => Ok(()),
+    }
+}
+
 pub(crate) fn scan_index_root_cancellable(
     root: &Path,
     root_key: &str,
@@ -90,6 +103,15 @@ pub(crate) fn scan_index_root_cancellable(
                 Err(error) => return Some(Err(error.to_string())),
             };
             let path = entry.path();
+            if let Err(error) = reject_child_read_error(
+                &path,
+                entry
+                    .read_children_error
+                    .as_ref()
+                    .map(|error| error as &dyn std::fmt::Display),
+            ) {
+                return Some(Err(error));
+            }
             if path == root || path.file_name().is_none() || path.parent().is_none() {
                 return None;
             }
@@ -959,11 +981,12 @@ pub(crate) fn fts_trigram_query(raw: &str) -> Option<String> {
 pub(crate) fn sql_prefilter_for_term(
     raw: &str,
     regex_mode: bool,
+    case_sensitive: bool,
     force_full: bool,
     field_expr: &str,
     fts_ready: bool,
 ) -> Option<(String, Vec<String>)> {
-    if regex_mode {
+    if regex_mode || case_sensitive {
         return None;
     }
     if !raw.is_empty() && raw.bytes().all(|byte| byte == b'*') {
@@ -1839,6 +1862,56 @@ impl Drop for RefreshLockGuard {
             .unwrap_or(false);
         if owned {
             let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[cfg(test)]
+mod scan_completion_tests {
+    use super::{normalize_index_dir, reject_child_read_error, scan_index_root_cancellable};
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn child_read_errors_abort_index_scans() {
+        let source_error = "permission denied";
+        let error = reject_child_read_error(
+            Path::new("/unreadable"),
+            Some(&source_error as &dyn std::fmt::Display),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("/unreadable"));
+        assert!(error.contains("permission denied"));
+        assert!(reject_child_read_error(Path::new("/readable"), None).is_ok());
+    }
+
+    #[test]
+    fn index_scan_rejects_an_unreadable_subtree_when_permissions_are_enforced() {
+        let root = std::env::temp_dir().join(format!(
+            "unearth-index-unreadable-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let blocked = root.join("blocked");
+        fs::create_dir_all(&blocked).unwrap();
+        fs::write(root.join("visible"), b"visible").unwrap();
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let permissions_enforced = fs::read_dir(&blocked).is_err();
+        let result = scan_index_root_cancellable(&root, &normalize_index_dir(&root), 1, None);
+
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+
+        if permissions_enforced {
+            let error = result.expect_err("unreadable subtree must make the scan incomplete");
+            assert!(error.contains("blocked"), "{error}");
         }
     }
 }

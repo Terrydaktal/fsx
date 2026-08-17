@@ -1,6 +1,6 @@
 use super::model::{ContainsAllSpec, MountInfo, Options, SearchDirMode, SearchResult, TypeFlag};
 use super::patterns::parse_search_dir;
-use super::scan_status::record_scan_error;
+use super::scan_status::LiveScanStatus;
 use super::{NTFS_FS_TYPES, ROOT_SIZE_SKIP_TREES};
 use crossbeam_channel::Sender;
 use jwalk::{Parallelism, WalkDir};
@@ -76,6 +76,7 @@ pub(crate) fn walk_fast(
     full_path_match: bool,
     serial_subtree: bool,
     timeout_flag: &Arc<AtomicBool>,
+    scan_status: &LiveScanStatus,
 ) {
     let visited = None;
     walk_fast_inner(
@@ -91,6 +92,7 @@ pub(crate) fn walk_fast(
         full_path_match,
         serial_subtree,
         timeout_flag,
+        scan_status,
         None,
         visited,
     );
@@ -110,6 +112,7 @@ fn walk_fast_inner(
     full_path_match: bool,
     serial_subtree: bool,
     timeout_flag: &Arc<AtomicBool>,
+    scan_status: &LiveScanStatus,
     inherited_ignore: Option<Arc<SimpleIgnoreRules>>,
     visited: VisitedDirs,
 ) {
@@ -121,7 +124,7 @@ fn walk_fast_inner(
         return;
     }
     let Ok(read_dir) = fs::read_dir(&dir) else {
-        record_scan_error();
+        scan_status.record_error();
         return;
     };
     let ignore_rules = if respect_ignore {
@@ -130,10 +133,10 @@ fn walk_fast_inner(
         None
     };
     let mut subdirs = Vec::new();
-    let mut local_buf = Vec::with_capacity(512);
+    let mut local_buf = Vec::new();
     for entry_res in read_dir {
         let Ok(entry) = entry_res else {
-            record_scan_error();
+            scan_status.record_error();
             continue;
         };
         let name = entry.file_name();
@@ -142,21 +145,26 @@ fn walk_fast_inner(
             continue;
         }
         let Ok(file_type) = entry.file_type() else {
-            record_scan_error();
+            scan_status.record_error();
             continue;
         };
-        let path = entry.path();
+        let mut path = if respect_ignore || (file_type.is_symlink() && follow_links) {
+            Some(entry.path())
+        } else {
+            None
+        };
         let is_symlink = file_type.is_symlink();
         let mut is_dir = file_type.is_dir();
         if is_symlink && follow_links {
-            if let Ok(meta) = fs::metadata(&path) {
+            if let Ok(meta) = fs::metadata(path.as_ref().expect("symlink path initialized")) {
                 if meta.is_dir() {
                     is_dir = true;
                 }
             }
         }
         if let Some(rules) = &ignore_rules {
-            if is_simple_ignored_name(&path, is_dir, rules) {
+            let path_ref = path.get_or_insert_with(|| entry.path());
+            if is_simple_ignored_name(path_ref, is_dir, rules) {
                 continue;
             }
         }
@@ -168,24 +176,20 @@ fn walk_fast_inner(
         if !skip_type {
             let is_match = if is_catch_all {
                 true
+            } else if full_path_match {
+                let path_ref = path.get_or_insert_with(|| entry.path());
+                re.is_match(path_ref.to_string_lossy().as_ref())
             } else {
-                let match_target = if full_path_match {
-                    path.to_string_lossy()
-                } else {
-                    name.to_string_lossy()
-                };
-                re.is_match(&match_target)
+                re.is_match(name.to_string_lossy().as_ref())
             };
             if is_match {
+                let path_ref = path.get_or_insert_with(|| entry.path());
                 local_buf.push(PathInfo {
-                    path: path.clone(),
+                    path: path_ref.clone(),
                     is_dir,
                 });
-                if local_buf.len() >= 512 {
-                    if tx.send(std::mem::take(&mut local_buf)).is_err() {
-                        return;
-                    }
-                    local_buf.reserve(512);
+                if local_buf.len() >= 512 && tx.send(std::mem::take(&mut local_buf)).is_err() {
+                    return;
                 }
             }
         }
@@ -200,7 +204,7 @@ fn walk_fast_inner(
             if is_symlink && !follow_links {
                 continue;
             }
-            subdirs.push(path);
+            subdirs.push(path.unwrap_or_else(|| entry.path()));
         }
     }
     if !local_buf.is_empty() && tx.send(local_buf).is_err() {
@@ -221,6 +225,7 @@ fn walk_fast_inner(
                 full_path_match,
                 true,
                 timeout_flag,
+                scan_status,
                 ignore_rules.clone(),
                 visited.clone(),
             );
@@ -243,6 +248,7 @@ fn walk_fast_inner(
                     full_path_match,
                     next_serial,
                     timeout_flag,
+                    scan_status,
                     ignore_rules.clone(),
                     visited.clone(),
                 );
@@ -263,6 +269,7 @@ pub(crate) fn walk_rayon_worker(
     needs_metadata: bool,
     serial_subtree: bool,
     timeout_flag: &Arc<AtomicBool>,
+    scan_status: &LiveScanStatus,
 ) {
     let visited = None;
     walk_rayon_worker_inner(
@@ -277,6 +284,7 @@ pub(crate) fn walk_rayon_worker(
         needs_metadata,
         serial_subtree,
         timeout_flag,
+        scan_status,
         None,
         visited,
     );
@@ -295,6 +303,7 @@ fn walk_rayon_worker_inner(
     needs_metadata: bool,
     serial_subtree: bool,
     timeout_flag: &Arc<AtomicBool>,
+    scan_status: &LiveScanStatus,
     inherited_ignore: Option<Arc<SimpleIgnoreRules>>,
     visited: VisitedDirs,
 ) {
@@ -306,7 +315,7 @@ fn walk_rayon_worker_inner(
         return;
     }
     let Ok(read_dir) = fs::read_dir(&dir) else {
-        record_scan_error();
+        scan_status.record_error();
         return;
     };
     let ignore_rules = if opts.respect_ignore {
@@ -315,10 +324,10 @@ fn walk_rayon_worker_inner(
         None
     };
     let mut subdirs = Vec::new();
-    let mut local_buf = Vec::with_capacity(256);
+    let mut local_buf = Vec::new();
     for entry_res in read_dir {
         let Ok(entry) = entry_res else {
-            record_scan_error();
+            scan_status.record_error();
             continue;
         };
         let name = entry.file_name();
@@ -327,21 +336,26 @@ fn walk_rayon_worker_inner(
             continue;
         }
         let Ok(file_type) = entry.file_type() else {
-            record_scan_error();
+            scan_status.record_error();
             continue;
         };
-        let path = entry.path();
+        let mut path = if opts.respect_ignore || (file_type.is_symlink() && opts.follow_links) {
+            Some(entry.path())
+        } else {
+            None
+        };
         let is_symlink = file_type.is_symlink();
         let mut is_dir = file_type.is_dir();
         if is_symlink && opts.follow_links {
-            if let Ok(meta) = fs::metadata(&path) {
+            if let Ok(meta) = fs::metadata(path.as_ref().expect("symlink path initialized")) {
                 if meta.is_dir() {
                     is_dir = true;
                 }
             }
         }
         if let Some(rules) = &ignore_rules {
-            if is_simple_ignored_name(&path, is_dir, rules) {
+            let path_ref = path.get_or_insert_with(|| entry.path());
+            if is_simple_ignored_name(path_ref, is_dir, rules) {
                 continue;
             }
         }
@@ -355,34 +369,47 @@ fn walk_rayon_worker_inner(
             let is_match = if is_catch_all {
                 true
             } else if full_path_match {
-                if re.is_match(name_lossy.as_ref()) {
-                    true
+                let name_matches = if opts.lossless_paths {
+                    re.is_match(&fsx::encode_lossless_path(Path::new(name.as_os_str())))
                 } else {
-                    let match_target = path.to_string_lossy();
-                    re.is_match(&match_target)
-                }
+                    re.is_match(name_lossy.as_ref())
+                };
+                name_matches
+                    || if opts.lossless_paths {
+                        let path_ref = path.get_or_insert_with(|| entry.path());
+                        re.is_match(&fsx::encode_lossless_path(path_ref))
+                    } else {
+                        let path_ref = path.get_or_insert_with(|| entry.path());
+                        re.is_match(path_ref.to_string_lossy().as_ref())
+                    }
+            } else if opts.lossless_paths {
+                re.is_match(&fsx::encode_lossless_path(Path::new(name.as_os_str())))
             } else {
                 re.is_match(name_lossy.as_ref())
             };
             if is_match {
-                let mut p_str = path
-                    .clone()
-                    .into_os_string()
-                    .into_string()
-                    .unwrap_or_else(|os| os.to_string_lossy().into_owned());
+                let path_ref = path.get_or_insert_with(|| entry.path());
+                let mut p_str = if opts.lossless_paths {
+                    fsx::encode_lossless_path(path_ref)
+                } else {
+                    path_ref
+                        .to_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| path_ref.to_string_lossy().into_owned())
+                };
                 if is_dir && !p_str.ends_with('/') {
                     p_str.push('/');
                 }
                 local_buf.push(SearchResult {
                     path: p_str,
-                    path_encoded: false,
+                    path_encoded: opts.lossless_paths,
                     is_dir,
                     is_symlink,
                     metadata: if needs_metadata {
-                        match fs::symlink_metadata(&path) {
+                        match fs::symlink_metadata(path_ref) {
                             Ok(metadata) => Some(metadata),
                             Err(_) => {
-                                record_scan_error();
+                                scan_status.record_error();
                                 None
                             }
                         }
@@ -393,11 +420,8 @@ fn walk_rayon_worker_inner(
                     indexed_size: None,
                 });
 
-                if local_buf.len() >= 256 {
-                    if tx.send(std::mem::take(&mut local_buf)).is_err() {
-                        return;
-                    }
-                    local_buf.reserve(256);
+                if local_buf.len() >= 256 && tx.send(std::mem::take(&mut local_buf)).is_err() {
+                    return;
                 }
                 if is_dir && prune_matched_dir_subtrees {
                     matched_dir_pruned = true;
@@ -419,8 +443,7 @@ fn walk_rayon_worker_inner(
             if is_symlink && !opts.follow_links {
                 continue;
             }
-            let child = entry.path();
-            subdirs.push(child);
+            subdirs.push(path.unwrap_or_else(|| entry.path()));
         }
     }
     if !local_buf.is_empty() && tx.send(local_buf).is_err() {
@@ -440,6 +463,7 @@ fn walk_rayon_worker_inner(
                 needs_metadata,
                 true,
                 timeout_flag,
+                scan_status,
                 ignore_rules.clone(),
                 visited.clone(),
             );
@@ -461,6 +485,7 @@ fn walk_rayon_worker_inner(
                     needs_metadata,
                     next_serial,
                     timeout_flag,
+                    scan_status,
                     ignore_rules.clone(),
                     visited.clone(),
                 );
@@ -703,7 +728,13 @@ pub(crate) fn should_skip_root_size_tree(path: &str) -> bool {
 }
 
 pub(crate) fn root_prefers_single_thread(path: &Path) -> bool {
-    path == Path::new("/media") || path.starts_with("/media/")
+    path == Path::new("/media")
+        || path.starts_with("/media/")
+        || (cfg!(target_os = "android")
+            && (path == Path::new("/storage")
+                || path.starts_with("/storage/")
+                || path == Path::new("/mnt")
+                || path.starts_with("/mnt/")))
 }
 
 pub(crate) fn effective_search_root(

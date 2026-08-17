@@ -4,12 +4,12 @@
 //! collision decisions, progress policy, and cleanup remain in their modules.
 
 use crate::domain::{ManifestDirTimeEntry, MediaKind};
-use crate::plan::{map_dir_dest_path, map_dir_dest_relative_path, normalize_rel};
+use crate::plan::map_dir_dest_relative_path;
 use crate::runtime::copy_chunk_bytes_for_file;
 use filetime::{set_file_times, FileTime};
 use jwalk::WalkDir;
 use sha2::{Digest, Sha256};
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -217,13 +217,31 @@ pub(crate) fn ensure_no_symlink_ancestors(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn open_directory_nofollow(path: &Path) -> io::Result<File> {
-    let mut current = File::open(if path.is_absolute() {
+    // Directory capabilities need search permission, not permission to list
+    // contents. Android app sandboxes can traverse `/` into their private data
+    // directory but cannot open `/` for reading, so use O_PATH throughout.
+    let start = if path.is_absolute() {
         Path::new("/")
     } else {
         Path::new(".")
-    })?;
+    };
+    let start = CString::new(start.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid directory path"))?;
+    let start_fd = unsafe {
+        nix::libc::open(
+            start.as_ptr(),
+            nix::libc::O_PATH
+                | nix::libc::O_DIRECTORY
+                | nix::libc::O_NOFOLLOW
+                | nix::libc::O_CLOEXEC,
+        )
+    };
+    if start_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut current = unsafe { File::from_raw_fd(start_fd) };
     for component in path.components() {
         let name = match component {
             std::path::Component::Normal(name) => name,
@@ -242,7 +260,7 @@ fn open_directory_nofollow(path: &Path) -> io::Result<File> {
             nix::libc::openat(
                 current.as_raw_fd(),
                 name.as_ptr(),
-                nix::libc::O_RDONLY
+                nix::libc::O_PATH
                     | nix::libc::O_DIRECTORY
                     | nix::libc::O_NOFOLLOW
                     | nix::libc::O_CLOEXEC,
@@ -256,7 +274,7 @@ fn open_directory_nofollow(path: &Path) -> io::Result<File> {
     Ok(current)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn open_destination_for_update(destination: &Path) -> io::Result<File> {
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     let follow_final_symlink = fs::symlink_metadata(destination)
@@ -282,7 +300,7 @@ fn open_destination_for_update(destination: &Path) -> io::Result<File> {
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn open_destination_for_update(destination: &Path) -> io::Result<File> {
     OpenOptions::new()
         .write(true)
@@ -292,7 +310,7 @@ fn open_destination_for_update(destination: &Path) -> io::Result<File> {
         .open(destination)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn persist_temp_path(staged: TempPath, destination: &Path) -> io::Result<()> {
     run_test_hook("before-publication", destination);
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
@@ -329,7 +347,7 @@ fn persist_temp_path(staged: TempPath, destination: &Path) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn persist_temp_path(staged: TempPath, destination: &Path) -> io::Result<()> {
     run_test_hook("before-publication", destination);
     staged.persist(destination).map_err(|error| error.error)?;
@@ -360,7 +378,11 @@ pub(crate) fn apply_file_metadata_fd(file: &File, meta: &fs::Metadata) -> io::Re
 
 pub(crate) fn try_reflink(src: &File, dst: &File) -> bool {
     const FICLONE: nix::libc::c_ulong = 0x4004_9409;
-    unsafe { nix::libc::ioctl(dst.as_raw_fd(), FICLONE, src.as_raw_fd()) == 0 }
+    #[cfg(target_os = "android")]
+    let request = FICLONE as nix::libc::c_int;
+    #[cfg(not(target_os = "android"))]
+    let request = FICLONE;
+    unsafe { nix::libc::ioctl(dst.as_raw_fd(), request, src.as_raw_fd()) == 0 }
 }
 
 pub(crate) fn advise_sequential(file: &File) {
@@ -385,12 +407,25 @@ pub(crate) fn pace_hdd_writeback(file: &File, total: u64, next_pace_at: &mut u64
     const WAIT_BEFORE: u32 = 1;
     const WRITE: u32 = 2;
     unsafe {
-        let _ = nix::libc::sync_file_range(
-            file.as_raw_fd(),
-            start as nix::libc::off64_t,
-            STEP as nix::libc::off64_t,
-            WAIT_BEFORE | WRITE,
-        );
+        #[cfg(target_os = "android")]
+        {
+            let _ = nix::libc::syscall(
+                nix::libc::SYS_sync_file_range,
+                file.as_raw_fd(),
+                start as nix::libc::off_t,
+                STEP as nix::libc::off_t,
+                WAIT_BEFORE | WRITE,
+            );
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = nix::libc::sync_file_range(
+                file.as_raw_fd(),
+                start as nix::libc::off64_t,
+                STEP as nix::libc::off64_t,
+                WAIT_BEFORE | WRITE,
+            );
+        }
     }
     *next_pace_at = total.saturating_add(STEP);
 }
@@ -517,28 +552,33 @@ where
         }
         let count = (size - total).min(16 * 1024 * 1024) as usize;
         let copied = unsafe {
-            nix::libc::copy_file_range(
-                src.as_raw_fd(),
-                std::ptr::null_mut(),
-                dst.as_raw_fd(),
-                std::ptr::null_mut(),
-                count,
-                0,
-            )
+            #[cfg(target_os = "android")]
+            {
+                nix::libc::syscall(
+                    nix::libc::SYS_copy_file_range,
+                    src.as_raw_fd(),
+                    std::ptr::null_mut::<nix::libc::off_t>(),
+                    dst.as_raw_fd(),
+                    std::ptr::null_mut::<nix::libc::off_t>(),
+                    count,
+                    0,
+                )
+            }
+            #[cfg(not(target_os = "android"))]
+            {
+                nix::libc::copy_file_range(
+                    src.as_raw_fd(),
+                    std::ptr::null_mut(),
+                    dst.as_raw_fd(),
+                    std::ptr::null_mut(),
+                    count,
+                    0,
+                )
+            }
         };
         if copied < 0 {
             let err = io::Error::last_os_error();
-            if total == 0
-                && matches!(
-                    err.raw_os_error(),
-                    Some(
-                        nix::libc::EXDEV
-                            | nix::libc::EINVAL
-                            | nix::libc::ENOSYS
-                            | nix::libc::EOPNOTSUPP
-                    )
-                )
-            {
+            if total == 0 && copy_file_range_should_fallback(err.raw_os_error()) {
                 return Ok(None);
             }
             return Err(err);
@@ -554,6 +594,19 @@ where
         on_bytes(copied);
     }
     Ok(Some(total))
+}
+
+fn copy_file_range_should_fallback(errno: Option<i32>) -> bool {
+    copy_file_range_should_fallback_for_platform(errno, cfg!(target_os = "android"))
+}
+
+fn copy_file_range_should_fallback_for_platform(errno: Option<i32>, is_android: bool) -> bool {
+    // Android's seccomp/FUSE path can reject copy_file_range even though both
+    // descriptors opened successfully, while ordinary buffered I/O remains valid.
+    matches!(
+        errno,
+        Some(nix::libc::EXDEV | nix::libc::EINVAL | nix::libc::ENOSYS | nix::libc::EOPNOTSUPP)
+    ) || (is_android && matches!(errno, Some(nix::libc::EACCES | nix::libc::EPERM)))
 }
 
 pub(crate) fn copy_file_preserve_with_progress_buffer<F>(
@@ -958,7 +1011,7 @@ pub(crate) fn preserve_directory_times_tree(
     src_root: &Path,
     dst_base: &Path,
     include_root: bool,
-    src_base: &str,
+    src_base: &OsStr,
     dir_times: Option<&[ManifestDirTimeEntry]>,
 ) -> io::Result<()> {
     if let Some(entries) = dir_times {
@@ -966,7 +1019,15 @@ pub(crate) fn preserve_directory_times_tree(
         for entry in entries {
             let dst_dir =
                 map_dir_dest_relative_path(include_root, src_base, &entry.relative_path, dst_base);
-            set_directory_times_checked(&dst_dir, entry.atime, entry.mtime)?;
+            set_directory_times_checked(&dst_dir, entry.atime, entry.mtime).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "set directory timestamps for '{}': {error}",
+                        dst_dir.display()
+                    ),
+                )
+            })?;
         }
         return Ok(());
     }
@@ -996,9 +1057,17 @@ pub(crate) fn preserve_directory_times_tree(
     dirs.sort_by_key(|(path, _, _)| std::cmp::Reverse(path.components().count()));
 
     for (src_dir, atime, mtime) in dirs {
-        let rel = normalize_rel(src_dir.strip_prefix(src_root).unwrap_or(Path::new("")));
-        let dst_dir = map_dir_dest_path(include_root, src_base, &rel, dst_base);
-        set_directory_times_checked(&dst_dir, atime, mtime)?;
+        let relative_path = src_dir.strip_prefix(src_root).unwrap_or(Path::new(""));
+        let dst_dir = map_dir_dest_relative_path(include_root, src_base, relative_path, dst_base);
+        set_directory_times_checked(&dst_dir, atime, mtime).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "set directory timestamps for '{}': {error}",
+                    dst_dir.display()
+                ),
+            )
+        })?;
     }
     Ok(())
 }
@@ -1021,6 +1090,73 @@ fn set_directory_times_checked(path: &Path, atime: FileTime, mtime: FileTime) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn destination_open_traverses_searchable_non_readable_ancestor() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let restricted = root.path().join("search-only");
+        let parent = restricted.join("destination");
+        fs::create_dir_all(&parent).expect("create destination parent");
+        fs::set_permissions(&restricted, fs::Permissions::from_mode(0o111))
+            .expect("make ancestor search-only");
+
+        let destination = parent.join("copied-file");
+        let opened = open_destination_for_update(&destination);
+        fs::set_permissions(&restricted, fs::Permissions::from_mode(0o700))
+            .expect("restore ancestor permissions");
+
+        let mut file = opened.expect("open destination through search-only ancestor");
+        file.write_all(b"copied").expect("write destination");
+        file.flush().expect("flush destination");
+        assert_eq!(fs::read(destination).expect("read destination"), b"copied");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn directory_capability_walk_rejects_symlink_component() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let actual = root.path().join("actual");
+        let link = root.path().join("link");
+        fs::create_dir(&actual).expect("create actual directory");
+        symlink(&actual, &link).expect("create directory symlink");
+
+        assert!(open_directory_nofollow(&link).is_err());
+    }
+
+    #[test]
+    fn copy_file_range_permission_errors_fall_back_only_on_android() {
+        for errno in [nix::libc::EACCES, nix::libc::EPERM] {
+            assert!(copy_file_range_should_fallback_for_platform(
+                Some(errno),
+                true
+            ));
+            assert!(!copy_file_range_should_fallback_for_platform(
+                Some(errno),
+                false
+            ));
+        }
+    }
+
+    #[test]
+    fn copy_file_range_unsupported_errors_fall_back_on_all_platforms() {
+        for errno in [
+            nix::libc::EXDEV,
+            nix::libc::EINVAL,
+            nix::libc::ENOSYS,
+            nix::libc::EOPNOTSUPP,
+        ] {
+            assert!(copy_file_range_should_fallback_for_platform(
+                Some(errno),
+                false
+            ));
+        }
+        assert!(!copy_file_range_should_fallback_for_platform(
+            Some(nix::libc::EIO),
+            true
+        ));
+        assert!(!copy_file_range_should_fallback_for_platform(None, true));
+    }
 
     #[test]
     fn verification_detects_post_copy_corruption() {

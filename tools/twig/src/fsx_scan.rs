@@ -1,11 +1,54 @@
 use super::*;
 
-pub(crate) type RecursiveStats = (
+type RecursiveStatsValues = (
     HashMap<OsString, u64>,
     HashMap<OsString, (u64, u64)>,
     Option<u64>,
     Option<(u64, u64)>,
 );
+
+pub(crate) struct RecursiveStats {
+    pub(crate) sizes: HashMap<OsString, u64>,
+    pub(crate) counts: HashMap<OsString, (u64, u64)>,
+    pub(crate) root_size: Option<u64>,
+    pub(crate) root_counts: Option<(u64, u64)>,
+    pub(crate) complete: bool,
+}
+
+impl Default for RecursiveStats {
+    fn default() -> Self {
+        Self {
+            sizes: HashMap::new(),
+            counts: HashMap::new(),
+            root_size: None,
+            root_counts: None,
+            complete: true,
+        }
+    }
+}
+
+impl RecursiveStats {
+    fn complete((sizes, counts, root_size, root_counts): RecursiveStatsValues) -> Self {
+        Self {
+            sizes,
+            counts,
+            root_size,
+            root_counts,
+            complete: true,
+        }
+    }
+}
+
+fn live_scan_threads() -> usize {
+    let available = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1);
+    std::env::var("TWIG_SCAN_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| available.clamp(1, 16))
+}
 
 pub(crate) fn collect_recursive_stats_checked(
     base_path: &Path,
@@ -13,13 +56,24 @@ pub(crate) fn collect_recursive_stats_checked(
     dedupe_hardlinks: bool,
     need_sizes: bool,
     need_counts: bool,
-) -> Option<RecursiveStats> {
+) -> RecursiveStats {
     if !need_sizes && !need_counts {
-        return Some((HashMap::new(), HashMap::new(), None, None));
+        return RecursiveStats::default();
     }
     let canonical_base = fs::canonicalize(base_path).unwrap_or_else(|_| base_path.to_path_buf());
+    if show_hidden
+        && !is_ntfs_like_filesystem(&canonical_base)
+        && let Some(indexed) = collect_recursive_stats_from_index(
+            &canonical_base,
+            dedupe_hardlinks,
+            need_sizes,
+            need_counts,
+        )
+    {
+        return RecursiveStats::complete(indexed);
+    }
     if is_ntfs_like_filesystem(&canonical_base) {
-        return Some(collect_recursive_stats_legacy(
+        return RecursiveStats::complete(collect_recursive_stats_legacy(
             &canonical_base,
             show_hidden,
             dedupe_hardlinks,
@@ -37,92 +91,54 @@ pub(crate) fn collect_recursive_stats_checked(
         },
         count_files: need_counts,
         count_dirs: need_counts,
-        // Keep each child aggregate complete.  The root aggregate is reduced
-        // separately below so a hardlink can appear in every child while only
-        // contributing once to the total, matching Twig's longstanding UI.
-        hardlinks: fsx::scan::HardlinkMode::CountEveryEntry,
+        hardlinks: if dedupe_hardlinks {
+            fsx::scan::HardlinkMode::DeduplicateCandidates
+        } else {
+            fsx::scan::HardlinkMode::CountEveryEntry
+        },
         symlinks: fsx::scan::SymlinkMode::DoNotFollow,
         show_hidden,
-        threads: std::thread::available_parallelism()
-            .map(|value| value.get().min(4))
-            .unwrap_or(1),
+        // A 16-worker foreground cap restored the pre-refactor latency without
+        // the syscall contention measured at the full 32 logical CPUs.  The
+        // override makes unusually slow or remote mounts independently tunable.
+        threads: live_scan_threads(),
         ..fsx::scan::ScanRequest::default()
     };
-    let snapshot = fsx::scan::scan(&request);
+    let snapshot = fsx::scan::scan_top_level(&request);
     if !snapshot.complete {
-        RECURSIVE_SCAN_INCOMPLETE.store(true, Ordering::Relaxed);
         eprintln!(
-            "twig: recursive scan of {} skipped {} unreadable entr{}",
+            "twig: recursive scan of {} is partial; skipped {} unreadable entr{}",
             canonical_base.display(),
             snapshot.errors,
             if snapshot.errors == 1 { "y" } else { "ies" }
         );
-        return None;
+    }
+    if snapshot.overflowed {
+        eprintln!(
+            "twig: warning: one or more filesystem aggregates overflowed u64 and were saturated"
+        );
     }
     let mut sizes = HashMap::new();
     let mut counts = HashMap::new();
-    for entry in snapshot.entries.iter().filter(|entry| entry.depth == 1) {
-        let Some(name) = entry.path.file_name() else {
-            continue;
-        };
-        if entry.metadata.kind == fsx::EntryKind::Directory {
-            if need_sizes {
-                sizes.insert(
-                    name.to_os_string(),
-                    snapshot
-                        .aggregates
-                        .get(&entry.path)
-                        .map(|aggregate| aggregate.allocated_size)
-                        .unwrap_or(entry.metadata.allocated_size),
-                );
-            }
-            if need_counts {
-                let aggregate = snapshot.aggregates.get(&entry.path);
-                counts.insert(
-                    name.to_os_string(),
-                    aggregate
-                        .map(|aggregate| (aggregate.dirs, aggregate.files))
-                        .unwrap_or_default(),
-                );
-            }
-        } else if need_sizes {
-            sizes.insert(name.to_os_string(), entry.metadata.allocated_size);
+    for (name, aggregate) in snapshot.children {
+        if need_sizes {
+            sizes.insert(name.clone(), aggregate.allocated_size);
+        }
+        if need_counts {
+            counts.insert(name, (aggregate.dirs.saturating_add(1), aggregate.files));
         }
     }
     let root_size = if need_sizes {
-        let mut total = fs::symlink_metadata(&canonical_base)
-            .map(|metadata| fsx::metadata::allocated_size(&metadata))
-            .unwrap_or(0);
-        let mut seen = HashSet::new();
-        for entry in &snapshot.entries {
-            let include = if entry.metadata.kind == fsx::EntryKind::Directory {
-                true
-            } else if dedupe_hardlinks {
-                entry
-                    .metadata
-                    .hardlink_key()
-                    .map(|key| seen.insert(key))
-                    .unwrap_or(true)
-            } else {
-                true
-            };
-            if include {
-                total = total.saturating_add(entry.metadata.allocated_size);
-            }
-        }
-        Some(total)
+        Some(snapshot.root.allocated_size)
     } else {
         None
     };
-    let root_aggregate = snapshot.aggregates.get(&canonical_base);
-    Some((
+    RecursiveStats {
         sizes,
         counts,
         root_size,
-        need_counts.then(|| {
-            root_aggregate
-                .map(|value| (value.dirs.saturating_add(1), value.files))
-                .unwrap_or((1, 0))
-        }),
-    ))
+        root_counts: need_counts
+            .then(|| (snapshot.root.dirs.saturating_add(1), snapshot.root.files)),
+        complete: snapshot.complete,
+    }
 }

@@ -4,7 +4,6 @@
 //! execution, telemetry, and terminal output live in their own modules.
 
 use crate::domain::{InflightWriteLimiter, InflightWritePermit, MediaKind};
-use nix::sys::stat::{major, minor};
 use std::env;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
@@ -42,8 +41,8 @@ pub(crate) fn dev_media_kind(path: &Path) -> MediaKind {
     let device = metadata.dev();
     let sys_link = PathBuf::from(format!(
         "/sys/dev/block/{}:{}",
-        major(device),
-        minor(device)
+        nix::libc::major(device),
+        nix::libc::minor(device)
     ));
     let canonical = match fs::canonicalize(&sys_link) {
         Ok(path) => path,

@@ -3,12 +3,18 @@ use crate::fs_ops::*;
 use crate::git::*;
 use crate::model::*;
 use crate::render::*;
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct RecursiveEntryOverride {
+    size: Option<u64>,
+    counts: Option<(u64, u64)>,
+}
 use chrono::{Datelike, Local};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, IsTerminal, Write};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 pub(crate) fn sort_entries(entries: &mut [EntryInfo], ctx: &Context, reverse_sorted_output: bool) {
@@ -116,23 +122,7 @@ pub(crate) fn emit_entries(
                     ctx.color_enabled,
                 ));
             } else {
-                out.push_str(&get_styled_name(
-                    &entry.render_name,
-                    &entry.actual_path,
-                    &entry.metadata,
-                    ctx,
-                ));
-                if ctx.show_targets {
-                    if let Some(target) = entry.symlink_target.as_ref() {
-                        out.push_str(" -> ");
-                        out.push_str(&get_symlink_target_display(
-                            &entry.actual_path,
-                            target,
-                            entry.target_metadata.as_ref(),
-                            ctx,
-                        ));
-                    }
-                }
+                out.push_str(&render_entry_name(entry, ctx));
             }
         }
         out.push('\n');
@@ -141,6 +131,223 @@ pub(crate) fn emit_entries(
 
     let mut stdout = io::stdout().lock();
     stdout.write_all(output.as_bytes())
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+fn resolve_external_command(name: &Path) -> Vec<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+
+    if name.as_os_str().as_bytes().contains(&b'/') {
+        return is_executable_file(name)
+            .then(|| name.to_path_buf())
+            .into_iter()
+            .collect();
+    }
+
+    let path_value = std::env::var_os("PATH").unwrap_or_default();
+    let mut matches = Vec::new();
+    let mut seen = HashSet::new();
+    for directory in std::env::split_paths(&path_value) {
+        let directory = if directory.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            directory.as_path()
+        };
+        let candidate = directory.join(name);
+        if is_executable_file(&candidate) && seen.insert(candidate.clone()) {
+            matches.push(candidate);
+        }
+    }
+    matches
+}
+
+fn command_name(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn resolved_symlink_target(link_path: &Path, target: Option<&Path>) -> Option<PathBuf> {
+    let target = target?;
+    let joined = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        link_path.parent()?.join(target)
+    };
+    fs::canonicalize(joined).ok()
+}
+
+fn without_final_newline(output: &str) -> &str {
+    output.strip_suffix('\n').unwrap_or(output)
+}
+
+pub(crate) fn run_which(cli: Cli) -> io::Result<()> {
+    if cli.paths.len() == 1 && cli.paths[0] == Path::new(".") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--which requires at least one command",
+        ));
+    }
+
+    let mut resolved = Vec::new();
+    let mut missing = Vec::new();
+    for name in &cli.paths {
+        let matches = resolve_external_command(name);
+        if matches.is_empty() {
+            missing.push(command_name(name));
+        } else {
+            resolved.extend(matches);
+        }
+    }
+
+    let (mut ctx, _, _, _, piped_output) = build_context_and_sort_state(&cli);
+    ctx.color_enabled = output_enabled(cli.color, piped_output, false);
+    ctx.hyperlink = output_enabled(cli.hyperlink, piped_output, false);
+    ctx.classify = true;
+    ctx.show_perms = true;
+    ctx.show_size_logical = true;
+    ctx.show_owner = true;
+    ctx.show_time = true;
+    ctx.show_targets = true;
+    ctx.absolute = true;
+    ctx.header = false;
+    ctx.reverse = false;
+    ctx.omit_name = false;
+    ctx.column_preference = vec![
+        DetailColumn::Perms,
+        DetailColumn::SizeLogical,
+        DetailColumn::Owner,
+        DetailColumn::Time,
+    ];
+
+    let now = Local::now();
+    let now_year = now.year();
+    let now_timestamp = now.timestamp();
+    let empty_sizes = HashMap::new();
+    let empty_counts = HashMap::new();
+    let mut user_cache = HashMap::new();
+    let mut group_cache = HashMap::new();
+    let columns = vec![
+        DetailColumn::Perms,
+        DetailColumn::SizeLogical,
+        DetailColumn::Owner,
+        DetailColumn::Time,
+    ];
+    let mut output = String::new();
+
+    for path in resolved {
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                missing.push(command_name(&path));
+                eprintln!("twig: {}: {error}", path.display());
+                continue;
+            }
+        };
+        let display_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+
+        if metadata.file_type().is_symlink() {
+            ctx.show_targets = true;
+            ctx.hyperlink = output_enabled(cli.hyperlink, piped_output, false);
+            ctx.omit_name = false;
+            let target_metadata = fs::metadata(&path).ok();
+            let entry = create_entry_info(
+                &display_name,
+                path.clone(),
+                metadata,
+                target_metadata,
+                &ctx,
+                &empty_sizes,
+                &empty_counts,
+                None,
+                &mut user_cache,
+                &mut group_cache,
+                now_year,
+                now_timestamp,
+            );
+            let name_line = render_entry_name(&entry, &ctx);
+
+            ctx.show_targets = false;
+            ctx.hyperlink = false;
+            ctx.omit_name = true;
+            let link_metadata = print_detailed_list(std::slice::from_ref(&entry), &ctx, &columns);
+            let target_metadata_line =
+                resolved_symlink_target(&entry.actual_path, entry.symlink_target.as_deref())
+                    .and_then(|target_path| {
+                        let target_meta = fs::symlink_metadata(&target_path).ok()?;
+                        let target_name = target_path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| target_path.to_string_lossy().into_owned());
+                        let target_entry = create_entry_info(
+                            &target_name,
+                            target_path,
+                            target_meta,
+                            None,
+                            &ctx,
+                            &empty_sizes,
+                            &empty_counts,
+                            None,
+                            &mut user_cache,
+                            &mut group_cache,
+                            now_year,
+                            now_timestamp,
+                        );
+                        Some(print_detailed_list(
+                            std::slice::from_ref(&target_entry),
+                            &ctx,
+                            &columns,
+                        ))
+                    })
+                    .unwrap_or_default();
+
+            output.push_str(&name_line);
+            output.push('\n');
+            output.push_str(without_final_newline(&link_metadata));
+            output.push_str(" -> ");
+            output.push_str(without_final_newline(&target_metadata_line));
+            output.push('\n');
+        } else {
+            ctx.show_targets = false;
+            ctx.hyperlink = output_enabled(cli.hyperlink, piped_output, false);
+            ctx.omit_name = false;
+            let entry = create_entry_info(
+                &display_name,
+                path,
+                metadata,
+                None,
+                &ctx,
+                &empty_sizes,
+                &empty_counts,
+                None,
+                &mut user_cache,
+                &mut group_cache,
+                now_year,
+                now_timestamp,
+            );
+            output.push_str(&print_detailed_list(
+                std::slice::from_ref(&entry),
+                &ctx,
+                &columns,
+            ));
+        }
+    }
+
+    io::stdout().write_all(output.as_bytes())?;
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("command not found: {}", missing.join(", ")),
+        ))
+    }
 }
 
 pub(crate) fn render_multiple_paths(cli: Cli) -> io::Result<()> {
@@ -199,19 +406,26 @@ pub(crate) fn render_multiple_paths(cli: Cli) -> io::Result<()> {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| path.to_string_lossy().into_owned());
 
-        let (recursive_sizes, recursive_counts, root_true_size, root_recursive_counts) =
-            if is_actual_dir || (cli.dereference && is_target_dir) {
-                collect_recursive_stats_checked(
-                    &actual_path,
-                    true,
-                    cli.dedupe_hardlinks,
-                    cli.true_size,
-                    need_counts,
-                )
-                .unwrap_or_else(|| (HashMap::new(), HashMap::new(), None, None))
-            } else {
-                (HashMap::new(), HashMap::new(), None, None)
-            };
+        let RecursiveStats {
+            sizes: recursive_sizes,
+            counts: recursive_counts,
+            root_size: root_true_size,
+            root_counts: root_recursive_counts,
+            complete: recursive_complete,
+        } = if is_actual_dir || (cli.dereference && is_target_dir) {
+            collect_recursive_stats_checked(
+                &actual_path,
+                true,
+                cli.dedupe_hardlinks,
+                cli.true_size,
+                need_counts,
+            )
+        } else {
+            RecursiveStats::default()
+        };
+        if !recursive_complete {
+            first_error.get_or_insert_with(|| io::Error::other("recursive scan incomplete"));
+        }
 
         let mut entry = create_entry_info(
             &display_name,
@@ -221,6 +435,10 @@ pub(crate) fn render_multiple_paths(cli: Cli) -> io::Result<()> {
             &ctx,
             &recursive_sizes,
             &recursive_counts,
+            Some(RecursiveEntryOverride {
+                size: root_true_size,
+                counts: root_recursive_counts,
+            }),
             &mut user_cache,
             &mut group_cache,
             now_year,
@@ -339,19 +557,23 @@ pub(crate) fn render_path(cli: Cli) -> io::Result<()> {
         .as_ref()
         .is_some_and(fs::Metadata::is_dir);
     let stats_target_is_dir = input_is_dir || (cli.dereference && input_target_is_dir);
-    let (recursive_sizes, recursive_counts, root_true_size, root_recursive_counts) =
-        if stats_target_is_dir {
-            collect_recursive_stats_checked(
-                input_path,
-                true,
-                cli.dedupe_hardlinks,
-                cli.true_size,
-                need_counts,
-            )
-            .unwrap_or_else(|| (HashMap::new(), HashMap::new(), None, None))
-        } else {
-            (HashMap::new(), HashMap::new(), None, None)
-        };
+    let RecursiveStats {
+        sizes: recursive_sizes,
+        counts: recursive_counts,
+        root_size: root_true_size,
+        root_counts: root_recursive_counts,
+        complete: recursive_complete,
+    } = if stats_target_is_dir {
+        collect_recursive_stats_checked(
+            input_path,
+            true,
+            cli.dedupe_hardlinks,
+            cli.true_size,
+            need_counts,
+        )
+    } else {
+        RecursiveStats::default()
+    };
     let now = Local::now();
     let now_year = now.year();
     let now_timestamp = now.timestamp();
@@ -373,7 +595,11 @@ pub(crate) fn render_path(cli: Cli) -> io::Result<()> {
     )? {
         let mut stdout = io::stdout().lock();
         stdout.write_all(output.as_bytes())?;
-        return Ok(());
+        return if recursive_complete {
+            Ok(())
+        } else {
+            Err(io::Error::other("recursive scan incomplete"))
+        };
     }
 
     if let Some(output) = try_render_large_dir_fast_path(
@@ -387,7 +613,11 @@ pub(crate) fn render_path(cli: Cli) -> io::Result<()> {
     )? {
         let mut stdout = io::stdout().lock();
         stdout.write_all(output.as_bytes())?;
-        return Ok(());
+        return if recursive_complete {
+            Ok(())
+        } else {
+            Err(io::Error::other("recursive scan incomplete"))
+        };
     }
 
     if cli.all && input_is_dir && !cli.no_traverse {
@@ -400,6 +630,7 @@ pub(crate) fn render_path(cli: Cli) -> io::Result<()> {
                 &ctx,
                 &recursive_sizes,
                 &recursive_counts,
+                None,
                 &mut user_cache,
                 &mut group_cache,
                 now_year,
@@ -421,6 +652,7 @@ pub(crate) fn render_path(cli: Cli) -> io::Result<()> {
                     &ctx,
                     &recursive_sizes,
                     &recursive_counts,
+                    None,
                     &mut user_cache,
                     &mut group_cache,
                     now_year,
@@ -478,6 +710,7 @@ pub(crate) fn render_path(cli: Cli) -> io::Result<()> {
                 &ctx,
                 &recursive_sizes,
                 &recursive_counts,
+                None,
                 &mut user_cache,
                 &mut group_cache,
                 now_year,
@@ -501,6 +734,10 @@ pub(crate) fn render_path(cli: Cli) -> io::Result<()> {
             &ctx,
             &recursive_sizes,
             &recursive_counts,
+            Some(RecursiveEntryOverride {
+                size: root_true_size,
+                counts: root_recursive_counts,
+            }),
             &mut user_cache,
             &mut group_cache,
             now_year,
@@ -509,10 +746,9 @@ pub(crate) fn render_path(cli: Cli) -> io::Result<()> {
     }
 
     if cli.all && cli.true_size && input_is_dir && !cli.no_traverse {
-        let dot_true_size = root_true_size.unwrap_or_else(|| {
-            recursive_dir_on_disk_size(Path::new(&cli.path), true, cli.dedupe_hardlinks)
-        });
-        if let Some(dot_entry) = entries.iter_mut().find(|e| e.display_name == ".") {
+        if let Some(dot_true_size) = root_true_size
+            && let Some(dot_entry) = entries.iter_mut().find(|e| e.display_name == ".")
+        {
             dot_entry.true_size_str = format_size(dot_true_size);
             dot_entry.final_size = dot_true_size;
         }
@@ -549,7 +785,11 @@ pub(crate) fn render_path(cli: Cli) -> io::Result<()> {
         if cache_raw_enabled {
             write_cache_raw_paths(&[], &[])?;
         }
-        return Ok(());
+        return if recursive_complete {
+            Ok(())
+        } else {
+            Err(io::Error::other("recursive scan incomplete"))
+        };
     }
 
     if cli.git {
@@ -572,7 +812,12 @@ pub(crate) fn render_path(cli: Cli) -> io::Result<()> {
         cli.reverse ^ implicit_ascending_sort,
         cli.all && input_is_dir && pin_dot_entries,
         cache_raw_enabled,
-    )
+    )?;
+    if recursive_complete {
+        Ok(())
+    } else {
+        Err(io::Error::other("recursive scan incomplete"))
+    }
 }
 
 pub(crate) fn collect_output_paths(
@@ -605,6 +850,7 @@ pub(crate) fn create_entry_info(
     ctx: &Context,
     recursive_sizes: &HashMap<OsString, u64>,
     recursive_counts: &HashMap<OsString, (u64, u64)>,
+    recursive_override: Option<RecursiveEntryOverride>,
     user_cache: &mut HashMap<u32, String>,
     group_cache: &mut HashMap<u32, String>,
     now_year: i32,
@@ -668,6 +914,8 @@ pub(crate) fn create_entry_info(
 
     let true_size = if !needs_true_size {
         0
+    } else if let Some(size) = recursive_override.and_then(|value| value.size) {
+        size
     } else if is_symlink && ctx.dereference && !broken_symlink {
         match target_meta.as_ref() {
             Some(meta) if meta.is_dir() => {
@@ -702,6 +950,8 @@ pub(crate) fn create_entry_info(
     };
     let (dir_count, file_count) = if !needs_counts {
         (0, 0)
+    } else if let Some(counts) = recursive_override.and_then(|value| value.counts) {
+        counts
     } else if is_dir {
         recursive_counts
             .get(OsStr::new(display_name))
@@ -809,23 +1059,33 @@ pub(crate) fn create_entry_info(
 }
 
 pub(crate) fn run(cli: Cli) -> io::Result<()> {
-    reset_recursive_scan_status();
+    if cli.which {
+        return run_which(cli);
+    }
     if cli.paths.len() > 1 {
-        render_multiple_paths(cli)?;
-        return if recursive_scan_incomplete() {
-            Err(io::Error::other("recursive scan incomplete"))
-        } else {
-            Ok(())
-        };
+        return render_multiple_paths(cli);
     }
     for path in cli.paths.iter().cloned() {
         let mut path_cli = cli.clone();
         path_cli.path = path;
         render_path(path_cli)?;
     }
-    if recursive_scan_incomplete() {
-        Err(io::Error::other("recursive scan incomplete"))
-    } else {
-        Ok(())
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn which_resolves_an_executable_path() {
+        let executable = std::env::current_exe().unwrap();
+        assert_eq!(resolve_external_command(&executable), vec![executable]);
+    }
+
+    #[test]
+    fn which_rejects_a_missing_executable() {
+        let missing = Path::new("/this/path/does/not/exist/twig-command");
+        assert!(resolve_external_command(missing).is_empty());
     }
 }

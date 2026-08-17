@@ -112,7 +112,7 @@ pub(crate) fn delete_sync_destination_extras(
     let mut deleted = DeleteCleanupOutcome::default();
 
     for entry in &manifest.sync_delete_files {
-        let path = destination_root.join(entry.rel.as_ref());
+        let path = destination_root.join(&entry.relative_path);
         if cleanup_path_unreachable(&path, destination_root)? {
             deleted.files = deleted.files.saturating_add(1);
             deleted.bytes = deleted.bytes.saturating_add(entry.size);
@@ -157,7 +157,7 @@ pub(crate) fn delete_sync_destination_extras(
     }
 
     for entry in &manifest.sync_delete_dirs {
-        let path = destination_root.join(&entry.rel);
+        let path = destination_root.join(&entry.relative_path);
         if cleanup_path_unreachable(&path, destination_root)? {
             continue;
         }
@@ -402,10 +402,10 @@ pub(crate) fn remove_single_file(path: &Path, use_sudo: bool, mode: TransferMode
 }
 
 pub(crate) fn prune_move_source_duplicates(
-    src_path: &str,
-    dst_path: &str,
+    src_root: &Path,
+    dst_base: &Path,
     src_obj_kind: SrcObjKind,
-    contents_mode: bool,
+    include_root: bool,
     exclude_rel: Option<&str>,
     use_sudo: bool,
     mode: TransferMode,
@@ -418,8 +418,8 @@ pub(crate) fn prune_move_source_duplicates(
 
     match src_obj_kind {
         SrcObjKind::File => {
-            let src = Path::new(src_path);
-            let mut dst_buf = PathBuf::from(dst_path);
+            let src = src_root;
+            let mut dst_buf = dst_base.to_path_buf();
             if dst_buf.is_dir() {
                 let src_name = match src.file_name() {
                     Some(v) => v,
@@ -451,18 +451,10 @@ pub(crate) fn prune_move_source_duplicates(
             report_progress(false, &removed);
         }
         SrcObjKind::Dir => {
-            let src_no_trailing = src_path.trim_end_matches('/');
-            let include_root = if contents_mode {
-                false
-            } else {
-                !src_path.ends_with('/')
+            let Some(src_base) = src_root.file_name() else {
+                removed.success = false;
+                return removed;
             };
-            let src_root = Path::new(src_no_trailing);
-            let dst_base = Path::new(dst_path.trim_end_matches('/'));
-            let src_base = src_root
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
 
             if let Some(m) = manifest {
                 let mut privileged_deletes: Vec<(PathBuf, u64)> = Vec::new();
@@ -486,10 +478,10 @@ pub(crate) fn prune_move_source_duplicates(
                             .relative_path
                             .as_deref()
                             .map(|rel| {
-                                map_dir_dest_relative_path(include_root, &src_base, rel, dst_base)
+                                map_dir_dest_relative_path(include_root, src_base, rel, dst_base)
                             })
                             .unwrap_or_else(|| {
-                                map_dir_dest_path(include_root, &src_base, &entry.rel, dst_base)
+                                map_dir_dest_path(include_root, src_base, &entry.rel, dst_base)
                             });
                         if src_file == dst_item {
                             continue;
@@ -594,7 +586,7 @@ pub(crate) fn prune_move_source_duplicates(
                     continue;
                 }
                 let dst_item = if include_root {
-                    dst_base.join(&src_base).join(rel)
+                    dst_base.join(src_base).join(rel)
                 } else {
                     dst_base.join(rel)
                 };
@@ -626,4 +618,60 @@ pub(crate) fn prune_move_source_duplicates(
 
     report_progress(true, &removed);
     removed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::MergeCollisionPolicy;
+    use crate::plan::pre_scan_directory;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    use tempfile::tempdir;
+
+    #[test]
+    fn sync_cleanup_deletes_exact_non_utf8_path_without_touching_percent_sibling() {
+        let td = tempdir().expect("tempdir");
+        let source = td.path().join("source");
+        let destination = td.path().join("destination");
+        fs::create_dir(&source).expect("source directory");
+        fs::create_dir(&destination).expect("destination directory");
+
+        let literal_name = OsString::from("%FF");
+        let invalid_name = OsString::from_vec(vec![0xff]);
+        fs::write(source.join(&literal_name), b"source").expect("source percent file");
+        fs::write(destination.join(&literal_name), b"destination")
+            .expect("destination percent file");
+        fs::write(destination.join(&invalid_name), b"delete me")
+            .expect("destination non-UTF-8 file");
+
+        let scan = pre_scan_directory(
+            &source,
+            &destination,
+            false,
+            true,
+            false,
+            false,
+            false,
+            true,
+            false,
+            MergeCollisionPolicy::default(),
+            None,
+            None,
+            false,
+        );
+        assert!(scan.scan_complete);
+        let manifest = scan.transfer_manifest.expect("sync manifest");
+        assert_eq!(manifest.sync_delete_files.len(), 1);
+        assert_eq!(
+            manifest.sync_delete_files[0].relative_path,
+            PathBuf::from(&invalid_name)
+        );
+
+        let outcome = delete_sync_destination_extras(&destination, &manifest)
+            .expect("delete destination extras");
+        assert_eq!(outcome.files, 1);
+        assert!(destination.join(&literal_name).exists());
+        assert!(!destination.join(&invalid_name).exists());
+    }
 }

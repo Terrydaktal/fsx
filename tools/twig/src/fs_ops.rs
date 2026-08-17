@@ -7,7 +7,6 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[path = "fsx_scan.rs"]
@@ -15,16 +14,6 @@ mod fsx_scan;
 pub(crate) use fsx_scan::{RecursiveStats, collect_recursive_stats_checked};
 
 const NTFS_FS_TYPES: [&str; 3] = ["ntfs", "ntfs3", "fuseblk"];
-
-static RECURSIVE_SCAN_INCOMPLETE: AtomicBool = AtomicBool::new(false);
-
-pub(crate) fn reset_recursive_scan_status() {
-    RECURSIVE_SCAN_INCOMPLETE.store(false, Ordering::Relaxed);
-}
-
-pub(crate) fn recursive_scan_incomplete() -> bool {
-    RECURSIVE_SCAN_INCOMPLETE.load(Ordering::Relaxed)
-}
 
 #[derive(Clone)]
 pub(crate) struct MountInfo {
@@ -778,7 +767,12 @@ fn collect_recursive_stats_legacy(
     dedupe_hardlinks: bool,
     need_sizes: bool,
     need_counts: bool,
-) -> RecursiveStats {
+) -> (
+    HashMap<OsString, u64>,
+    HashMap<OsString, (u64, u64)>,
+    Option<u64>,
+    Option<(u64, u64)>,
+) {
     if !need_sizes && !need_counts {
         return (HashMap::new(), HashMap::new(), None, None);
     }
@@ -1047,6 +1041,7 @@ fn collect_recursive_stats_legacy(
     stats
 }
 
+#[cfg(feature = "index")]
 fn collect_recursive_stats_from_index(
     base_path: &Path,
     dedupe_hardlinks: bool,
@@ -1080,6 +1075,21 @@ fn collect_recursive_stats_from_index(
         need_sizes.then_some(root.allocated_size),
         need_counts.then_some((root.dirs, root.files)),
     ))
+}
+
+#[cfg(not(feature = "index"))]
+fn collect_recursive_stats_from_index(
+    _base_path: &Path,
+    _dedupe_hardlinks: bool,
+    _need_sizes: bool,
+    _need_counts: bool,
+) -> Option<(
+    HashMap<OsString, u64>,
+    HashMap<OsString, (u64, u64)>,
+    Option<u64>,
+    Option<(u64, u64)>,
+)> {
+    None
 }
 
 pub(crate) fn recursive_dir_on_disk_size(
@@ -1158,7 +1168,7 @@ mod tests {
     }
 
     #[test]
-    fn recursive_stats_dedupes_hardlinks_only_in_root_aggregate() {
+    fn recursive_stats_dedupes_hardlinks_per_display_scope() {
         let root = std::env::temp_dir().join(format!(
             "twig-hardlink-stats-{}-{}",
             std::process::id(),
@@ -1172,8 +1182,9 @@ mod tests {
         fs::write(root.join("a/data"), b"shared inode").unwrap();
         fs::hard_link(root.join("a/data"), root.join("b/data")).unwrap();
 
-        let (sizes, _, root_size, _) =
-            collect_recursive_stats_checked(&root, true, true, true, false).unwrap();
+        let RecursiveStats {
+            sizes, root_size, ..
+        } = collect_recursive_stats_checked(&root, true, true, true, false);
         let root_allocated = on_disk_size(&fs::symlink_metadata(&root).unwrap());
         let a_allocated = on_disk_size(&fs::symlink_metadata(root.join("a")).unwrap());
         let b_allocated = on_disk_size(&fs::symlink_metadata(root.join("b")).unwrap());

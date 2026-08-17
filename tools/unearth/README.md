@@ -6,11 +6,14 @@ Build:
 
 ```bash
 cargo build --release -p unearth
+cargo build --release -p unearth --no-default-features # SQLite-free live client
 cargo build --release -p fsxd
 cargo build --release -p unearth --features watcher --bin unearthd
 ```
 
-The default release build produces the short-lived `unearth` client without watcher-only code.
+The default release build produces the indexed short-lived `unearth` client without watcher-only
+code. The `index` feature is optional; `--no-default-features` produces a genuinely SQLite-free
+live client. The `jemalloc` feature is also optional for Android builds without an NDK C compiler.
 Build `fsxd` with the `watcher` feature when installing the live index service.
 `unearthd` remains an equivalent compatibility binary.
 
@@ -230,7 +233,7 @@ Usage:
                        [--reverse]
                        [--no-recurse|-R] [--follow-links]
                        [--ignore] [--hidden|-H] [--threads N]
-                       [--cache-raw] [--snapshot-cache]
+                       [--cache-raw] [--snapshot-cache] [--live|--no-index]
                        [--index|--index-if-watched] [--index-binary]
                        [--recent N]
                        [--index-refresh DIR] [--index-snapshot DIR]
@@ -396,6 +399,10 @@ Options:
       Timed-out scans do not replace an existing snapshot. Background
       refreshes use a long timeout by default unless --timeout is passed
       explicitly.
+  --live, --no-index
+      Force a live filesystem traversal. This never reads, opens, creates, or
+      refreshes the SQLite index, including for --full/-F searches. It cannot
+      be combined with index, watcher, recent, or snapshot modes.
   --index
       Query the global pooled path database instead of walking the filesystem.
       The database is stored at ~/.cache/fsx/index/fsx.db unless

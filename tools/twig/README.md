@@ -2,6 +2,10 @@
 
 `twig` is a single-binary Rust CLI that lists one directory level (`max_depth = 1`) with optional long-format metadata, sorting, Git integration, symlink target rendering, hyperlink support, path caching for shell tooling, and NTFS-aware recursive stats fast paths.
 
+The `index` Cargo feature is enabled by default for indexed recursive statistics. Build with
+`cargo build --release -p twig --no-default-features` for an SQLite-free live-only binary; the
+filesystem scanner remains available and simply skips the index fast path.
+
 ## Justification
 
 1. Eligible plain and long listings use dedicated `std::fs::read_dir` fast paths. When piping or when there are >1000 entries in the listing, `--color=auto` and `--hyperlink=auto` do not apply colour or hyperlinks.
@@ -124,12 +128,13 @@ From `twig --help`:
 - `--header` show list headers (moved to bottom with `-r`)
 - `--color <always|auto|never>` control ANSI color rendering
 - `--cache-raw` write listed full paths for dirs/files to `/tmp/fzf-history-$USER/...`
+- `--which COMMAND...` resolve external executables through `PATH` and render the native command-inspection view. It reports external files only; shell aliases, functions, and builtins are outside Twig's scope.
 
 ## Operation Pipeline (Execution Order)
 
 For each invocation, `twig` runs roughly this pipeline:
 
-1. Parse CLI flags and build rendering context.
+1. Parse CLI flags and build rendering context. `--which` enters the native external-command resolution path and shares one rendering context across all matches.
 2. Optionally precompute recursive stats when needed:
    - recursive sizes for `-S`
    - recursive counts for `-c` and `--sort dircount|filecount`
@@ -138,6 +143,9 @@ For each invocation, `twig` runs roughly this pipeline:
      child aggregates in one query over maintained per-directory statistics
    - preserve default hardlink deduplication from indexed `(device, inode)`
      candidates; incomplete index metadata falls back to the live scanner
+   - the live scanner makes one bounded pass, retaining only the root and
+     immediate-child aggregates; partial walks keep usable totals, print one
+     diagnostic, and return a failing exit status
    - on NTFS-like mounts, attempts MFT scan first and falls back automatically
 3. Scan one directory level for displayed entries (`std::fs::read_dir`).
 4. Build per-entry metadata struct:
@@ -166,6 +174,7 @@ When the listing path is on `ntfs`, `ntfs3`, or `fuseblk`:
 
 Environment controls:
 
+- `TWIG_SCAN_THREADS=<n>`: overrides live recursive scanner worker count (defaults to up to 16 available CPUs).
 - `TWIG_NTFS_THREADS=<n>`: overrides NTFS recursive scanner worker count.
 - `TWIG_NTFS_DEBUG=1`: prints whether MFT fast path was enabled or unavailable.
 
@@ -346,8 +355,8 @@ Core crates:
 - `jemallocator` for allocator performance
 
 Twig also consumes the sibling `fsx` crate for allocated-size metadata, lexical path normalization,
-and raw fzf path-cache output. NTFS MFT traversal, Twig's one-level listing fast paths, sorting,
-and presentation policy remain local to Twig.
+bounded live recursive aggregation, clean-index queries, and raw fzf path-cache output. NTFS MFT
+traversal, Twig's one-level listing fast paths, sorting, and presentation policy remain local to Twig.
 
 ## Notes and Limits
 

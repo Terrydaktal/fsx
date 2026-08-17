@@ -51,6 +51,7 @@ pub(crate) fn can_stream_direct(opts: &Options, use_style: bool) -> bool {
         && !opts.snapshot_cache
         && !opts.snapshot_refresh
         && !opts.absolute_paths
+        && !opts.lossless_paths
         && !opts.hyperlinks
 }
 pub(crate) fn format_size_iec(bytes: u64) -> String {
@@ -466,6 +467,7 @@ pub(crate) fn parse_ls_colors() -> ColorSpec {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn parse_ls_colors_value(spec: &str) -> ColorSpec {
     fsx::colors::parse_ls_colors_value(spec)
 }
@@ -555,12 +557,15 @@ pub(crate) fn decorator_for_res(res: &SearchResult) -> Option<char> {
 
 pub(crate) const MATCH_HIGHLIGHT_CODE: &str = "1;91";
 
-pub(crate) fn compile_highlight_spec(patterns: &[(String, bool)]) -> Result<HighlightSpec, String> {
+pub(crate) fn compile_highlight_spec(
+    patterns: &[(String, bool)],
+    case_sensitive: bool,
+) -> Result<HighlightSpec, String> {
     let mut prefix_rules = Vec::new();
     let mut leaf_rules = Vec::new();
     for (raw, full_path_match) in patterns {
         let re = RegexBuilder::new(raw)
-            .case_insensitive(true)
+            .case_insensitive(!case_sensitive)
             .build()
             .map_err(|e| format!("Invalid regex: {}", e))?;
         if *full_path_match {
@@ -645,6 +650,7 @@ pub(crate) fn colorize_segment_with_highlights(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn encode_file_uri_path(path: &str) -> String {
     fsx::terminal::encode_file_uri_path(Path::new(path))
         .and_then(|uri| uri.strip_prefix("file://").map(str::to_string))
@@ -652,12 +658,14 @@ pub(crate) fn encode_file_uri_path(path: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn parent_file_uri(prefix: &str, leaf_path: &str) -> String {
     let encoded_leaf = encode_file_uri_path(leaf_path);
     parent_file_uri_encoded(prefix, &encoded_leaf)
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn parent_file_uri_encoded(prefix: &str, encoded_leaf: &str) -> String {
     let encoded_prefix = encode_file_uri_path(prefix);
     format!("file://{}?select={}", encoded_prefix, encoded_leaf)

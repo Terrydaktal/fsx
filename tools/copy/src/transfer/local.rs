@@ -17,7 +17,7 @@ use crate::output::{
     log, print_transfer_columns_header, print_transfer_progress_bars, TransferEtaEstimator,
 };
 use crate::plan::{
-    map_dir_dest, map_dir_dest_relative_path, normalize_rel, regular_file_collision_change,
+    map_dir_dest_path, map_dir_dest_relative_path, normalize_rel, regular_file_collision_change,
     regular_file_relation_change, rel_matches_prefix,
 };
 use crate::runtime::{
@@ -50,8 +50,9 @@ fn remember_transfer_error(
 }
 
 pub(crate) fn run_rust_transfer(
-    src_path: &str,
-    dst_path: &str,
+    src_path: &Path,
+    dst_path: &Path,
+    include_root: bool,
     src_obj_kind: SrcObjKind,
     _is_move: bool,
     requested_mode: TransferMode,
@@ -75,9 +76,9 @@ pub(crate) fn run_rust_transfer(
         .map(|m| {
             EtaWorkload::from_manifest(
                 m,
-                src_obj_kind == SrcObjKind::Dir && !src_path.ends_with('/'),
+                src_obj_kind == SrcObjKind::Dir && include_root,
                 media,
-                transfer_profile_key(Path::new(src_path), Path::new(dst_path)),
+                transfer_profile_key(src_path, dst_path),
             )
         })
         .or_else(|| {
@@ -87,7 +88,7 @@ pub(crate) fn run_rust_transfer(
                         EtaWorkload::from_file(
                             meta.len(),
                             media,
-                            transfer_profile_key(Path::new(src_path), Path::new(dst_path)),
+                            transfer_profile_key(src_path, dst_path),
                         )
                     })
                 })
@@ -98,13 +99,13 @@ pub(crate) fn run_rust_transfer(
     print_transfer_columns_header();
     let io_window_for_avg = ProcessIoWindow::from_pid(std::process::id());
     let io_start_counters = io_window_for_avg.current_totals();
-    let device_window_for_avg = DeviceIoWindow::from_transfer_paths(src_path, dst_path);
+    let device_window_for_avg = DeviceIoWindow::from_local_paths(src_path, dst_path);
     let device_start_totals = device_window_for_avg.current_totals();
     let transfer_start_for_ticker = transfer_start;
     let io_start_counters_for_ticker = io_start_counters;
     let device_start_totals_for_ticker = device_start_totals;
-    let src_path_for_ticker = src_path.to_string();
-    let dst_path_for_ticker = dst_path.to_string();
+    let src_path_for_ticker = src_path.to_path_buf();
+    let dst_path_for_ticker = dst_path.to_path_buf();
     let eta_workload_for_ticker = eta_workload.clone();
     let eta_progress_for_ticker = Arc::clone(&eta_progress);
 
@@ -116,7 +117,7 @@ pub(crate) fn run_rust_transfer(
         let mut io_window = ProcessIoWindow::from_pid(std::process::id());
         let _ = io_window.sample();
         let device_window =
-            DeviceIoWindow::from_transfer_paths(&src_path_for_ticker, &dst_path_for_ticker);
+            DeviceIoWindow::from_local_paths(&src_path_for_ticker, &dst_path_for_ticker);
         let mut last_device_totals = device_start_totals_for_ticker;
         let mut last_device_at = transfer_start_for_ticker;
         let mut last_done_bytes: u64 = 0;
@@ -249,8 +250,8 @@ pub(crate) fn run_rust_transfer(
 
     match src_obj_kind {
         SrcObjKind::File => {
-            let src = Path::new(src_path);
-            let mut dst_buf = PathBuf::from(dst_path);
+            let src = src_path;
+            let mut dst_buf = dst_path.to_path_buf();
             let dst_is_symlink = fs::symlink_metadata(&dst_buf)
                 .map(|md| md.file_type().is_symlink())
                 .unwrap_or(false);
@@ -376,17 +377,14 @@ pub(crate) fn run_rust_transfer(
             }
         }
         SrcObjKind::Dir => {
-            let src_no_trailing = src_path.trim_end_matches('/');
-            let include_root = !src_path.ends_with('/');
-            let src_root = Path::new(src_no_trailing);
-            let dst_base = Path::new(dst_path.trim_end_matches('/'));
-            let src_base = src_root
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
+            let src_root = src_path;
+            let dst_base = dst_path;
+            let Some(src_base) = src_root.file_name() else {
+                finish_transfer!(1);
+            };
 
             if include_root {
-                let target = dst_base.join(&src_base);
+                let target = dst_base.join(src_base);
                 if let Err(err) = ensure_directory_target(&target, sync_mode) {
                     remember_transfer_error(
                         &transfer_errors,
@@ -422,12 +420,14 @@ pub(crate) fn run_rust_transfer(
                         .map(|relative_path| {
                             map_dir_dest_relative_path(
                                 include_root,
-                                &src_base,
+                                src_base,
                                 relative_path,
                                 dst_base,
                             )
                         })
-                        .unwrap_or_else(|| map_dir_dest(include_root, &src_base, rel, dst_base).0);
+                        .unwrap_or_else(|| {
+                            map_dir_dest_path(include_root, src_base, rel, dst_base)
+                        });
                     if let Err(err) = ensure_directory_target(&dst_dir, sync_mode) {
                         remember_transfer_error(
                             &transfer_errors,
@@ -457,20 +457,22 @@ pub(crate) fn run_rust_transfer(
                                 .map(|path| src_root.join(path))
                                 .unwrap_or_else(|| src_root.join(entry.rel.as_ref()))
                         });
-                        let (dst_item, _) =
-                            if let Some(relative_path) = entry.relative_path.as_deref() {
-                                (
-                                    map_dir_dest_relative_path(
-                                        include_root,
-                                        &src_base,
-                                        relative_path,
-                                        dst_base,
-                                    ),
-                                    String::new(),
+                        let exact_relative_path = entry
+                            .relative_path
+                            .as_deref()
+                            .or_else(|| src_file.strip_prefix(src_root).ok());
+                        let dst_item = exact_relative_path
+                            .map(|relative_path| {
+                                map_dir_dest_relative_path(
+                                    include_root,
+                                    src_base,
+                                    relative_path,
+                                    dst_base,
                                 )
-                            } else {
-                                map_dir_dest(include_root, &src_base, &entry.rel, dst_base)
-                            };
+                            })
+                            .unwrap_or_else(|| {
+                                map_dir_dest_path(include_root, src_base, &entry.rel, dst_base)
+                            });
                         let src_md = match fs::symlink_metadata(&src_file) {
                             Ok(md) => md,
                             Err(err) => {
@@ -720,7 +722,7 @@ pub(crate) fn run_rust_transfer(
                     src_root,
                     dst_base,
                     include_root,
-                    &src_base,
+                    src_base,
                     manifest.map(|m| m.dir_times.as_slice()),
                 ) {
                     remember_transfer_error(
@@ -740,30 +742,54 @@ pub(crate) fn run_rust_transfer(
                     }
                 }
             } else {
-                let mut entries: Vec<PathBuf> = WalkDir::new(src_root)
+                let mut entries: Vec<PathBuf> = Vec::new();
+                for result in WalkDir::new(src_root)
                     .sort(false)
                     .skip_hidden(false)
-                    .parallelism(jwalk::Parallelism::RayonDefaultPool {
-                        busy_timeout: Duration::from_secs(0),
-                    })
+                    .parallelism(jwalk::Parallelism::Serial)
                     .into_iter()
-                    .filter_map(Result::ok)
-                    .map(|e| e.path().to_path_buf())
-                    .collect();
+                {
+                    let entry = match result {
+                        Ok(entry) => entry,
+                        Err(error) => {
+                            let error = io::Error::other(error.to_string());
+                            remember_transfer_error(
+                                &transfer_errors,
+                                "traverse source",
+                                src_root,
+                                &error,
+                            );
+                            finish_transfer!(1);
+                        }
+                    };
+                    if let Some(error) = entry.read_children_error.as_ref() {
+                        let error = io::Error::other(error.to_string());
+                        remember_transfer_error(
+                            &transfer_errors,
+                            "read source directory",
+                            &entry.path(),
+                            &error,
+                        );
+                        finish_transfer!(1);
+                    }
+                    entries.push(entry.path().to_path_buf());
+                }
                 entries.sort();
 
                 for p in entries {
                     if p == src_root {
                         continue;
                     }
-                    let rel = normalize_rel(p.strip_prefix(src_root).unwrap_or(Path::new("")));
+                    let relative_path = p.strip_prefix(src_root).unwrap_or(Path::new(""));
+                    let rel = normalize_rel(relative_path);
                     if exclude_rel
                         .map(|prefix| rel_matches_prefix(&rel, prefix))
                         .unwrap_or(false)
                     {
                         continue;
                     }
-                    let (dst_item, _) = map_dir_dest(include_root, &src_base, &rel, dst_base);
+                    let dst_item =
+                        map_dir_dest_relative_path(include_root, src_base, relative_path, dst_base);
                     let md = match fs::symlink_metadata(&p) {
                         Ok(v) => v,
                         Err(_) => finish_transfer!(1),
@@ -848,7 +874,7 @@ pub(crate) fn run_rust_transfer(
                     src_root,
                     dst_base,
                     include_root,
-                    &src_base,
+                    src_base,
                     manifest.map(|m| m.dir_times.as_slice()),
                 ) {
                     remember_transfer_error(
@@ -864,4 +890,158 @@ pub(crate) fn run_rust_transfer(
     }
 
     finish_transfer!(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::DstObjKind;
+    use crate::plan::{pre_scan_directory, pre_scan_file};
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    use tempfile::tempdir;
+
+    #[test]
+    fn non_utf8_file_root_keeps_exact_basename_in_preview_and_transfer() {
+        let td = tempdir().expect("tempdir");
+        let source_parent = td.path().join("source-parent");
+        let destination = td.path().join("destination");
+        fs::create_dir(&source_parent).expect("source parent");
+        fs::create_dir(&destination).expect("destination");
+        let source_name = OsString::from_vec(b"file-\xff".to_vec());
+        let source = source_parent.join(&source_name);
+        fs::write(&source, b"payload").expect("source file");
+
+        let scan = pre_scan_file(
+            &source,
+            &destination,
+            DstObjKind::DirExisting,
+            true,
+            true,
+            false,
+            MergeCollisionPolicy::default(),
+            None,
+        );
+        assert!(scan.scan_complete);
+        assert_eq!(scan.change_preview.len(), 1);
+        assert_eq!(scan.change_preview[0].rel, "file-%FF");
+
+        let outcome = run_rust_transfer(
+            &source,
+            &destination,
+            false,
+            SrcObjKind::File,
+            false,
+            TransferMode::Copy,
+            scan.planned_bytes,
+            None,
+            MediaKind::Other,
+            false,
+            MergeCollisionPolicy::default(),
+            false,
+            None,
+            false,
+        );
+        assert_eq!(outcome.rc, 0);
+        assert_eq!(
+            fs::read(destination.join(&source_name)).unwrap(),
+            b"payload"
+        );
+        assert!(!destination.join("source").exists());
+        assert!(!destination.join("file-%FF").exists());
+    }
+
+    #[test]
+    fn non_utf8_directory_root_keeps_exact_basename_in_preview_and_transfer() {
+        let td = tempdir().expect("tempdir");
+        let source_parent = td.path().join("source-parent");
+        let destination = td.path().join("destination");
+        fs::create_dir(&source_parent).expect("source parent");
+        fs::create_dir(&destination).expect("destination");
+        let source_name = OsString::from_vec(b"dir-\xff".to_vec());
+        let source = source_parent.join(&source_name);
+        fs::create_dir(&source).expect("source directory");
+        fs::write(source.join("payload"), b"directory payload").expect("source child");
+
+        let scan = pre_scan_directory(
+            &source,
+            &destination,
+            true,
+            true,
+            false,
+            true,
+            true,
+            false,
+            false,
+            MergeCollisionPolicy::default(),
+            None,
+            None,
+            false,
+        );
+        assert!(scan.scan_complete);
+        assert!(scan
+            .change_preview
+            .iter()
+            .any(|entry| entry.rel == "dir-%FF/"));
+        let manifest = scan.transfer_manifest.expect("transfer manifest");
+
+        let outcome = run_rust_transfer(
+            &source,
+            &destination,
+            true,
+            SrcObjKind::Dir,
+            false,
+            TransferMode::Copy,
+            scan.planned_bytes,
+            Some(&manifest),
+            MediaKind::Other,
+            false,
+            MergeCollisionPolicy::default(),
+            false,
+            None,
+            false,
+        );
+        assert_eq!(outcome.rc, 0);
+        assert_eq!(
+            fs::read(destination.join(&source_name).join("payload")).unwrap(),
+            b"directory payload"
+        );
+        assert!(!destination.join("dir-%FF").exists());
+    }
+
+    #[test]
+    fn non_manifest_transfer_keeps_exact_non_utf8_descendant_paths() {
+        let td = tempdir().expect("tempdir");
+        let source = td.path().join("source");
+        let destination = td.path().join("destination");
+        let child_name = OsString::from_vec(b"child-\xff".to_vec());
+        fs::create_dir(&source).expect("source directory");
+        fs::create_dir(&destination).expect("destination directory");
+        fs::create_dir(source.join(&child_name)).expect("non-UTF-8 child directory");
+        fs::write(source.join(&child_name).join("payload"), b"payload").expect("source child");
+
+        let outcome = run_rust_transfer(
+            &source,
+            &destination,
+            true,
+            SrcObjKind::Dir,
+            false,
+            TransferMode::Copy,
+            7,
+            None,
+            MediaKind::Other,
+            false,
+            MergeCollisionPolicy::default(),
+            false,
+            None,
+            false,
+        );
+
+        assert_eq!(outcome.rc, 0);
+        assert_eq!(
+            fs::read(destination.join("source").join(&child_name).join("payload")).unwrap(),
+            b"payload"
+        );
+        assert!(!destination.join("source").join("child-%FF").exists());
+    }
 }

@@ -29,13 +29,19 @@ fn encode_lossless_bytes(bytes: &[u8]) -> String {
         } else if byte == b'%' {
             output.push_str("%25");
             index += 1;
-        } else if byte.is_ascii() {
+        } else if (0x20..0x7F).contains(&byte) {
             output.push(byte as char);
             index += 1;
-        } else if let Ok(value) = std::str::from_utf8(&bytes[index..]) {
-            let character = value.chars().next().expect("non-empty UTF-8 slice");
-            output.push(character);
-            index += character.len_utf8();
+        } else if byte >= 0x80 {
+            if let Ok(value) = std::str::from_utf8(&bytes[index..]) {
+                let character = value.chars().next().expect("non-empty UTF-8 slice");
+                output.push(character);
+                index += character.len_utf8();
+            } else {
+                use std::fmt::Write;
+                let _ = write!(output, "%{byte:02X}");
+                index += 1;
+            }
         } else {
             use std::fmt::Write;
             let _ = write!(output, "%{byte:02X}");

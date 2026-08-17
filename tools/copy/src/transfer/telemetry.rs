@@ -7,7 +7,6 @@ use crate::domain::{
 };
 use crate::output::log;
 use crate::plan::existing_probe_path;
-use nix::sys::stat::{major, minor};
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::io;
@@ -79,7 +78,7 @@ pub(crate) fn device_key_for_block_device(devnode: &Path) -> Option<(u64, u64)> 
     if rdev == 0 {
         return None;
     }
-    Some((major(rdev), minor(rdev)))
+    Some((nix::libc::major(rdev) as u64, nix::libc::minor(rdev) as u64))
 }
 
 pub(crate) fn parse_major_minor(raw: &str) -> Option<(u64, u64)> {
@@ -172,7 +171,7 @@ pub(crate) fn device_keys_for_path(path: &Path) -> Vec<(u64, u64)> {
         return Vec::new();
     };
     let dev = md.dev();
-    vec![(major(dev), minor(dev))]
+    vec![(nix::libc::major(dev) as u64, nix::libc::minor(dev) as u64)]
 }
 
 pub(crate) fn block_name_for_dev_key(key: (u64, u64)) -> Option<String> {
@@ -390,6 +389,13 @@ impl ProcessIoWindow {
 }
 
 impl DeviceIoWindow {
+    pub(crate) fn from_local_paths(src_path: &Path, dst_path: &Path) -> Self {
+        Self {
+            src_keys: device_keys_for_path(src_path),
+            dst_keys: device_keys_for_path(dst_path),
+        }
+    }
+
     pub(crate) fn from_transfer_paths(src_path: &str, dst_path: &str) -> Self {
         let src_keys = local_path_from_transfer_arg(src_path)
             .as_deref()

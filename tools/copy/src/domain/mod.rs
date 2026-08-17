@@ -183,9 +183,10 @@ pub(crate) struct ManifestFileEntry {
     pub(crate) mtime: Option<std::time::SystemTime>,
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub(crate) struct ManifestDeleteEntry {
     pub(crate) rel: Arc<str>,
+    pub(crate) relative_path: PathBuf,
     pub(crate) size: u64,
     pub(crate) dev: u64,
     pub(crate) ino: u64,
@@ -194,9 +195,10 @@ pub(crate) struct ManifestDeleteEntry {
     pub(crate) link_target: Option<PathBuf>,
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub(crate) struct ManifestDeleteDirEntry {
     pub(crate) rel: String,
+    pub(crate) relative_path: PathBuf,
     pub(crate) dev: u64,
     pub(crate) ino: u64,
 }

@@ -1,4 +1,5 @@
 use clap::Parser;
+#[cfg(feature = "jemalloc")]
 use jemallocator::Jemalloc;
 use std::io;
 
@@ -9,6 +10,7 @@ mod git;
 mod model;
 mod render;
 
+#[cfg(feature = "jemalloc")]
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 

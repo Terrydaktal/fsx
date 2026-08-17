@@ -557,6 +557,7 @@ dependencies = [
  "jwalk",
  "libc",
  "ntfs",
+ "rayon",
  "regex",
  "rusqlite",
 ]
@@ -1342,6 +1343,7 @@ dependencies = [
  "lscolors",
  "rayon",
  "rustc-hash",
+ "tempfile",
 ]
 
 [[package]]

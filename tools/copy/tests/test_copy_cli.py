@@ -136,6 +136,43 @@ class CopyCliIntegrationTests(unittest.TestCase):
             self.assertIn("Planned transfer bytes: 0 (0 B)", out)
             self.assertIn("No changes detected; nothing to copy.", out)
 
+    def test_file_target_tree_marks_metadata_identical_target_teal(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "source" / "which.fish"
+            dst = Path(td) / "destination" / "which.fish"
+            write_file(src, "which\n")
+            write_file(dst, "which\n")
+            same_ts = 1_700_000_000
+            os.utime(src, (same_ts, same_ts))
+            os.utime(dst, (same_ts, same_ts))
+
+            rc, out, raw = run_copy([str(src), str(dst), "--showall"])
+            self.assertEqual(rc, 0, out)
+            self.assertRegex(
+                out,
+                r"Files\s+\|\s*0\s+\|\s*0\s+\|\s*1\s+\|\s*0\s+\|\s*0\s+\|\s*0",
+            )
+            self.assertIn("\x1b[96mwhich.fish\x1b[0m", raw)
+            self.assertNotIn("\x1b[93mwhich.fish\x1b[0m", raw)
+
+    def test_same_directory_rename_tree_marks_identical_target_teal(self):
+        with tempfile.TemporaryDirectory() as td:
+            directory = Path(td) / "fish"
+            src = directory / "old.fish"
+            dst = directory / "new.fish"
+            write_file(src, "which\n")
+            write_file(dst, "which\n")
+            same_ts = 1_700_000_000
+            os.utime(src, (same_ts, same_ts))
+            os.utime(dst, (same_ts, same_ts))
+
+            rc, out, raw = run_copy(
+                ["--move", str(src), str(dst), "--showall"], confirm=False
+            )
+            self.assertEqual(rc, 0, out)
+            self.assertIn("\x1b[96mnew.fish\x1b[0m", raw)
+            self.assertNotIn("\x1b[93mnew.fish\x1b[0m", raw)
+
     def test_explicit_source_always_replaces_metadata_identical_collision(self):
         with tempfile.TemporaryDirectory() as td:
             src = Path(td) / "src" / "A"

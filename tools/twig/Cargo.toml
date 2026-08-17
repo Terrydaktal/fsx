@@ -4,11 +4,16 @@ license = "MIT"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["index", "jemalloc"]
+index = ["fsx/index"]
+jemalloc = ["dep:jemallocator"]
+
 [dependencies]
 chrono = "0.4.44"
 clap = { version = "4.6.0", features = ["derive"] }
-fsx = { workspace = true, features = ["colors", "git", "index", "ntfs", "scan", "terminal"] }
-jemallocator = "0.5.4"
+fsx = { workspace = true, features = ["colors", "git", "ntfs", "scan", "terminal"] }
+jemallocator = { version = "0.5.4", optional = true }
 jwalk = "0.8.1"
 libc = "0.2.183"
 lscolors = "0.21.0"

@@ -43,7 +43,7 @@ copy/
 - `-m`, `--move`
   - Move mode (transfer then remove source data).
 - `-s`, `--sudo`
-  - Run privileged transfer/removal commands through `pkexec`.
+  - Run privileged transfer/removal commands through `sudo`.
 - `-o`, `--overwrite`
   - Replace conflicting destination target instead of merge behavior.
 - `-c`, `--contents-only`
@@ -132,9 +132,8 @@ python3 -m unittest discover -s tools/copy/tests -v
 This includes real localhost SSH/rsync round trips, process-level signal tests, every hard-crash
 journal/publication boundary, corruption checks, and adversarial mutation between preview,
 preflight, execution, and publication. `tests/coverage.sh` records workspace LCOV output and makes
-CI enforce measured line and branch floors. Tests that genuinely
-need authority remain explicit opt-ins: run `COPY_RS_RUN_PKEXEC_TEST=1` in an interactive Polkit
-session for the real `pkexec` path, and run the isolated loopback-filesystem harness once through
-`pkexec bash -c 'COPY_RS_RUN_ROOT_FAULT_TESTS=1 /absolute/path/to/test_copy_linux_faults.sh'` for
-ENOSPC, read-only, and removed-device failures. The harness only creates a temporary image and loop
-mount beneath `/tmp` and validates its exact targets before cleanup.
+CI enforce measured line and branch floors. Tests that genuinely need authority remain explicit
+opt-ins: run `COPY_RS_RUN_SUDO_TEST=1` in an interactive terminal for the real `sudo` path. Run the
+isolated loopback-filesystem harness as root with `COPY_RS_RUN_ROOT_FAULT_TESTS=1` for ENOSPC,
+read-only, and removed-device failures. The harness only creates a temporary image and loop mount
+beneath `/tmp` and validates its exact targets before cleanup.

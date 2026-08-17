@@ -35,9 +35,9 @@ mod libc_time {
                 tm_wday: 0,
                 tm_yday: 0,
                 tm_isdst: 0,
-                #[cfg(any(target_env = "gnu", target_env = "musl"))]
+                #[cfg(any(target_env = "gnu", target_env = "musl", target_os = "android"))]
                 tm_gmtoff: 0,
-                #[cfg(any(target_env = "gnu", target_env = "musl"))]
+                #[cfg(any(target_env = "gnu", target_env = "musl", target_os = "android"))]
                 tm_zone: std::ptr::null(),
             };
             let t: time_t = secs as time_t;
@@ -173,7 +173,7 @@ pub(crate) fn backup_path_with_base(
 }
 
 fn rename_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         let source_path = source.to_path_buf();
         let destination_path = destination.to_path_buf();
@@ -209,7 +209,7 @@ fn rename_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
             Err(err)
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         if fs::symlink_metadata(destination).is_ok() {
             return Err(std::io::Error::new(

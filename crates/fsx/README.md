@@ -8,7 +8,7 @@ The crate provides:
 
 - stable metadata snapshots with explicit logical and allocated-size semantics;
 - lexical path normalization and missing-leaf path resolution;
-- bounded or recursive filesystem scanning with optional aggregation;
+- bounded top-level or fully retained recursive filesystem scanning with optional aggregation;
 - candidate-only hard-link accounting and symlink-cycle protection;
 - batched clean-index recursive statistics for a root and its visible children;
 - Git-ignore matching and porcelain status parsing;
@@ -47,6 +47,13 @@ The four consumers provide the input flags and choose policies, call the fsx
 fact APIs, then render or act on the returned data. `fsx` has no executable or
 background pipeline of its own and creates cache files only when a consumer
 explicitly calls `path_cache::write_raw_paths`.
+
+`scan::scan_top_level` streams one filesystem walk into a root aggregate and
+one aggregate per immediate child. It does not retain descendants or build an
+aggregate for every directory. Hardlink candidates are deduplicated globally
+for the root and independently per child; completion, error-count, and overflow
+state travel with the returned snapshot so concurrent callers do not share
+mutable status.
 
 `encode_lossless_path` and `decode_lossless_path` are intended for text-only storage boundaries
 such as SQLite. They preserve valid Unicode, escape `%`, and encode invalid Unix bytes as `%XX`.

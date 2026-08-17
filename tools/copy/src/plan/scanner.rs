@@ -17,6 +17,7 @@ use jwalk::WalkDir;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -105,8 +106,8 @@ pub(crate) fn destination_file_counts(
     let uncollided = idx
         .entries
         .iter()
-        .filter(|(rel, entry)| {
-            entry.kind == DestinationKind::Regular && !source_rel_files.contains(*rel)
+        .filter(|(identity_rel, entry)| {
+            entry.kind == DestinationKind::Regular && !source_rel_files.contains(*identity_rel)
         })
         .count() as u64;
     (total, uncollided)
@@ -121,6 +122,8 @@ pub(crate) enum DestinationKind {
 
 #[derive(Clone)]
 pub(crate) struct DestinationEntry {
+    pub(crate) relative_path: PathBuf,
+    pub(crate) display_rel: String,
     pub(crate) kind: DestinationKind,
     pub(crate) size: u64,
     pub(crate) dev: u64,
@@ -169,67 +172,83 @@ pub(crate) fn build_destination_index(destination_root: &Path) -> DestinationInd
                 continue;
             }
         };
-        let rel = ent
-            .path()
-            .strip_prefix(destination_root)
-            .ok()
-            .map(|p| {
-                if path_components_are_utf8(p) {
-                    normalize_rel(p)
-                } else {
-                    lossless_rel(p)
-                }
-            })
-            .unwrap_or_default();
-        if rel.is_empty() {
+        let relative_path = match ent.path().strip_prefix(destination_root) {
+            Ok(relative_path) => relative_path.to_path_buf(),
+            Err(_) => {
+                complete = false;
+                continue;
+            }
+        };
+        if relative_path.as_os_str().is_empty() {
             continue;
         }
+        let rel = lossless_rel(&relative_path);
+        let display_rel = display_rel_path(&relative_path);
 
         let fty = ent.file_type();
         if fty.is_file() {
-            let metadata = ent
-                .metadata()
-                .or_else(|_| fs::symlink_metadata(ent.path()))
-                .ok();
-            let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
-            let mtime = metadata.as_ref().and_then(|m| m.modified().ok());
+            let metadata = match ent.metadata().or_else(|_| fs::symlink_metadata(ent.path())) {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    complete = false;
+                    continue;
+                }
+            };
+            let size = metadata.len();
+            let mtime = metadata.modified().ok();
             entries.insert(
                 rel,
                 DestinationEntry {
+                    relative_path,
+                    display_rel,
                     kind: DestinationKind::Regular,
                     size,
-                    dev: metadata.as_ref().map(MetadataExt::dev).unwrap_or(0),
-                    ino: metadata.as_ref().map(MetadataExt::ino).unwrap_or(0),
+                    dev: metadata.dev(),
+                    ino: metadata.ino(),
                     mtime,
                     link_target: None,
                 },
             );
         } else if fty.is_dir() && ent.depth() > 0 {
-            let metadata = ent
-                .metadata()
-                .or_else(|_| fs::symlink_metadata(ent.path()))
-                .ok();
+            let metadata = match ent.metadata().or_else(|_| fs::symlink_metadata(ent.path())) {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    complete = false;
+                    continue;
+                }
+            };
             entries.insert(
                 rel,
                 DestinationEntry {
+                    relative_path,
+                    display_rel,
                     kind: DestinationKind::Directory,
                     size: 0,
-                    dev: metadata.as_ref().map(MetadataExt::dev).unwrap_or(0),
-                    ino: metadata.as_ref().map(MetadataExt::ino).unwrap_or(0),
-                    mtime: metadata.as_ref().and_then(|m| m.modified().ok()),
+                    dev: metadata.dev(),
+                    ino: metadata.ino(),
+                    mtime: metadata.modified().ok(),
                     link_target: None,
                 },
             );
         } else if fty.is_symlink() {
+            let link_target = match fs::read_link(ent.path()) {
+                Ok(target) => Some(target),
+                Err(_) => {
+                    complete = false;
+                    None
+                }
+            };
             entries.insert(
                 rel,
                 DestinationEntry {
+                    relative_path,
+                    display_rel,
                     kind: DestinationKind::Symlink,
                     size: 0,
                     dev: 0,
                     ino: 0,
                     mtime: None,
-                    link_target: fs::read_link(ent.path()).ok(),
+                    link_target,
                 },
             );
         } else {
@@ -285,9 +304,17 @@ fn lossless_rel(path: &Path) -> String {
     fsx::encode_lossless_path(path)
 }
 
+fn display_rel_path(path: &Path) -> String {
+    if path_components_are_utf8(path) {
+        normalize_rel(path)
+    } else {
+        lossless_rel(path)
+    }
+}
+
 pub(crate) fn map_dir_dest_path(
     include_root: bool,
-    src_base: &str,
+    src_base: &OsStr,
     rel: &str,
     dst_base: &Path,
 ) -> PathBuf {
@@ -306,7 +333,7 @@ pub(crate) fn map_dir_dest_path(
 
 pub(crate) fn map_dir_dest_relative_path(
     include_root: bool,
-    src_base: &str,
+    src_base: &OsStr,
     rel: &Path,
     dst_base: &Path,
 ) -> PathBuf {
@@ -370,27 +397,17 @@ pub(crate) fn insert_preview_change(
         .or_insert(kind);
 }
 
-pub(crate) fn map_dir_dest(
-    include_root: bool,
-    src_base: &str,
-    rel: &str,
-    dst_base: &Path,
-) -> (PathBuf, String) {
-    (
-        map_dir_dest_path(include_root, src_base, rel, dst_base),
-        map_display_rel(include_root, src_base, rel),
-    )
-}
-
-pub(crate) fn ensure_dst_file_path<'a>(
+fn ensure_dst_file_relative_path<'a>(
     dst_file: &'a mut Option<PathBuf>,
     include_root: bool,
-    src_base: &str,
-    rel: &str,
+    src_base: &OsStr,
+    relative_path: &Path,
     dst_base: &Path,
 ) -> &'a Path {
     dst_file
-        .get_or_insert_with(|| map_dir_dest_path(include_root, src_base, rel, dst_base))
+        .get_or_insert_with(|| {
+            map_dir_dest_relative_path(include_root, src_base, relative_path, dst_base)
+        })
         .as_path()
 }
 
@@ -522,6 +539,7 @@ pub(crate) fn pre_scan_new_tree_lite(
 
 pub(crate) struct ScannedFileEntry {
     rel: Arc<str>,
+    identity_rel: Arc<str>,
     relative_path: PathBuf,
     source_path: Option<PathBuf>,
     size: u64,
@@ -532,8 +550,14 @@ pub(crate) struct ScannedFileEntry {
     mtime: Option<SystemTime>,
 }
 
+pub(crate) struct ScannedDirEntry {
+    rel: String,
+    identity_rel: String,
+    relative_path: PathBuf,
+}
+
 type SrcScanEntries = (
-    Vec<String>,
+    Vec<ScannedDirEntry>,
     Vec<ScannedFileEntry>,
     Vec<ManifestDirTimeEntry>,
     bool,
@@ -565,21 +589,19 @@ pub(crate) fn scan_source_entries(
                     continue;
                 }
             };
+            if entry.read_children_error.is_some() {
+                scan_complete = false;
+            }
             let path = entry.path();
-            let path_is_lossless = !path_components_are_utf8(&path);
-            let rel = match path.strip_prefix(src_root) {
-                Ok(rel) => {
-                    if path_is_lossless {
-                        lossless_rel(rel)
-                    } else {
-                        normalize_rel(rel)
-                    }
-                }
+            let relative_path = match path.strip_prefix(src_root) {
+                Ok(rel) => rel.to_path_buf(),
                 Err(_) => {
                     scan_complete = false;
                     continue;
                 }
             };
+            let rel = display_rel_path(&relative_path);
+            let identity_rel = lossless_rel(&relative_path);
             if exclude_rel
                 .map(|prefix| rel_matches_prefix(&rel, prefix))
                 .unwrap_or(false)
@@ -596,25 +618,24 @@ pub(crate) fn scan_source_entries(
             if meta.is_dir() {
                 if collect_dir_times {
                     dir_times.push(ManifestDirTimeEntry {
-                        rel: rel.clone(),
-                        relative_path: path
-                            .strip_prefix(src_root)
-                            .unwrap_or(Path::new(""))
-                            .to_path_buf(),
+                        rel: identity_rel.clone(),
+                        relative_path: relative_path.clone(),
                         atime: FileTime::from_last_access_time(&meta),
                         mtime: FileTime::from_last_modification_time(&meta),
                     });
                 }
                 if !rel.is_empty() {
-                    dirs.push(rel);
+                    dirs.push(ScannedDirEntry {
+                        rel,
+                        identity_rel,
+                        relative_path,
+                    });
                 }
             } else if meta.is_file() {
                 files.push(ScannedFileEntry {
                     rel: rel.into(),
-                    relative_path: path
-                        .strip_prefix(src_root)
-                        .unwrap_or(Path::new(""))
-                        .to_path_buf(),
+                    identity_rel: identity_rel.into(),
+                    relative_path,
                     source_path: Some(path.clone()),
                     size: meta.len(),
                     is_symlink: false,
@@ -626,10 +647,8 @@ pub(crate) fn scan_source_entries(
             } else if meta.file_type().is_symlink() {
                 files.push(ScannedFileEntry {
                     rel: rel.into(),
-                    relative_path: path
-                        .strip_prefix(src_root)
-                        .unwrap_or(Path::new(""))
-                        .to_path_buf(),
+                    identity_rel: identity_rel.into(),
+                    relative_path,
                     source_path: Some(path),
                     size: 0,
                     is_symlink: true,
@@ -644,7 +663,7 @@ pub(crate) fn scan_source_entries(
         }
         return (dirs, files, dir_times, scan_complete);
     }
-    let mut dirs: Vec<String> = Vec::new();
+    let mut dirs: Vec<ScannedDirEntry> = Vec::new();
     let mut files: Vec<ScannedFileEntry> = Vec::new();
     let mut dir_times: Vec<ManifestDirTimeEntry> = Vec::new();
 
@@ -654,7 +673,7 @@ pub(crate) fn scan_source_entries(
         current_meta: Option<fs::Metadata>,
         rel: &str,
         exclude_rel: Option<&str>,
-        dirs: &mut Vec<String>,
+        dirs: &mut Vec<ScannedDirEntry>,
         files: &mut Vec<ScannedFileEntry>,
         dir_times: &mut Vec<ManifestDirTimeEntry>,
         collect_dir_times: bool,
@@ -667,20 +686,26 @@ pub(crate) fn scan_source_entries(
                 Err(_) => return false,
             },
         };
+        let relative_path = current
+            .strip_prefix(src_root)
+            .unwrap_or(Path::new(""))
+            .to_path_buf();
+        let identity_rel = lossless_rel(&relative_path);
         if meta.is_dir() {
             if collect_dir_times {
                 dir_times.push(ManifestDirTimeEntry {
-                    rel: rel.to_string(),
-                    relative_path: current
-                        .strip_prefix(src_root)
-                        .unwrap_or(Path::new(""))
-                        .to_path_buf(),
+                    rel: identity_rel.clone(),
+                    relative_path: relative_path.clone(),
                     atime: FileTime::from_last_access_time(&meta),
                     mtime: FileTime::from_last_modification_time(&meta),
                 });
             }
             if !rel.is_empty() {
-                dirs.push(rel.to_string());
+                dirs.push(ScannedDirEntry {
+                    rel: rel.to_string(),
+                    identity_rel,
+                    relative_path,
+                });
             }
             let rd = match fs::read_dir(current) {
                 Ok(v) => v,
@@ -695,21 +720,20 @@ pub(crate) fn scan_source_entries(
                     }
                 };
                 let child_path = entry.path();
+                let child_relative_path = child_path
+                    .strip_prefix(src_root)
+                    .unwrap_or(Path::new(""))
+                    .to_path_buf();
                 let child_name = child_path
                     .file_name()
-                    .map(|name| {
-                        if let Some(name) = name.to_str() {
-                            name.to_string()
-                        } else {
-                            lossless_rel(Path::new(name)).replace('/', "_")
-                        }
-                    })
+                    .map(|name| display_rel_path(Path::new(name)))
                     .unwrap_or_else(|| "<unknown>".to_string());
                 let child_rel = if rel.is_empty() {
                     child_name.clone()
                 } else {
                     format!("{rel}/{child_name}")
                 };
+                let child_identity_rel = lossless_rel(&child_relative_path);
                 if exclude_rel
                     .map(|prefix| rel_matches_prefix(&child_rel, prefix))
                     .unwrap_or(false)
@@ -738,10 +762,8 @@ pub(crate) fn scan_source_entries(
                 } else if child_meta.is_file() {
                     files.push(ScannedFileEntry {
                         rel: child_rel.into(),
-                        relative_path: child_path
-                            .strip_prefix(src_root)
-                            .unwrap_or(Path::new(""))
-                            .to_path_buf(),
+                        identity_rel: child_identity_rel.into(),
+                        relative_path: child_relative_path,
                         source_path: Some(child_path.clone()),
                         size: child_meta.len(),
                         is_symlink: false,
@@ -753,10 +775,8 @@ pub(crate) fn scan_source_entries(
                 } else if child_meta.file_type().is_symlink() {
                     files.push(ScannedFileEntry {
                         rel: child_rel.into(),
-                        relative_path: child_path
-                            .strip_prefix(src_root)
-                            .unwrap_or(Path::new(""))
-                            .to_path_buf(),
+                        identity_rel: child_identity_rel.into(),
+                        relative_path: child_relative_path,
                         source_path: Some(child_path),
                         size: 0,
                         is_symlink: true,
@@ -789,9 +809,9 @@ pub(crate) fn scan_source_entries(
 }
 
 pub(crate) fn pre_scan_directory(
-    src_path: &str,
-    dst_path: &str,
-    src_mnt: &Path,
+    src_root: &Path,
+    dst_base: &Path,
+    include_root: bool,
     build_manifest: bool,
     retain_identical_manifest: bool,
     build_source_display_paths: bool,
@@ -803,12 +823,8 @@ pub(crate) fn pre_scan_directory(
     bounded_preview_depth: Option<usize>,
     preview_lite: bool,
 ) -> PreScan {
-    let src_no_trailing = src_path.trim_end_matches('/');
-    let include_root = !src_path.ends_with('/');
-    let src_root = Path::new(src_no_trailing);
-    let dst_base = Path::new(dst_path.trim_end_matches('/'));
-    let src_base = match src_mnt.file_name().and_then(|s| s.to_str()) {
-        Some(name) => name.to_string(),
+    let src_base = match src_root.file_name() {
+        Some(name) => name,
         None => {
             return PreScan {
                 scan_complete: false,
@@ -816,9 +832,10 @@ pub(crate) fn pre_scan_directory(
             }
         }
     };
+    let src_base_display = display_rel_path(Path::new(src_base));
 
     let destination_root = if include_root {
-        dst_base.join(&src_base)
+        dst_base.join(src_base)
     } else {
         dst_base.to_path_buf()
     };
@@ -828,7 +845,7 @@ pub(crate) fn pre_scan_directory(
         return pre_scan_new_tree_lite(
             src_root,
             include_root,
-            &src_base,
+            &src_base_display,
             exclude_rel,
             build_source_display_paths,
             bounded_preview_depth,
@@ -851,7 +868,7 @@ pub(crate) fn pre_scan_directory(
         && (src_dev != dst_dev
             || (source_media == MediaKind::Nvme && destination_media == MediaKind::Nvme));
     let (mut dirs, files, mut dir_times, source_scan_complete, destination_index): (
-        Vec<String>,
+        Vec<ScannedDirEntry>,
         Vec<ScannedFileEntry>,
         Vec<ManifestDirTimeEntry>,
         bool,
@@ -898,18 +915,18 @@ pub(crate) fn pre_scan_directory(
                 .map(|depth| key.split('/').count() <= depth)
                 .unwrap_or(true)
         };
-        if include_root && !src_base.is_empty() {
-            source_display_paths.insert(src_base.clone());
+        if include_root && !src_base_display.is_empty() {
+            source_display_paths.insert(src_base_display.clone());
         }
-        for rel in &dirs {
-            let mapped = map_display_rel(include_root, &src_base, rel);
+        for entry in &dirs {
+            let mapped = map_display_rel(include_root, &src_base_display, &entry.rel);
             let key = mapped.trim_end_matches('/').to_string();
             if !key.is_empty() && within_display_depth(&key) {
                 source_display_paths.insert(key);
             }
         }
         for entry in &files {
-            let mapped = map_display_rel(include_root, &src_base, &entry.rel);
+            let mapped = map_display_rel(include_root, &src_base_display, &entry.rel);
             let key = mapped.trim_end_matches('/').to_string();
             if !key.is_empty() && within_display_depth(&key) {
                 source_display_paths.insert(key);
@@ -917,9 +934,17 @@ pub(crate) fn pre_scan_directory(
         }
         out.source_display_paths = source_display_paths;
     }
-    let source_rel_dirs: FxHashSet<String> = dirs.iter().cloned().collect();
+    let source_rel_dirs: FxHashSet<String> = dirs
+        .iter()
+        .map(|entry| entry.identity_rel.clone())
+        .collect();
+    let source_display_dirs: FxHashSet<String> =
+        dirs.iter().map(|entry| entry.rel.clone()).collect();
     let source_rel_files: FxHashSet<String> = if sync_mode {
-        files.iter().map(|entry| entry.rel.to_string()).collect()
+        files
+            .iter()
+            .map(|entry| entry.identity_rel.to_string())
+            .collect()
     } else {
         FxHashSet::default()
     };
@@ -928,7 +953,8 @@ pub(crate) fn pre_scan_directory(
 
     let mut directory_preview_changes: FxHashMap<String, ChangeKind> = FxHashMap::default();
     if include_root && destination_missing {
-        let (dst_root, display_rel) = map_dir_dest(true, &src_base, "", dst_base);
+        let dst_root = dst_base.join(src_base);
+        let display_rel = map_display_rel(true, &src_base_display, "");
         if !dst_root.is_dir() && !display_rel.is_empty() {
             insert_preview_change(
                 &mut directory_preview_changes,
@@ -942,31 +968,35 @@ pub(crate) fn pre_scan_directory(
     }
 
     let mut missing_dir_prefixes: FxHashSet<String> = FxHashSet::default();
-    dirs.sort_by_cached_key(|rel| {
+    dirs.sort_by_cached_key(|entry| {
         (
-            rel.bytes().filter(|byte| *byte == b'/').count(),
-            rel.clone(),
+            entry.relative_path.components().count(),
+            entry.identity_rel.clone(),
         )
     });
 
-    for rel in &dirs {
-        let parent_missing = match rel.rfind('/') {
-            Some(idx) => missing_dir_prefixes.contains(&rel[..idx]),
+    for entry in &dirs {
+        let identity_rel = &entry.identity_rel;
+        let parent_missing = match identity_rel.rfind('/') {
+            Some(idx) => missing_dir_prefixes.contains(&identity_rel[..idx]),
             None => false,
         };
         let dir_missing = if destination_missing || parent_missing {
             true
         } else if let Some(idx) = destination_index.as_ref() {
             !matches!(
-                idx.entries.get(rel.as_str()).map(|entry| entry.kind),
+                idx.entries
+                    .get(identity_rel.as_str())
+                    .map(|entry| entry.kind),
                 Some(DestinationKind::Directory)
             )
         } else {
-            !map_dir_dest_path(include_root, &src_base, rel, dst_base).is_dir()
+            !map_dir_dest_relative_path(include_root, src_base, &entry.relative_path, dst_base)
+                .is_dir()
         };
         if dir_missing {
-            missing_dir_prefixes.insert(rel.clone());
-            let display_rel = map_display_rel(include_root, &src_base, rel);
+            missing_dir_prefixes.insert(identity_rel.clone());
+            let display_rel = map_display_rel(include_root, &src_base_display, &entry.rel);
             let rel_dir = format!("{display_rel}/").replace("//", "/");
             insert_preview_change(
                 &mut directory_preview_changes,
@@ -980,7 +1010,15 @@ pub(crate) fn pre_scan_directory(
     }
 
     let source_dir_count = dirs.len();
-    let mut manifest_dirs = if build_manifest { Some(dirs) } else { None };
+    let mut manifest_dirs = if build_manifest {
+        Some(
+            dirs.iter()
+                .map(|entry| entry.identity_rel.clone())
+                .collect(),
+        )
+    } else {
+        None
+    };
 
     type FileReduce = (
         u64,
@@ -1022,6 +1060,7 @@ pub(crate) fn pre_scan_directory(
             },
             |mut acc, entry| {
                 let rel = &entry.rel;
+                let identity_rel = &entry.identity_rel;
                 let src_file = &entry.source_path;
                 let size = entry.size;
                 let is_symlink = entry.is_symlink;
@@ -1030,7 +1069,8 @@ pub(crate) fn pre_scan_directory(
                 // Keep presentation independent from execution: relation_change always uses
                 // type/size/mtime, while planned_change follows the selected collision policy.
                 let (planned_change, relation_change) = if destination_missing
-                    || (has_missing_subtrees && parent_rel_in_set(rel, &missing_dir_prefixes))
+                    || (has_missing_subtrees
+                        && parent_rel_in_set(identity_rel, &missing_dir_prefixes))
                 {
                     let change = Some(ChangeKind::NewFile);
                     (change, change)
@@ -1039,16 +1079,18 @@ pub(crate) fn pre_scan_directory(
                         Some(src_link) => {
                             if let Some(idx) = dst_idx {
                                 if matches!(
-                                    idx.entries.get(rel.as_ref()).map(|entry| entry.kind),
+                                    idx.entries
+                                        .get(identity_rel.as_ref())
+                                        .map(|entry| entry.kind),
                                     Some(DestinationKind::Symlink)
                                 ) {
                                     if symlink_targets_equal(
                                         src_link,
-                                        ensure_dst_file_path(
+                                        ensure_dst_file_relative_path(
                                             &mut dst_file,
                                             include_root,
-                                            &src_base,
-                                            rel,
+                                            src_base,
+                                            &entry.relative_path,
                                             dst_base,
                                         ),
                                     ) {
@@ -1056,28 +1098,28 @@ pub(crate) fn pre_scan_directory(
                                     } else {
                                         Some(ChangeKind::ModFile)
                                     }
-                                } else if idx.path_exists(rel.as_ref()) {
+                                } else if idx.path_exists(identity_rel.as_ref()) {
                                     Some(ChangeKind::ModFile)
                                 } else {
                                     Some(ChangeKind::NewFile)
                                 }
                             } else {
-                                match fs::symlink_metadata(ensure_dst_file_path(
+                                match fs::symlink_metadata(ensure_dst_file_relative_path(
                                     &mut dst_file,
                                     include_root,
-                                    &src_base,
-                                    rel,
+                                    src_base,
+                                    &entry.relative_path,
                                     dst_base,
                                 )) {
                                     Ok(dm)
                                         if dm.file_type().is_symlink()
                                             && symlink_targets_equal(
                                                 src_link,
-                                                ensure_dst_file_path(
+                                                ensure_dst_file_relative_path(
                                                     &mut dst_file,
                                                     include_root,
-                                                    &src_base,
-                                                    rel,
+                                                    src_base,
+                                                    &entry.relative_path,
                                                     dst_base,
                                                 ),
                                             ) =>
@@ -1095,20 +1137,25 @@ pub(crate) fn pre_scan_directory(
                 } else {
                     let src_mtime = entry.mtime;
                     let dst_exists = if let Some(idx) = dst_idx {
-                        idx.path_exists(rel.as_ref())
+                        idx.path_exists(identity_rel.as_ref())
                     } else {
-                        fs::symlink_metadata(ensure_dst_file_path(
+                        fs::symlink_metadata(ensure_dst_file_relative_path(
                             &mut dst_file,
                             include_root,
-                            &src_base,
-                            rel,
+                            src_base,
+                            &entry.relative_path,
                             dst_base,
                         ))
                         .is_ok()
                     };
-                    let dst_path =
-                        ensure_dst_file_path(&mut dst_file, include_root, &src_base, rel, dst_base);
-                    let dst_entry = dst_idx.and_then(|idx| idx.entries.get(rel.as_ref()));
+                    let dst_path = ensure_dst_file_relative_path(
+                        &mut dst_file,
+                        include_root,
+                        src_base,
+                        &entry.relative_path,
+                        dst_base,
+                    );
+                    let dst_entry = dst_idx.and_then(|idx| idx.entries.get(identity_rel.as_ref()));
                     let dst_is_symlink = if let Some(entry) = dst_entry {
                         entry.kind == DestinationKind::Symlink
                     } else {
@@ -1177,7 +1224,7 @@ pub(crate) fn pre_scan_directory(
                             _ => acc.1 += 1,
                         }
                     }
-                    let display_rel = map_display_rel(include_root, &src_base, rel);
+                    let display_rel = map_display_rel(include_root, &src_base_display, rel);
                     insert_preview_change(&mut acc.3, display_rel, kind, bounded_preview_depth);
                     add_parent_dir_chain(rel, include_root, &mut acc.6);
                 }
@@ -1267,7 +1314,12 @@ pub(crate) fn pre_scan_directory(
     }
 
     out.add_dirs = missing_dir_prefixes.len() as u64 + u64::from(root_new_dir);
-    for rel in &missing_dir_prefixes {
+    let missing_display_dirs: FxHashSet<&str> = dirs
+        .iter()
+        .filter(|entry| missing_dir_prefixes.contains(&entry.identity_rel))
+        .map(|entry| entry.rel.as_str())
+        .collect();
+    for rel in &missing_display_dirs {
         add_parent_dir_chain(rel, include_root, &mut changed_parent_dirs);
     }
     let mod_dirs_count = changed_parent_dirs
@@ -1276,8 +1328,8 @@ pub(crate) fn pre_scan_directory(
             if rel.is_empty() {
                 include_root && !root_new_dir
             } else {
-                source_rel_dirs.contains(rel.as_str())
-                    && !missing_dir_prefixes.contains(rel.as_str())
+                source_display_dirs.contains(rel.as_str())
+                    && !missing_display_dirs.contains(rel.as_str())
             }
         })
         .count() as u64;
@@ -1318,7 +1370,8 @@ pub(crate) fn pre_scan_directory(
                     && !source_rel_dirs.contains(rel)
                 {
                     sync_delete_files.push(ManifestDeleteEntry {
-                        rel: Arc::from(rel.as_str()),
+                        rel: Arc::from(entry.display_rel.as_str()),
+                        relative_path: entry.relative_path.clone(),
                         size: entry.size,
                         dev: entry.dev,
                         ino: entry.ino,
@@ -1326,7 +1379,8 @@ pub(crate) fn pre_scan_directory(
                         is_symlink: false,
                         link_target: entry.link_target.clone(),
                     });
-                    let display_rel = map_display_rel(include_root, &src_base, rel);
+                    let display_rel =
+                        map_display_rel(include_root, &src_base_display, &entry.display_rel);
                     insert_preview_change(
                         &mut directory_preview_changes,
                         display_rel,
@@ -1341,7 +1395,8 @@ pub(crate) fn pre_scan_directory(
                     && !source_rel_dirs.contains(rel)
                 {
                     sync_delete_files.push(ManifestDeleteEntry {
-                        rel: Arc::from(rel.as_str()),
+                        rel: Arc::from(entry.display_rel.as_str()),
+                        relative_path: entry.relative_path.clone(),
                         size: 0,
                         dev: 0,
                         ino: 0,
@@ -1349,7 +1404,8 @@ pub(crate) fn pre_scan_directory(
                         is_symlink: true,
                         link_target: entry.link_target.clone(),
                     });
-                    let display_rel = map_display_rel(include_root, &src_base, rel);
+                    let display_rel =
+                        map_display_rel(include_root, &src_base_display, &entry.display_rel);
                     insert_preview_change(
                         &mut directory_preview_changes,
                         display_rel,
@@ -1364,13 +1420,15 @@ pub(crate) fn pre_scan_directory(
                     && !source_rel_files.contains(rel)
                 {
                     sync_delete_dirs.push(ManifestDeleteDirEntry {
-                        rel: rel.clone(),
+                        rel: entry.display_rel.clone(),
+                        relative_path: entry.relative_path.clone(),
                         dev: entry.dev,
                         ino: entry.ino,
                     });
                     let display_rel = format!(
                         "{}/",
-                        map_display_rel(include_root, &src_base, rel).trim_end_matches('/')
+                        map_display_rel(include_root, &src_base_display, &entry.display_rel)
+                            .trim_end_matches('/')
                     );
                     insert_preview_change(
                         &mut directory_preview_changes,
@@ -1384,7 +1442,7 @@ pub(crate) fn pre_scan_directory(
         sync_delete_files.sort_by(|a, b| a.rel.cmp(&b.rel));
         sync_delete_dirs.sort_by_cached_key(|entry| {
             (
-                std::cmp::Reverse(entry.rel.bytes().filter(|byte| *byte == b'/').count()),
+                std::cmp::Reverse(entry.relative_path.components().count()),
                 entry.rel.clone(),
             )
         });
@@ -1437,7 +1495,7 @@ pub(crate) fn pre_scan_directory(
 
 pub(crate) fn pre_scan_file(
     src_mnt: &Path,
-    dst_path: &str,
+    dst_path: &Path,
     dst_obj_kind: DstObjKind,
     build_source_display_paths: bool,
     collect_file_relation_breakdown: bool,
@@ -1471,32 +1529,28 @@ pub(crate) fn pre_scan_file(
     out.total_regular_bytes = Some(size);
     out.total_dirs = Some(0);
 
-    let src_name = src_mnt
-        .file_name()
-        .and_then(|s| s.to_str())
-        .map(str::to_string)
-        .unwrap_or_else(|| "source".to_string());
-    let src_name_key = src_name.clone();
+    let Some(src_name) = src_mnt.file_name() else {
+        out.scan_complete = false;
+        return out;
+    };
+    let src_name_display = display_rel_path(Path::new(src_name));
+    let src_name_key = lossless_rel(Path::new(src_name));
 
     let (dst_file, display_rel) = match dst_obj_kind {
         DstObjKind::Dir | DstObjKind::DirExisting => {
-            let base = Path::new(dst_path.trim_end_matches('/'));
-            (base.join(&src_name), src_name.clone())
+            (dst_path.join(src_name), src_name_display.clone())
         }
         _ => {
-            let p = Path::new(dst_path);
-            let n = p
+            let n = dst_path
                 .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or(src_name.clone());
-            (p.to_path_buf(), n)
+                .map(|name| display_rel_path(Path::new(name)))
+                .unwrap_or(src_name_display.clone());
+            (dst_path.to_path_buf(), n)
         }
     };
 
     let destination_root = match dst_obj_kind {
-        DstObjKind::Dir | DstObjKind::DirExisting => {
-            Some(PathBuf::from(dst_path.trim_end_matches('/')))
-        }
+        DstObjKind::Dir | DstObjKind::DirExisting => Some(dst_path.to_path_buf()),
         _ => dst_file.parent().map(|p| {
             if p.as_os_str().is_empty() {
                 PathBuf::from(".")
@@ -1508,7 +1562,10 @@ pub(crate) fn pre_scan_file(
     if let Some(root) = destination_root {
         if root.is_dir() {
             let mut source_rel_files = HashSet::new();
-            let rel_key = display_rel.trim_end_matches('/').to_string();
+            let rel_key = dst_file
+                .strip_prefix(&root)
+                .map(lossless_rel)
+                .unwrap_or_default();
             if !rel_key.is_empty() {
                 source_rel_files.insert(rel_key);
             }
@@ -1529,8 +1586,9 @@ pub(crate) fn pre_scan_file(
                 index
                     .entries
                     .iter()
-                    .filter(|(rel, entry)| {
-                        entry.kind == DestinationKind::Regular && !source_rel_files.contains(*rel)
+                    .filter(|(identity_rel, entry)| {
+                        entry.kind == DestinationKind::Regular
+                            && !source_rel_files.contains(*identity_rel)
                     })
                     .count() as u64
             } else {
@@ -1627,7 +1685,51 @@ mod tests {
     use super::*;
     use crate::domain::{DstObjKind, MergeCollisionPolicy};
     use std::collections::HashSet;
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
+
+    #[test]
+    fn destination_index_does_not_alias_percent_escapes_and_non_utf8_names() {
+        let td = tempdir().expect("tempdir");
+        let literal_percent = td.path().join("%FF");
+        let invalid_byte = td.path().join(std::ffi::OsString::from_vec(vec![0xff]));
+        fs::write(&literal_percent, b"literal").expect("write literal percent file");
+        fs::write(&invalid_byte, b"invalid").expect("write non-UTF-8 file");
+
+        let index = build_destination_index(td.path());
+
+        assert!(index.complete);
+        assert_eq!(index.entries.len(), 2);
+        assert_eq!(
+            index.entries.get("%25FF").map(|entry| &entry.relative_path),
+            Some(&PathBuf::from("%FF"))
+        );
+        assert_eq!(
+            index.entries.get("%FF").map(|entry| &entry.relative_path),
+            Some(&PathBuf::from(std::ffi::OsString::from_vec(vec![0xff])))
+        );
+    }
+
+    #[test]
+    fn parallel_source_scan_marks_unreadable_subtrees_incomplete_when_permissions_apply() {
+        let td = tempdir().expect("tempdir");
+        let blocked = td.path().join("blocked");
+        fs::create_dir(&blocked).expect("blocked directory");
+        fs::write(blocked.join("hidden"), b"payload").expect("hidden file");
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o0)).expect("remove permissions");
+
+        if fs::read_dir(&blocked).is_ok() {
+            fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700))
+                .expect("restore permissions");
+            return;
+        }
+
+        let (_, _, _, complete) = scan_source_entries(td.path(), None, true, false);
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700))
+            .expect("restore permissions");
+        assert!(!complete);
+    }
 
     #[test]
     fn pre_scan_file_counts_uncollided_siblings_for_file_target() {
@@ -1647,7 +1749,7 @@ mod tests {
 
         let ps = pre_scan_file(
             &src,
-            &dst_file.display().to_string(),
+            &dst_file,
             DstObjKind::File,
             false,
             false,

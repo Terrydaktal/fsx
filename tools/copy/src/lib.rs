@@ -8,8 +8,10 @@ mod plan;
 mod runtime;
 mod transfer;
 
+#[cfg(feature = "jemalloc")]
 use jemallocator::Jemalloc;
 
+#[cfg(feature = "jemalloc")]
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 

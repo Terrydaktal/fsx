@@ -193,10 +193,10 @@ class CopyFaultIntegrationTests(unittest.TestCase):
             self.assertEqual(proc.returncode, expected_returncode, proc.stdout + proc.stderr)
             self.assertFalse(destination.exists(), proc.stdout + proc.stderr)
 
-    @unittest.skipUnless(shutil.which("pkexec"), "pkexec unavailable")
-    def test_actual_pkexec_invocation_reaches_policykit(self):
-        if not os.environ.get("COPY_RS_RUN_PKEXEC_TEST"):
-            self.skipTest("set COPY_RS_RUN_PKEXEC_TEST=1 in an interactive Polkit session")
+    @unittest.skipUnless(shutil.which("sudo"), "sudo unavailable")
+    def test_actual_sudo_invocation(self):
+        if not os.environ.get("COPY_RS_RUN_SUDO_TEST"):
+            self.skipTest("set COPY_RS_RUN_SUDO_TEST=1 in an interactive terminal")
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             source = root / "source.txt"

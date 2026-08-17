@@ -56,6 +56,80 @@ mod tests {
         std::env::temp_dir().join(format!("fsx-{name}-{}", std::process::id()))
     }
 
+    #[cfg(feature = "scan")]
+    type AggregateSignature = (u64, u64, u64, u64, bool);
+
+    #[cfg(feature = "scan")]
+    type TopLevelSignature = (
+        AggregateSignature,
+        Vec<(std::ffi::OsString, AggregateSignature)>,
+        bool,
+        u64,
+        bool,
+    );
+
+    #[cfg(feature = "scan")]
+    fn aggregate_signature(aggregate: &scan::Aggregate) -> AggregateSignature {
+        (
+            aggregate.logical_size,
+            aggregate.allocated_size,
+            aggregate.files,
+            aggregate.dirs,
+            aggregate.overflowed,
+        )
+    }
+
+    #[cfg(feature = "scan")]
+    fn top_level_signature(snapshot: &scan::TopLevelScanSnapshot) -> TopLevelSignature {
+        let mut children = snapshot
+            .children
+            .iter()
+            .map(|(name, aggregate)| (name.clone(), aggregate_signature(aggregate)))
+            .collect::<Vec<_>>();
+        children.sort_by(|left, right| left.0.cmp(&right.0));
+        (
+            aggregate_signature(&snapshot.root),
+            children,
+            snapshot.complete,
+            snapshot.errors,
+            snapshot.overflowed,
+        )
+    }
+
+    #[cfg(all(feature = "scan", unix))]
+    fn relative_path_between(from: &Path, to: &Path) -> PathBuf {
+        let from_components = from.components().collect::<Vec<_>>();
+        let to_components = to.components().collect::<Vec<_>>();
+        let common = from_components
+            .iter()
+            .zip(&to_components)
+            .take_while(|(left, right)| left == right)
+            .count();
+        let mut relative = PathBuf::new();
+        for _ in &from_components[common..] {
+            relative.push("..");
+        }
+        for component in &to_components[common..] {
+            relative.push(component.as_os_str());
+        }
+        relative
+    }
+
+    #[cfg(all(feature = "scan", unix))]
+    struct PermissionRestore {
+        path: PathBuf,
+        permissions: Option<std::fs::Permissions>,
+    }
+
+    #[cfg(all(feature = "scan", unix))]
+    impl Drop for PermissionRestore {
+        fn drop(&mut self) {
+            if let Some(permissions) = self.permissions.take() {
+                let _ = fs::set_permissions(&self.path, permissions);
+            }
+        }
+    }
+
     #[test]
     fn formats_shared_values() {
         assert_eq!(format_size_compact(4096), "4.0K");
@@ -148,6 +222,495 @@ mod tests {
             &fs::symlink_metadata(root.join("child")).expect("child metadata"),
         );
         assert!(child_size >= child_inode_size);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "scan")]
+    #[test]
+    fn top_level_scan_retains_only_immediate_aggregates() {
+        let root = temp_root("top-level-scan");
+        let _ = fs::remove_dir_all(&root);
+        let mut nested = root.join("child");
+        fs::create_dir_all(&nested).expect("create top-level directory");
+        for depth in 0..64 {
+            nested.push(format!("nested-{depth}"));
+            fs::create_dir(&nested).expect("create nested directory");
+        }
+        fs::write(nested.join("file"), b"payload").expect("create nested file");
+
+        let snapshot = scan::scan_top_level(&scan::ScanRequest {
+            root: root.clone(),
+            count_files: true,
+            count_dirs: true,
+            threads: 4,
+            ..scan::ScanRequest::default()
+        });
+
+        assert!(snapshot.complete);
+        assert_eq!(snapshot.children.len(), 1);
+        assert_eq!(snapshot.root.dirs, 65);
+        assert_eq!(snapshot.root.files, 1);
+        let child = snapshot
+            .children
+            .get(std::ffi::OsStr::new("child"))
+            .unwrap();
+        assert_eq!(child.dirs, 64);
+        assert_eq!(child.files, 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(feature = "scan", unix))]
+    #[test]
+    fn top_level_scan_resolves_relative_roots_without_losing_buckets() {
+        let root = temp_root("top-level-relative-root");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("child/deep")).expect("create relative-root tree");
+        fs::write(root.join("child/deep/file"), b"relative").expect("create relative-root file");
+        let cwd = fs::canonicalize(std::env::current_dir().expect("read current directory"))
+            .expect("canonicalize current directory");
+        let canonical_root = fs::canonicalize(&root).expect("canonicalize fixture root");
+        let relative_root = relative_path_between(&cwd, &canonical_root);
+        assert!(!relative_root.is_absolute());
+
+        let snapshot = scan::scan_top_level(&scan::ScanRequest {
+            root: relative_root,
+            size_mode: scan::SizeMode::Logical,
+            count_files: true,
+            count_dirs: true,
+            threads: 4,
+            ..scan::ScanRequest::default()
+        });
+
+        assert!(snapshot.complete);
+        assert_eq!(snapshot.errors, 0);
+        assert_eq!(snapshot.root.logical_size, 8);
+        assert_eq!(snapshot.root.dirs, 2);
+        assert_eq!(snapshot.root.files, 1);
+        assert_eq!(snapshot.children.len(), 1);
+        let child = &snapshot.children[std::ffi::OsStr::new("child")];
+        assert_eq!(child.logical_size, 8);
+        assert_eq!(child.dirs, 1);
+        assert_eq!(child.files, 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "scan")]
+    #[test]
+    fn top_level_scan_hidden_policy_applies_to_entries_and_subtrees() {
+        let root = temp_root("top-level-hidden");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("child")).expect("create visible directory");
+        fs::create_dir_all(root.join(".hidden-dir")).expect("create hidden directory");
+        fs::write(root.join("visible-root"), b"v").expect("create visible root file");
+        fs::write(root.join(".hidden-file"), b"hhh").expect("create hidden root file");
+        fs::write(root.join("child/visible-child"), b"vv").expect("create visible child file");
+        fs::write(root.join("child/.hidden-child"), b"hhhh").expect("create hidden child file");
+        fs::write(root.join(".hidden-dir/nested"), b"hhhhh")
+            .expect("create file in hidden subtree");
+
+        let request = scan::ScanRequest {
+            root: root.clone(),
+            size_mode: scan::SizeMode::Logical,
+            count_files: true,
+            count_dirs: true,
+            show_hidden: false,
+            threads: 4,
+            ..scan::ScanRequest::default()
+        };
+        let visible = scan::scan_top_level(&request);
+        assert!(visible.complete);
+        assert_eq!(visible.root.logical_size, 3);
+        assert_eq!(visible.root.dirs, 1);
+        assert_eq!(visible.root.files, 2);
+        assert!(
+            !visible
+                .children
+                .contains_key(std::ffi::OsStr::new(".hidden-file"))
+        );
+        assert!(
+            !visible
+                .children
+                .contains_key(std::ffi::OsStr::new(".hidden-dir"))
+        );
+        let visible_child = &visible.children[std::ffi::OsStr::new("child")];
+        assert_eq!(visible_child.logical_size, 2);
+        assert_eq!(visible_child.files, 1);
+
+        let with_hidden = scan::scan_top_level(&scan::ScanRequest {
+            show_hidden: true,
+            ..request
+        });
+        assert!(with_hidden.complete);
+        assert_eq!(with_hidden.root.logical_size, 15);
+        assert_eq!(with_hidden.root.dirs, 2);
+        assert_eq!(with_hidden.root.files, 5);
+        assert!(
+            with_hidden
+                .children
+                .contains_key(std::ffi::OsStr::new(".hidden-file"))
+        );
+        let hidden_directory = &with_hidden.children[std::ffi::OsStr::new(".hidden-dir")];
+        assert_eq!(hidden_directory.logical_size, 5);
+        assert_eq!(hidden_directory.files, 1);
+        let visible_child = &with_hidden.children[std::ffi::OsStr::new("child")];
+        assert_eq!(visible_child.logical_size, 6);
+        assert_eq!(visible_child.files, 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(feature = "scan", unix))]
+    #[test]
+    fn top_level_scan_root_symlink_obeys_follow_policy() {
+        let root = temp_root("top-level-root-symlink");
+        let _ = fs::remove_dir_all(&root);
+        let target = root.join("target");
+        let link = root.join("root-link");
+        fs::create_dir_all(target.join("child")).expect("create symlink target tree");
+        fs::write(target.join("file"), vec![b'f'; 8192]).expect("create target file");
+        std::os::unix::fs::symlink(&target, &link).expect("create root symlink");
+
+        let request = scan::ScanRequest {
+            root: link.clone(),
+            size_mode: scan::SizeMode::Allocated,
+            count_files: true,
+            count_dirs: true,
+            symlinks: scan::SymlinkMode::DoNotFollow,
+            threads: 4,
+            ..scan::ScanRequest::default()
+        };
+        let not_followed = scan::scan_top_level(&request);
+        let link_size = metadata::allocated_size(&fs::symlink_metadata(&link).unwrap());
+        assert!(not_followed.complete);
+        assert_eq!(not_followed.root.allocated_size, link_size);
+        assert_eq!(not_followed.root.dirs, 0);
+        assert_eq!(not_followed.root.files, 0);
+        assert!(not_followed.children.is_empty());
+
+        let followed = scan::scan_top_level(&scan::ScanRequest {
+            symlinks: scan::SymlinkMode::Follow,
+            ..request
+        });
+        let target_size = metadata::allocated_size(&fs::metadata(&link).unwrap());
+        let child_size = metadata::allocated_size(&fs::metadata(target.join("child")).unwrap());
+        let file_size = metadata::allocated_size(&fs::metadata(target.join("file")).unwrap());
+        assert!(followed.complete);
+        assert_eq!(followed.errors, 0);
+        assert_eq!(
+            followed.root.allocated_size,
+            target_size + child_size + file_size
+        );
+        assert_eq!(followed.root.dirs, 1);
+        assert_eq!(followed.root.files, 1);
+        assert_eq!(followed.children.len(), 2);
+        assert_eq!(
+            followed.children[std::ffi::OsStr::new("child")].allocated_size,
+            child_size
+        );
+        assert_eq!(
+            followed.children[std::ffi::OsStr::new("file")].allocated_size,
+            file_size
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(feature = "scan", unix))]
+    #[test]
+    fn top_level_scan_reports_unreadable_subtree_and_preserves_partial_totals() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root("top-level-unreadable");
+        let _ = fs::remove_dir_all(&root);
+        let good = root.join("good");
+        let blocked = root.join("blocked");
+        fs::create_dir_all(&good).expect("create readable directory");
+        fs::create_dir_all(&blocked).expect("create directory to restrict");
+        fs::write(good.join("file"), b"readable").expect("create readable file");
+        fs::write(blocked.join("file"), b"unreadable").expect("create restricted file");
+
+        let original_permissions = fs::symlink_metadata(&blocked)
+            .expect("read original permissions")
+            .permissions();
+        fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000))
+            .expect("restrict directory");
+        let restore = PermissionRestore {
+            path: blocked.clone(),
+            permissions: Some(original_permissions),
+        };
+        if fs::read_dir(&blocked).is_ok() {
+            drop(restore);
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+
+        let snapshot = scan::scan_top_level(&scan::ScanRequest {
+            root: root.clone(),
+            size_mode: scan::SizeMode::Allocated,
+            count_files: true,
+            count_dirs: true,
+            threads: 4,
+            ..scan::ScanRequest::default()
+        });
+        let root_size = metadata::allocated_size(&fs::symlink_metadata(&root).unwrap());
+        let good_size = metadata::allocated_size(&fs::symlink_metadata(&good).unwrap());
+        let blocked_size = metadata::allocated_size(&fs::symlink_metadata(&blocked).unwrap());
+        let file_size = metadata::allocated_size(&fs::symlink_metadata(good.join("file")).unwrap());
+
+        assert!(!snapshot.complete);
+        assert_eq!(snapshot.errors, 1);
+        assert_eq!(snapshot.root.dirs, 2);
+        assert_eq!(snapshot.root.files, 1);
+        assert_eq!(
+            snapshot.root.allocated_size,
+            root_size + good_size + blocked_size + file_size
+        );
+        let good_stats = &snapshot.children[std::ffi::OsStr::new("good")];
+        assert_eq!(good_stats.files, 1);
+        assert_eq!(good_stats.allocated_size, good_size + file_size);
+        let blocked_stats = &snapshot.children[std::ffi::OsStr::new("blocked")];
+        assert_eq!(blocked_stats.files, 0);
+        assert_eq!(blocked_stats.dirs, 0);
+        assert_eq!(blocked_stats.allocated_size, blocked_size);
+
+        drop(restore);
+        assert!(fs::read_dir(&blocked).is_ok());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(feature = "scan", unix))]
+    #[test]
+    fn top_level_scan_is_exact_across_thread_counts() {
+        let root = temp_root("top-level-thread-parity");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("a/deep")).expect("create first tree");
+        fs::create_dir_all(root.join("b")).expect("create second tree");
+        fs::create_dir_all(root.join(".hidden")).expect("create hidden tree");
+        fs::write(root.join("a/shared"), vec![b's'; 8192]).expect("create shared file");
+        fs::hard_link(root.join("a/shared"), root.join("a/shared-again"))
+            .expect("create local hardlink");
+        fs::hard_link(root.join("a/shared"), root.join("b/shared"))
+            .expect("create cross-child hardlink");
+        fs::write(root.join("a/deep/unique"), vec![b'u'; 16384]).expect("create unique file");
+        fs::write(root.join(".hidden/file"), b"hidden").expect("create hidden file");
+        std::os::unix::fs::symlink("missing", root.join("dangling"))
+            .expect("create dangling symlink");
+
+        let base_request = scan::ScanRequest {
+            root: root.clone(),
+            size_mode: scan::SizeMode::Allocated,
+            count_files: true,
+            count_dirs: true,
+            hardlinks: scan::HardlinkMode::DeduplicateCandidates,
+            show_hidden: true,
+            ..scan::ScanRequest::default()
+        };
+        let available = std::thread::available_parallelism()
+            .map(|value| value.get())
+            .unwrap_or(1);
+        let mut expected = None;
+        for threads in [1, 4, available] {
+            let snapshot = scan::scan_top_level(&scan::ScanRequest {
+                threads,
+                ..base_request.clone()
+            });
+            assert!(snapshot.complete, "threads={threads}");
+            let signature = top_level_signature(&snapshot);
+            if let Some(expected) = &expected {
+                assert_eq!(&signature, expected, "threads={threads}");
+            } else {
+                expected = Some(signature);
+            }
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(feature = "scan", unix))]
+    #[test]
+    fn top_level_scan_deduplicates_hardlinks_per_scope() {
+        let root = temp_root("top-level-hardlinks");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("a")).expect("create first directory");
+        fs::create_dir_all(root.join("b")).expect("create second directory");
+        fs::write(root.join("a/first"), vec![b'x'; 8192]).expect("create source file");
+        fs::hard_link(root.join("a/first"), root.join("a/second"))
+            .expect("create same-child hardlink");
+        fs::hard_link(root.join("a/first"), root.join("b/third"))
+            .expect("create cross-child hardlink");
+        fs::write(root.join("a/unique"), vec![b'u'; 16384]).expect("create unique file");
+
+        let request = scan::ScanRequest {
+            root: root.clone(),
+            size_mode: scan::SizeMode::Allocated,
+            count_files: true,
+            count_dirs: true,
+            hardlinks: scan::HardlinkMode::DeduplicateCandidates,
+            threads: 4,
+            ..scan::ScanRequest::default()
+        };
+        let snapshot = scan::scan_top_level(&request);
+        let root_size = metadata::allocated_size(&fs::symlink_metadata(&root).unwrap());
+        let a_size = metadata::allocated_size(&fs::symlink_metadata(root.join("a")).unwrap());
+        let b_size = metadata::allocated_size(&fs::symlink_metadata(root.join("b")).unwrap());
+        let file_size =
+            metadata::allocated_size(&fs::symlink_metadata(root.join("a/first")).unwrap());
+        let unique_size =
+            metadata::allocated_size(&fs::symlink_metadata(root.join("a/unique")).unwrap());
+
+        assert!(snapshot.complete);
+        assert_eq!(snapshot.errors, 0);
+        assert!(!snapshot.overflowed);
+        assert_eq!(snapshot.children.len(), 2);
+        assert!(file_size > 0);
+        assert!(unique_size > 0);
+        assert_eq!(
+            snapshot.root.allocated_size,
+            root_size + a_size + b_size + file_size + unique_size
+        );
+        assert_eq!(snapshot.root.logical_size, 0);
+        assert_eq!(snapshot.root.dirs, 2);
+        assert_eq!(snapshot.root.files, 4);
+        assert_eq!(
+            snapshot.children[std::ffi::OsStr::new("a")].allocated_size,
+            a_size + file_size + unique_size
+        );
+        assert_eq!(snapshot.children[std::ffi::OsStr::new("a")].dirs, 0);
+        assert_eq!(snapshot.children[std::ffi::OsStr::new("a")].files, 3);
+        assert_eq!(
+            snapshot.children[std::ffi::OsStr::new("b")].allocated_size,
+            b_size + file_size
+        );
+        assert_eq!(snapshot.children[std::ffi::OsStr::new("b")].dirs, 0);
+        assert_eq!(snapshot.children[std::ffi::OsStr::new("b")].files, 1);
+
+        let counted = scan::scan_top_level(&scan::ScanRequest {
+            hardlinks: scan::HardlinkMode::CountEveryEntry,
+            ..request
+        });
+        assert_eq!(
+            counted.root.allocated_size,
+            root_size + a_size + b_size + file_size * 3 + unique_size
+        );
+        assert_eq!(counted.root.dirs, 2);
+        assert_eq!(counted.root.files, 4);
+        assert_eq!(
+            counted.children[std::ffi::OsStr::new("a")].allocated_size,
+            a_size + file_size * 2 + unique_size
+        );
+        assert_eq!(counted.children[std::ffi::OsStr::new("a")].files, 3);
+        assert_eq!(
+            counted.children[std::ffi::OsStr::new("b")].allocated_size,
+            b_size + file_size
+        );
+        assert_eq!(counted.children[std::ffi::OsStr::new("b")].files, 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "scan")]
+    #[test]
+    fn top_level_scan_reports_a_missing_root_as_incomplete() {
+        let root = temp_root("missing-top-level-scan");
+        let _ = fs::remove_dir_all(&root);
+        let snapshot = scan::scan_top_level(&scan::ScanRequest {
+            root,
+            count_files: true,
+            count_dirs: true,
+            ..scan::ScanRequest::default()
+        });
+        assert!(!snapshot.complete);
+        assert!(snapshot.errors >= 1);
+        assert!(snapshot.children.is_empty());
+    }
+
+    #[cfg(feature = "scan")]
+    #[test]
+    fn scan_count_flags_are_independent() {
+        let root = temp_root("scan-count-flags");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("child")).expect("create directory");
+        fs::write(root.join("child/file"), b"file").expect("create file");
+
+        let files_only = scan::scan(&scan::ScanRequest {
+            root: root.clone(),
+            count_files: true,
+            ..scan::ScanRequest::default()
+        });
+        assert_eq!(files_only.aggregates[&root].files, 1);
+        assert_eq!(files_only.aggregates[&root].dirs, 0);
+
+        let dirs_only = scan::scan(&scan::ScanRequest {
+            root: root.clone(),
+            count_dirs: true,
+            ..scan::ScanRequest::default()
+        });
+        assert_eq!(dirs_only.aggregates[&root].files, 0);
+        assert_eq!(dirs_only.aggregates[&root].dirs, 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "scan")]
+    #[test]
+    fn scan_populates_only_the_requested_size_metric() {
+        let root = temp_root("scan-size-mode");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("child")).expect("create directory");
+        fs::write(root.join("child/file"), b"logical bytes").expect("create file");
+
+        let logical = scan::scan(&scan::ScanRequest {
+            root: root.clone(),
+            size_mode: scan::SizeMode::Logical,
+            ..scan::ScanRequest::default()
+        });
+        assert_eq!(logical.aggregates[&root].logical_size, 13);
+        assert_eq!(logical.aggregates[&root].allocated_size, 0);
+
+        let allocated = scan::scan(&scan::ScanRequest {
+            root: root.clone(),
+            size_mode: scan::SizeMode::Allocated,
+            ..scan::ScanRequest::default()
+        });
+        assert_eq!(allocated.aggregates[&root].logical_size, 0);
+        assert!(allocated.aggregates[&root].allocated_size > 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(feature = "scan", unix))]
+    #[test]
+    fn followed_directory_cycles_and_aliases_have_one_stable_representative() {
+        let root = temp_root("top-level-follow-cycle");
+        let _ = fs::remove_dir_all(&root);
+        let real = root.join("a-real");
+        fs::create_dir_all(&real).expect("create target directory");
+        fs::write(real.join("file"), b"payload").expect("create target file");
+        std::os::unix::fs::symlink("..", real.join("back")).expect("create relative cycle");
+        std::os::unix::fs::symlink("a-real", root.join("z-alias"))
+            .expect("create duplicate directory alias");
+
+        let snapshot = scan::scan_top_level(&scan::ScanRequest {
+            root: root.clone(),
+            size_mode: scan::SizeMode::Logical,
+            count_files: true,
+            count_dirs: true,
+            symlinks: scan::SymlinkMode::Follow,
+            max_depth: Some(100),
+            threads: 8,
+            ..scan::ScanRequest::default()
+        });
+
+        assert!(snapshot.complete);
+        assert_eq!(snapshot.errors, 0);
+        assert_eq!(snapshot.root.logical_size, 7);
+        assert_eq!(snapshot.root.dirs, 1);
+        assert_eq!(snapshot.root.files, 1);
+        assert_eq!(snapshot.children.len(), 1);
+        assert!(
+            snapshot
+                .children
+                .contains_key(std::ffi::OsStr::new("a-real"))
+        );
+        assert!(
+            !snapshot
+                .children
+                .contains_key(std::ffi::OsStr::new("z-alias"))
+        );
         let _ = fs::remove_dir_all(root);
     }
 

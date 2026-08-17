@@ -663,6 +663,11 @@ pub(crate) fn try_render_large_dir_long_fast_path(
         out.push_str(&fsx::terminal::dim_text(&time_text, ctx.color_enabled));
         out.push(' ');
 
+        if ctx.omit_name {
+            out.push('\n');
+            continue;
+        }
+
         if e.is_symlink && e.broken_symlink {
             let mut broken_text = escape_terminal_text(&e.display_name);
             if ctx.show_targets {
@@ -795,10 +800,12 @@ pub(crate) fn print_detailed_list(
                 }
             }
         }
-        if !header.is_empty() {
+        if !header.is_empty() && !ctx.omit_name {
             header.push(' ');
         }
-        header.push_str("NAME");
+        if !ctx.omit_name {
+            header.push_str("NAME");
+        }
         paint_if_enabled(
             nu_ansi_term::Style::default().bold(),
             &header,
@@ -935,8 +942,13 @@ pub(crate) fn print_detailed_list(
                 }
             }
         }
-        if !row.is_empty() {
+        if !row.is_empty() && !ctx.omit_name {
             row.push(' ');
+        }
+        if ctx.omit_name {
+            out.push_str(&row);
+            out.push('\n');
+            continue;
         }
         if e.is_symlink && e.broken_symlink {
             let mut broken_text = get_display_name_text(&e.render_name, &e.metadata, ctx);
@@ -1034,6 +1046,33 @@ pub(crate) fn get_styled_name(
         );
     }
     painted
+}
+
+pub(crate) fn render_entry_name(entry: &EntryInfo, ctx: &Context) -> String {
+    if entry.is_symlink && entry.broken_symlink {
+        let mut broken_text = get_display_name_text(&entry.render_name, &entry.metadata, ctx);
+        if ctx.show_targets {
+            if let Some(target) = entry.symlink_target.as_ref() {
+                broken_text.push_str(" -> ");
+                broken_text.push_str(&escape_terminal_text(&target.to_string_lossy()));
+            }
+        }
+        return highlight_broken_symlink_text(&broken_text, ctx.color_enabled);
+    }
+
+    let mut output = get_styled_name(&entry.render_name, &entry.actual_path, &entry.metadata, ctx);
+    if ctx.show_targets {
+        if let Some(target) = entry.symlink_target.as_ref() {
+            output.push_str(" -> ");
+            output.push_str(&get_symlink_target_display(
+                &entry.actual_path,
+                target,
+                entry.target_metadata.as_ref(),
+                ctx,
+            ));
+        }
+    }
+    output
 }
 
 fn paint_text_with_lscolors(

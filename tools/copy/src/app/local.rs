@@ -23,10 +23,12 @@ use crate::transfer::{
     backup_base_path, backup_path_with_base, copy_path_to_backup, flush_destination_writes,
     plan_backup_path, prefer_hdd_scheduler_for_paths, preflight_source_file_reads,
     premerge_fast_rename_noncolliding_children, remove_path_recursive,
-    report_source_read_preflight_failures, run_command_capture, run_move_cleanup_phase,
-    run_rsync_transfer, run_rust_transfer, run_sync_cleanup_phase, run_test_hook, TransferJournal,
+    report_source_read_preflight_failures, run_command_capture_os, run_move_cleanup_phase,
+    run_rsync_transfer_os, run_rust_transfer, run_sync_cleanup_phase, run_test_hook,
+    TransferJournal,
 };
 use std::collections::{HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -34,6 +36,24 @@ use std::time::Instant;
 use tempfile::TempDir;
 
 const NONMUTATING_PREFLIGHT_FAILURE: i32 = 2;
+
+fn display_file_name(name: &OsStr) -> String {
+    name.to_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| fsx::encode_lossless_path(Path::new(name)))
+}
+
+fn transfer_path_arg(path: &Path, trailing_slash: bool) -> OsString {
+    let mut argument = path.as_os_str().to_os_string();
+    if trailing_slash && !argument.is_empty() {
+        argument.push("/");
+    }
+    argument
+}
+
+fn directory_display_path(path: &Path) -> PathBuf {
+    PathBuf::from(transfer_path_arg(path, true))
+}
 
 pub(crate) struct LocalTransferRequest<'a> {
     pub(crate) args: &'a CliArgs,
@@ -89,12 +109,12 @@ fn planned_regular_source_paths(
 fn move_path_for_replace(source: &Path, destination: &Path, use_sudo: bool) -> bool {
     if use_sudo {
         let command = vec![
-            "mv".to_string(),
-            "--".to_string(),
-            source.display().to_string(),
-            destination.display().to_string(),
+            OsString::from("mv"),
+            OsString::from("--"),
+            source.as_os_str().to_os_string(),
+            destination.as_os_str().to_os_string(),
         ];
-        run_command_capture(&command, true)
+        run_command_capture_os(&command, true)
             .map(|output| output.code == 0)
             .unwrap_or(false)
     } else {
@@ -244,15 +264,7 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
         let dst_slot_for_src =
             realpath_allow_missing(&dst_mnt.join(src_mnt.file_name().unwrap_or_default()));
         if dst_slot_for_src == src_mnt {
-            let src_base = src_mnt
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let dst_base = dst_mnt
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
-            if src_base == dst_base {
+            if src_mnt.file_name() == dst_mnt.file_name() {
                 source_already_in_destination = true;
                 if force && !effective_source_contents_mode {
                     merge_child_into_parent = true;
@@ -312,7 +324,7 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
         && src_mnt.file_name() != dst_mnt.file_name();
 
     let mut target_dir_for_name: Option<PathBuf> = None;
-    let mut target_name_for_conflict: Option<String> = None;
+    let mut target_name_for_conflict: Option<OsString> = None;
     let mut overwrite_rename_dir_target = false;
     let mut overwrite_replace_file_target = false;
 
@@ -342,23 +354,20 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
             || (merge_child_into_parent && src_obj_kind == SrcObjKind::Dir)
         {
             target_dir_for_name = dst_mnt.parent().map(|p| p.to_path_buf());
-            target_name_for_conflict = dst_mnt.file_name().map(|s| s.to_string_lossy().to_string());
+            target_name_for_conflict = dst_mnt.file_name().map(OsStr::to_os_string);
         } else {
             target_dir_for_name = Some(dst_mnt.clone());
-            target_name_for_conflict = match src_obj_kind {
-                SrcObjKind::Dir => src_mnt.file_name().map(|s| s.to_string_lossy().to_string()),
-                SrcObjKind::File => src_mnt.file_name().map(|s| s.to_string_lossy().to_string()),
-            };
+            target_name_for_conflict = src_mnt.file_name().map(OsStr::to_os_string);
         }
     } else if dst_obj_kind == DstObjKind::DirNew && src_obj_kind == SrcObjKind::Dir {
         target_dir_for_name = dst_mnt.parent().map(|p| p.to_path_buf());
-        target_name_for_conflict = dst_mnt.file_name().map(|s| s.to_string_lossy().to_string());
+        target_name_for_conflict = dst_mnt.file_name().map(OsStr::to_os_string);
     } else if matches!(
         dst_obj_kind,
         DstObjKind::File | DstObjKind::FileExistingForDir
     ) {
         target_dir_for_name = dst_mnt.parent().map(|p| p.to_path_buf());
-        target_name_for_conflict = dst_mnt.file_name().map(|s| s.to_string_lossy().to_string());
+        target_name_for_conflict = dst_mnt.file_name().map(OsStr::to_os_string);
     }
 
     let mut target_conflict_path: Option<PathBuf> = None;
@@ -444,6 +453,7 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
             }
         }
     };
+    let include_source_root = src_obj_kind == SrcObjKind::Dir && !src_path.ends_with('/');
 
     let dst_path = if overwrite_rename_dir_target || overwrite_replace_file_target {
         dst_mnt
@@ -460,6 +470,11 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
             .trim_end_matches('/')
             .to_string()
     };
+    let src_transfer_arg = transfer_path_arg(
+        &src_mnt,
+        src_obj_kind == SrcObjKind::Dir && !include_source_root,
+    );
+    let dst_transfer_arg = transfer_path_arg(&dst_mnt, dst_path.ends_with('/'));
 
     let src_parent = src_mnt
         .parent()
@@ -578,7 +593,7 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
     let prescan = if source_already_in_destination {
         PreScan::default()
     } else {
-        let mut pre_dst_path = dst_path.clone();
+        let mut pre_dst_path = dst_mnt.clone();
         let mut preflight_tmpdir: Option<TempDir> = None;
 
         if src_obj_kind == SrcObjKind::Dir && overwrite_target_path.is_some() {
@@ -587,16 +602,16 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
                 .prefix(&format!(".{}-preflight-", requested_mode.word()))
                 .tempdir_in(pre_parent)
             {
-                pre_dst_path = td.path().join("target").display().to_string();
+                pre_dst_path = td.path().join("target");
                 preflight_tmpdir = Some(td);
             }
         }
 
         let ps = match src_obj_kind {
             SrcObjKind::Dir => pre_scan_directory(
-                &src_path,
-                &pre_dst_path,
                 &src_mnt,
+                &pre_dst_path,
+                include_source_root,
                 build_transfer_manifest,
                 is_move,
                 args.showall,
@@ -669,16 +684,9 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
         dst_obj_kind,
         DstObjKind::Dir | DstObjKind::DirExisting | DstObjKind::DirNew
     ) {
-        PathBuf::from(format!("{}/", dst_path.trim_end_matches('/')))
+        directory_display_path(&dst_mnt)
     } else {
-        PathBuf::from(
-            Path::new(dst_path.trim_end_matches('/'))
-                .parent()
-                .unwrap_or_else(|| Path::new("/"))
-                .display()
-                .to_string()
-                + "/",
-        )
+        directory_display_path(dst_mnt.parent().unwrap_or_else(|| Path::new("/")))
     };
 
     let mut simple_rename_src: Option<String> = None;
@@ -688,14 +696,10 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
     let mut rename_target_is_dir = false;
 
     if src_obj_kind == SrcObjKind::Dir && rename_dir_to_new_path {
-        let src_base = src_mnt
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let dst_base = dst_mnt
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
+        let src_base_os = src_mnt.file_name().unwrap_or_default();
+        let dst_base_os = dst_mnt.file_name().unwrap_or_default();
+        let src_base = display_file_name(src_base_os);
+        let dst_base = display_file_name(dst_base_os);
         let src_parent = src_mnt
             .parent()
             .map(|p| p.to_path_buf())
@@ -707,7 +711,7 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
         if src_parent == dst_parent
             && !src_base.is_empty()
             && !dst_base.is_empty()
-            && src_base != dst_base
+            && src_base_os != dst_base_os
         {
             simple_rename_src = Some(src_base);
             simple_rename_dst = Some(dst_base);
@@ -717,14 +721,10 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
             rename_target_is_dir = true;
         }
     } else if src_obj_kind == SrcObjKind::File && dst_obj_kind == DstObjKind::File {
-        let src_base = src_mnt
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let dst_base = dst_mnt
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
+        let src_base_os = src_mnt.file_name().unwrap_or_default();
+        let dst_base_os = dst_mnt.file_name().unwrap_or_default();
+        let src_base = display_file_name(src_base_os);
+        let dst_base = display_file_name(dst_base_os);
         let src_parent = src_mnt
             .parent()
             .map(|p| p.to_path_buf())
@@ -736,14 +736,14 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
         if src_parent == dst_parent
             && !src_base.is_empty()
             && !dst_base.is_empty()
-            && src_base != dst_base
+            && src_base_os != dst_base_os
         {
             simple_rename_src = Some(src_base);
             simple_rename_dst = Some(dst_base);
             simple_rename_parent = Some(src_parent);
         } else if !src_base.is_empty()
             && !dst_base.is_empty()
-            && (src_parent != dst_parent || src_base != dst_base)
+            && (src_parent != dst_parent || src_base_os != dst_base_os)
         {
             rename_target_only = Some(dst_base);
         }
@@ -753,20 +753,14 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
         rename_target_only.is_some() && rename_target_is_dir && overwrite_target_path.is_some();
 
     let mut preview_root = if let Some(parent) = &simple_rename_parent {
-        PathBuf::from(format!(
-            "{}/",
-            parent.display().to_string().trim_end_matches('/')
-        ))
+        directory_display_path(parent)
     } else if rename_target_only.is_some() && !preview_inside_target_dir && !rename_target_is_dir {
         let rename_parent = if rename_target_is_dir {
             dst_mnt.parent().unwrap_or_else(|| Path::new("/"))
         } else {
             dst_mnt.parent().unwrap_or_else(|| Path::new("/"))
         };
-        PathBuf::from(format!(
-            "{}/",
-            rename_parent.display().to_string().trim_end_matches('/')
-        ))
+        directory_display_path(rename_parent)
     } else {
         dst_preview_root.clone()
     };
@@ -793,12 +787,7 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
     if let Some(pb) = &planned_backup_path {
         if overwrite_target_path.is_none() {
             let backup_parent = pb.parent().unwrap_or_else(|| Path::new("/"));
-            let current_root = PathBuf::from(
-                preview_root
-                    .to_string_lossy()
-                    .trim_end_matches('/')
-                    .to_string(),
-            );
+            let current_root = preview_root.clone();
             if realpath_allow_missing(backup_parent) != realpath_allow_missing(&current_root) {
                 let current_root_name = current_root
                     .file_name()
@@ -817,18 +806,13 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
                         display_change_preview = remapped;
                     }
                 }
-                preview_root = PathBuf::from(format!(
-                    "{}/",
-                    backup_parent.display().to_string().trim_end_matches('/')
-                ));
+                preview_root = directory_display_path(backup_parent);
             }
         }
     }
 
     if is_move && merge_child_into_parent && src_obj_kind == SrcObjKind::Dir {
-        let preview_root_real = realpath_allow_missing(Path::new(
-            preview_root.to_string_lossy().trim_end_matches('/'),
-        ));
+        let preview_root_real = realpath_allow_missing(&preview_root);
         let src_real = realpath_allow_missing(&src_mnt);
         if let Ok(removed_rel) = src_real.strip_prefix(&preview_root_real) {
             let rel = normalize_rel(removed_rel);
@@ -841,8 +825,7 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
         }
     }
 
-    let preview_root_lossy = preview_root.to_string_lossy();
-    let preview_root_trimmed = Path::new(preview_root_lossy.trim_end_matches('/'));
+    let preview_root_trimmed = preview_root.as_path();
     let highlight_new_preview_leaf = src_obj_kind == SrcObjKind::Dir
         && matches!(dst_obj_kind, DstObjKind::DirNew)
         && !preview_root_trimmed.exists();
@@ -868,7 +851,7 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
     );
 
     let mut extra_added: HashSet<String> = HashSet::new();
-    let mut extra_modified: HashSet<String> = HashSet::new();
+    let extra_modified: HashSet<String> = HashSet::new();
     let mut extra_replaced: HashSet<String> = HashSet::new();
     let mut extra_removed: HashSet<String> = HashSet::new();
 
@@ -888,17 +871,18 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
     }
     if let Some(rt) = &rename_target_only {
         if !preview_inside_target_dir && !rename_target_is_dir {
-            if existing_same_name_target {
-                extra_modified.insert(rt.trim_end_matches('/').to_string());
-            } else {
+            // An existing target is not necessarily modified.  The relation
+            // preview already classifies it from type/size/mtime, so forcing
+            // `modified` here made metadata-identical file targets render
+            // yellow while the counts correctly reported them as identical.
+            if !existing_same_name_target {
                 extra_added.insert(rt.trim_end_matches('/').to_string());
             }
         }
     }
     if let Some(sd) = &simple_rename_dst {
-        if existing_same_name_target {
-            extra_modified.insert(sd.trim_end_matches('/').to_string());
-        } else {
+        // As above, leave existing targets to the relation-based preview.
+        if !existing_same_name_target {
             extra_added.insert(sd.trim_end_matches('/').to_string());
         }
     }
@@ -908,11 +892,7 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
         }
     }
 
-    let preview_root_trimmed_owned = preview_root
-        .to_string_lossy()
-        .trim_end_matches('/')
-        .to_string();
-    let preview_root_path = Path::new(&preview_root_trimmed_owned);
+    let preview_root_path = preview_root.as_path();
     {
         const BODY_MAX_LINES: usize = 25;
         let max_depth = args.tree_depth.unwrap_or(1);
@@ -1395,16 +1375,10 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
                 // already the replacement root, so preserve the source
                 // contents directly inside it; otherwise publication would
                 // create `target/source/source/...`.
-                let staged_source_path = if src_obj_kind == SrcObjKind::Dir {
-                    format!("{}/", src_path.trim_end_matches('/'))
-                } else {
-                    src_path.clone()
-                };
-
                 let transfer = match backend {
-                    TransferBackend::Rsync => run_rsync_transfer(
-                        &staged_source_path,
-                        &stage_path.display().to_string(),
+                    TransferBackend::Rsync => run_rsync_transfer_os(
+                        &transfer_path_arg(&src_mnt, src_obj_kind == SrcObjKind::Dir),
+                        stage_path.as_os_str(),
                         planned_bytes,
                         use_sudo,
                         false,
@@ -1412,8 +1386,9 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
                         !args.sync_mode,
                     ),
                     TransferBackend::Rust => run_rust_transfer(
-                        &staged_source_path,
-                        &stage_path.display().to_string(),
+                        &src_mnt,
+                        &stage_path,
+                        false,
                         src_obj_kind,
                         is_move,
                         requested_mode,
@@ -1506,12 +1481,12 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
 
                     if use_sudo {
                         let cmd = vec![
-                            "mv".to_string(),
-                            "--".to_string(),
-                            stage_path.display().to_string(),
-                            otp.display().to_string(),
+                            OsString::from("mv"),
+                            OsString::from("--"),
+                            stage_path.as_os_str().to_os_string(),
+                            otp.as_os_str().to_os_string(),
                         ];
-                        let mv_ok = run_command_capture(&cmd, true)
+                        let mv_ok = run_command_capture_os(&cmd, true)
                             .map(|o| o.code == 0)
                             .unwrap_or(false);
                         if !mv_ok {
@@ -1574,11 +1549,10 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
                         let mut move_cleanup_success = true;
                         if is_move {
                             let cleanup = run_move_cleanup_phase(
-                                &src_path,
-                                &otp.display().to_string(),
                                 &src_mnt,
+                                otp,
                                 src_obj_kind,
-                                effective_contents_mode_requested,
+                                false,
                                 effective_source_contents_mode,
                                 descendant_target_exclude_rel.as_deref(),
                                 true,
@@ -1606,11 +1580,10 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
                     }
                     if is_move {
                         let cleanup = run_move_cleanup_phase(
-                            &src_path,
-                            &otp.display().to_string(),
                             &src_mnt,
+                            otp,
                             src_obj_kind,
-                            effective_contents_mode_requested,
+                            false,
                             effective_source_contents_mode,
                             descendant_target_exclude_rel.as_deref(),
                             true,
@@ -1753,11 +1726,10 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
 
         if move_cleanup_only {
             let cleanup = run_move_cleanup_phase(
-                &src_path,
-                &dst_path,
                 &src_mnt,
+                &dst_mnt,
                 src_obj_kind,
-                effective_contents_mode_requested,
+                include_source_root,
                 effective_source_contents_mode,
                 descendant_target_exclude_rel.as_deref(),
                 rename_dir_to_new_path,
@@ -1791,9 +1763,9 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
         }
 
         let transfer = match backend {
-            TransferBackend::Rsync => run_rsync_transfer(
-                &src_path,
-                &dst_path,
+            TransferBackend::Rsync => run_rsync_transfer_os(
+                &src_transfer_arg,
+                &dst_transfer_arg,
                 planned_bytes,
                 use_sudo,
                 false,
@@ -1801,8 +1773,9 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
                 !args.sync_mode,
             ),
             TransferBackend::Rust => run_rust_transfer(
-                &src_path,
-                &dst_path,
+                &src_mnt,
+                &dst_mnt,
+                include_source_root,
                 src_obj_kind,
                 is_move,
                 requested_mode,
@@ -1841,15 +1814,18 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
             }
             if src_obj_kind == SrcObjKind::Dir {
                 if let Some(manifest) = transfer_manifest.as_ref() {
-                    let source_base = src_path
-                        .trim_end_matches('/')
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or_default();
+                    let Some(source_base) = src_mnt.file_name() else {
+                        log(
+                            requested_mode,
+                            "Failed to resolve the source directory basename.",
+                            LogLevel::Error,
+                        );
+                        return 1;
+                    };
                     if let Err(err) = crate::transfer::preserve_directory_times_tree(
-                        Path::new(src_path.trim_end_matches('/')),
-                        Path::new(dst_path.trim_end_matches('/')),
-                        !src_path.ends_with('/'),
+                        &src_mnt,
+                        &dst_mnt,
+                        include_source_root,
                         source_base,
                         Some(&manifest.dir_times),
                     ) {
@@ -1865,11 +1841,10 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
             log_transfer_complete(requested_mode);
             if is_move {
                 let cleanup = run_move_cleanup_phase(
-                    &src_path,
-                    &dst_path,
                     &src_mnt,
+                    &dst_mnt,
                     src_obj_kind,
-                    effective_contents_mode_requested,
+                    include_source_root,
                     effective_source_contents_mode,
                     descendant_target_exclude_rel.as_deref(),
                     rename_dir_to_new_path,
@@ -1899,8 +1874,13 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
                     if !manifest.sync_delete_files.is_empty()
                         || !manifest.sync_delete_dirs.is_empty()
                     {
-                        let cleanup =
-                            run_sync_cleanup_phase(&src_path, &dst_path, requested_mode, manifest);
+                        let cleanup = run_sync_cleanup_phase(
+                            &src_mnt,
+                            &dst_mnt,
+                            include_source_root,
+                            requested_mode,
+                            manifest,
+                        );
                         deleted_cleanup_total.files = deleted_cleanup_total
                             .files
                             .saturating_add(cleanup.stats.deleted.files);

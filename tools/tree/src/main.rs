@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock};
 
-#[cfg(not(target_env = "msvc"))]
+#[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
 #[global_allocator]
 static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
@@ -315,6 +315,8 @@ struct ScanResult {
     errors: u64,
     overflowed: bool,
 }
+
+type VisibleInodeSets = Arc<DashMap<PathBuf, Arc<DashSet<(u64, u64)>>>>;
 
 const GIT_COL_WIDTH: usize = 2;
 
@@ -979,8 +981,7 @@ fn perform_shallow_size_scan(
             seen.insert((metadata.dev(), metadata.ino()));
         }
     }
-    let visible_inode_sets: Arc<DashMap<PathBuf, Arc<DashSet<(u64, u64)>>>> =
-        Arc::new(DashMap::new());
+    let visible_inode_sets: VisibleInodeSets = Arc::new(DashMap::new());
     let aggregate_requested = args.sizes || args.counts;
     if let Ok(root_meta) = root.symlink_metadata() {
         true_sizes.insert(
@@ -1062,9 +1063,7 @@ fn perform_shallow_size_scan(
                     let ignored = is_gitignored(matcher, &entry_path, entry_res.file_type.is_dir());
                     if ignored {
                         entry_res.read_children_path = None;
-                        if !entry_res.file_type.is_dir() {
-                            continue;
-                        }
+                        continue;
                     }
                 }
 
@@ -1111,28 +1110,23 @@ fn perform_shallow_size_scan(
                             .clone();
                         set.insert((md.dev(), md.ino()))
                     };
-                    let include_size = if visible_depth2.is_some() {
-                        include_visible(visible_depth2.as_ref())
-                    } else if visible_depth1.is_some() {
-                        include_visible(visible_depth1.as_ref())
-                    } else {
-                        include_root
-                    };
-                    if include_size {
-                        let contribution = fsx::metadata::allocated_size(md);
-                        if entry_path != scan_root {
-                            let mut slot = ts.entry(scan_root.clone()).or_insert(0);
-                            if fsx::overflow::checked_add_u64(&mut slot, contribution) {
-                                overflow.store(true, AtomicOrdering::Relaxed);
-                            }
+                    let contribution = fsx::metadata::allocated_size(md);
+                    if include_root && entry_path != scan_root {
+                        let mut slot = ts.entry(scan_root.clone()).or_insert(0);
+                        if fsx::overflow::checked_add_u64(&mut slot, contribution) {
+                            overflow.store(true, AtomicOrdering::Relaxed);
                         }
-                        if let Some(ref depth1_path) = visible_depth1 {
+                    }
+                    if let Some(ref depth1_path) = visible_depth1 {
+                        if include_visible(Some(depth1_path)) {
                             let mut slot = ts.entry(depth1_path.clone()).or_insert(0);
                             if fsx::overflow::checked_add_u64(&mut slot, contribution) {
                                 overflow.store(true, AtomicOrdering::Relaxed);
                             }
                         }
-                        if let Some(ref depth2_path) = visible_depth2 {
+                    }
+                    if let Some(ref depth2_path) = visible_depth2 {
+                        if include_visible(Some(depth2_path)) {
                             let mut slot = ts.entry(depth2_path.clone()).or_insert(0);
                             if fsx::overflow::checked_add_u64(&mut slot, contribution) {
                                 overflow.store(true, AtomicOrdering::Relaxed);
@@ -1160,7 +1154,11 @@ fn perform_shallow_size_scan(
         })
         .into_iter()
         .for_each(|result| {
-            if result.is_err() {
+            if result
+                .as_ref()
+                .map(|entry| entry.read_children_error.is_some())
+                .unwrap_or(true)
+            {
                 scan_errors.fetch_add(1, AtomicOrdering::Relaxed);
             }
         });
@@ -1212,8 +1210,12 @@ fn perform_unified_scan(
     } else {
         None
     };
-    let seen_inodes = if collect_recursive_sizes && !args.no_dedupe_hardlinks {
-        Some(Arc::new(DashSet::with_hasher(FxBuildHasher::default())))
+    // Hardlinks are excluded from the ordinary bottom-up sums and accumulated
+    // once per rendered ancestor instead. A single global inode set can make
+    // the root correct, but would still make one of two sibling subtrees lose
+    // the shared file according to which Rayon callback wins.
+    let hardlink_sizes = if collect_recursive_sizes && !args.no_dedupe_hardlinks {
+        Some(Arc::new(DashMap::with_hasher(FxBuildHasher::default())))
     } else {
         None
     };
@@ -1229,17 +1231,16 @@ fn perform_unified_scan(
             seen.insert((metadata.dev(), metadata.ino()));
         }
     }
-    // A hard link is counted once for the root, and independently once inside
-    // each visible first/second-level subtree. This matches the size shown to
-    // users and avoids assigning bytes to whichever Rayon callback wins.
-    let visible_inode_sets: Arc<DashMap<PathBuf, Arc<DashSet<(u64, u64)>>>> =
-        Arc::new(DashMap::new());
+    // Only hardlink candidates enter these sets, so exact subtree accounting
+    // does not retain an inode for every ordinary file.
+    let visible_inode_sets: VisibleInodeSets = Arc::new(DashMap::new());
 
     // Seed root size and file-count accumulation.
     if collect_recursive_sizes {
         if let Ok(m) = root.symlink_metadata() {
+            let root_size = fsx::metadata::allocated_size(&m);
             if let Some(ref ds) = dir_local_sizes {
-                ds.insert(root.to_path_buf(), fsx::metadata::allocated_size(&m));
+                ds.insert(root.to_path_buf(), root_size);
             }
         }
     }
@@ -1252,11 +1253,11 @@ fn perform_unified_scan(
 
     let dc = Arc::clone(&dir_children);
     let ds = dir_local_sizes.as_ref().map(Arc::clone);
+    let hardlinks = hardlink_sizes.as_ref().map(Arc::clone);
     let dfc = dir_local_file_counts.as_ref().map(Arc::clone);
     let ddc = dir_local_dir_counts.as_ref().map(Arc::clone);
     let classify_files = args.classify;
     let aggregate_requested = args.sizes || args.counts;
-    let si = seen_inodes.as_ref().map(Arc::clone);
     let sdi = seen_dir_inodes.as_ref().map(Arc::clone);
     let vis = Arc::clone(&visible_inode_sets);
     let errors = Arc::clone(&scan_errors);
@@ -1277,9 +1278,10 @@ fn perform_unified_scan(
             } else {
                 scan_root.join(path)
             };
-            let (visible_depth1, visible_depth2) =
-                shallow_visible_ancestors(&scan_root, &current_path, depth, render_max_depth);
-            let mut local_sum = if collect_recursive_sizes && current_path != scan_root {
+            let current_dir_size = if collect_recursive_sizes
+                && current_path != scan_root
+                && current_path.starts_with(&scan_root)
+            {
                 current_path
                     .symlink_metadata()
                     .map(|metadata| fsx::metadata::allocated_size(&metadata))
@@ -1287,6 +1289,7 @@ fn perform_unified_scan(
             } else {
                 0
             };
+            let mut local_sum = current_dir_size;
             let mut local_file_count = 0u64;
             let mut local_dir_count = 0u64;
             let should_cache_children = depth < render_max_depth;
@@ -1309,9 +1312,7 @@ fn perform_unified_scan(
                     let ignored = is_gitignored(matcher, &entry_path, entry_res.file_type.is_dir());
                     if ignored {
                         entry_res.read_children_path = None;
-                        if !entry_res.file_type.is_dir() {
-                            continue;
-                        }
+                        continue;
                     }
                 }
 
@@ -1345,41 +1346,45 @@ fn perform_unified_scan(
 
                 if let Some(ref metadata) = m {
                     if collect_recursive_sizes {
-                        let include_root = if let Some(ref si_map) = si {
-                            if !entry_res.file_type.is_dir() && metadata.nlink() > 1 {
-                                si_map.insert((metadata.dev(), metadata.ino()))
-                            } else {
-                                true
-                            }
-                        } else {
-                            true
-                        };
-                        let include_visible = |ancestor: Option<&PathBuf>| {
-                            let Some(ancestor) = ancestor else {
-                                return include_root;
-                            };
-                            if entry_res.file_type.is_dir() || metadata.nlink() <= 1 {
-                                return true;
-                            }
-                            let set = vis
-                                .entry(ancestor.clone())
-                                .or_insert_with(|| Arc::new(DashSet::new()))
-                                .clone();
-                            set.insert((metadata.dev(), metadata.ino()))
-                        };
-                        let include_size = if visible_depth2.is_some() {
-                            include_visible(visible_depth2.as_ref())
-                        } else if visible_depth1.is_some() {
-                            include_visible(visible_depth1.as_ref())
-                        } else {
-                            include_root
-                        };
-                        if include_size
-                            && (!entry_res.file_type.is_dir()
-                                || entry_res.read_children_path.is_none())
-                        {
+                        let contributes_here =
+                            !entry_res.file_type.is_dir() || entry_res.read_children_path.is_none();
+                        if contributes_here {
                             let contribution = fsx::metadata::allocated_size(metadata);
-                            if fsx::overflow::checked_add_u64(&mut local_sum, contribution) {
+                            if !entry_res.file_type.is_dir()
+                                && metadata.nlink() > 1
+                                && let Some(ref hardlink_map) = hardlinks
+                            {
+                                let inode = (metadata.dev(), metadata.ino());
+                                for ancestor in current_path.ancestors() {
+                                    if ancestor != scan_root && !ancestor.starts_with(&scan_root) {
+                                        break;
+                                    }
+                                    let ancestor_depth = ancestor
+                                        .strip_prefix(&scan_root)
+                                        .map(|relative| relative.components().count())
+                                        .unwrap_or(usize::MAX);
+                                    if ancestor_depth <= render_max_depth {
+                                        let set = vis
+                                            .entry(ancestor.to_path_buf())
+                                            .or_insert_with(|| Arc::new(DashSet::new()))
+                                            .clone();
+                                        if set.insert(inode) {
+                                            let mut slot = hardlink_map
+                                                .entry(ancestor.to_path_buf())
+                                                .or_insert(0);
+                                            if fsx::overflow::checked_add_u64(
+                                                &mut slot,
+                                                contribution,
+                                            ) {
+                                                overflow.store(true, AtomicOrdering::Relaxed);
+                                            }
+                                        }
+                                    }
+                                    if ancestor == scan_root {
+                                        break;
+                                    }
+                                }
+                            } else if fsx::overflow::checked_add_u64(&mut local_sum, contribution) {
                                 overflow.store(true, AtomicOrdering::Relaxed);
                             }
                         }
@@ -1430,7 +1435,11 @@ fn perform_unified_scan(
         })
         .into_iter()
         .for_each(|result| {
-            if result.is_err() {
+            if result
+                .as_ref()
+                .map(|entry| entry.read_children_error.is_some())
+                .unwrap_or(true)
+            {
                 scan_errors.fetch_add(1, AtomicOrdering::Relaxed);
             }
         });
@@ -1506,6 +1515,15 @@ fn perform_unified_scan(
                 if fsx::overflow::checked_add_u64(slot, value) {
                     aggregate_overflowed = true;
                 }
+            }
+        }
+    }
+
+    if let Some(hardlink_sizes) = hardlink_sizes {
+        for entry in hardlink_sizes.iter() {
+            let slot = true_sizes.entry(entry.key().clone()).or_insert(0);
+            if fsx::overflow::checked_add_u64(slot, *entry.value()) {
+                aggregate_overflowed = true;
             }
         }
     }
@@ -2061,6 +2079,25 @@ fn print_node(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn shallow_size_args(path: &Path) -> Args {
+        Args::try_parse_from([
+            OsString::from("tree"),
+            OsString::from("-a"),
+            OsString::from("-L"),
+            OsString::from("1"),
+            OsString::from("-S"),
+            path.as_os_str().to_os_string(),
+        ])
+        .expect("parse tree test arguments")
+    }
+
+    fn allocated(path: &Path) -> u64 {
+        let metadata = path.symlink_metadata().expect("fixture metadata");
+        fsx::metadata::allocated_size(&metadata)
+    }
 
     #[test]
     fn reverse_render_keeps_top_level_and_root_punctuation() {
@@ -2077,5 +2114,140 @@ mod tests {
         let output = "  15.6G 2026-08-09 12:00 │   ├── directory/\n.\n";
         let reversed = reverse_rendered_output(output.as_bytes());
         assert!(String::from_utf8(reversed).is_ok());
+    }
+
+    #[test]
+    fn scans_count_unreadable_directory_errors_when_permissions_are_enforced() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let blocked = root.join("blocked");
+        std::fs::create_dir(&blocked).expect("blocked directory");
+        std::fs::write(blocked.join("hidden"), b"payload").expect("hidden file");
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o0))
+            .expect("remove permissions");
+
+        if std::fs::read_dir(&blocked).is_ok() {
+            std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700))
+                .expect("restore permissions");
+            return;
+        }
+
+        let args = shallow_size_args(root);
+        let shallow = perform_shallow_size_scan(root, &args, true, false, None);
+        let unified = perform_unified_scan(root, &args, usize::MAX, true, true, false, None);
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700))
+            .expect("restore permissions");
+
+        assert!(shallow.errors > 0);
+        assert!(unified.errors > 0);
+    }
+
+    #[test]
+    fn all_size_scans_dedupe_root_but_count_hardlinks_in_each_visible_subtree() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let left = root.join("left");
+        let right = root.join("right");
+        std::fs::create_dir_all(&left).expect("left directory");
+        std::fs::create_dir_all(&right).expect("right directory");
+        let original = left.join("payload");
+        std::fs::write(&original, vec![0x5a; 16 * 1024]).expect("payload");
+        std::fs::hard_link(&original, right.join("payload")).expect("hardlink");
+
+        let args = shallow_size_args(root);
+        let payload_size = allocated(&original);
+        for scan in [
+            perform_shallow_size_scan(root, &args, true, false, None),
+            perform_unified_scan(root, &args, usize::MAX, true, true, false, None),
+        ] {
+            assert_eq!(scan.errors, 0);
+            assert_eq!(
+                scan.true_sizes.get(root).copied(),
+                Some(allocated(root) + allocated(&left) + allocated(&right) + payload_size)
+            );
+            assert_eq!(
+                scan.true_sizes.get(&left).copied(),
+                Some(allocated(&left) + payload_size)
+            );
+            assert_eq!(
+                scan.true_sizes.get(&right).copied(),
+                Some(allocated(&right) + payload_size)
+            );
+        }
+    }
+
+    #[test]
+    fn unified_scan_dedupes_hardlinks_at_deep_visible_levels() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let left = root.join("left");
+        let right = root.join("right");
+        let left_inner = left.join("inner");
+        let right_inner = right.join("inner");
+        std::fs::create_dir_all(&left_inner).expect("left inner directory");
+        std::fs::create_dir_all(&right_inner).expect("right inner directory");
+        let original = left_inner.join("payload");
+        std::fs::write(&original, vec![0x6b; 16 * 1024]).expect("payload");
+        std::fs::hard_link(&original, right_inner.join("payload")).expect("hardlink");
+
+        let mut args = shallow_size_args(root);
+        args.max_depth = 3;
+        let scan = perform_unified_scan(root, &args, usize::MAX, true, true, false, None);
+        assert_eq!(scan.errors, 0);
+
+        let payload_size = allocated(&original);
+        assert_eq!(
+            scan.true_sizes.get(root).copied(),
+            Some(
+                allocated(root)
+                    + allocated(&left)
+                    + allocated(&right)
+                    + allocated(&left_inner)
+                    + allocated(&right_inner)
+                    + payload_size
+            )
+        );
+        assert_eq!(
+            scan.true_sizes.get(&left_inner).copied(),
+            Some(allocated(&left_inner) + payload_size)
+        );
+        assert_eq!(
+            scan.true_sizes.get(&right_inner).copied(),
+            Some(allocated(&right_inner) + payload_size)
+        );
+    }
+
+    #[test]
+    fn ignored_directories_are_neither_rendered_nor_aggregated() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let ignored = root.join("ignored");
+        std::fs::create_dir(&ignored).expect("ignored directory");
+        std::fs::write(ignored.join("large.bin"), vec![0x33; 64 * 1024]).expect("ignored payload");
+        let ignore_file = root.join(".gitignore");
+        std::fs::write(&ignore_file, b"ignored/\n").expect("ignore rules");
+        let kept = root.join("kept.bin");
+        std::fs::write(&kept, vec![0x22; 8 * 1024]).expect("kept payload");
+
+        let args = shallow_size_args(root);
+        let matcher = build_gitignore_matcher(root, true);
+        for scan in [
+            perform_shallow_size_scan(root, &args, true, false, matcher.clone()),
+            perform_unified_scan(root, &args, usize::MAX, true, true, false, matcher),
+        ] {
+            assert_eq!(scan.errors, 0);
+
+            let root_children = scan.dir_children.get(root).expect("root children");
+            let visible_names = root_children
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>();
+            assert!(!visible_names.contains(&"ignored"));
+            assert!(!scan.true_sizes.contains_key(&ignored));
+            assert_eq!(
+                scan.true_sizes.get(root).copied(),
+                Some(allocated(root) + allocated(&ignore_file) + allocated(&kept))
+            );
+        }
     }
 }

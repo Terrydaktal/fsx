@@ -1,5 +1,6 @@
 //! Rsync subprocess integration and progress-stream translation.
 
+use super::command::privileged_command_os;
 use super::telemetry::{counter_delta, device_io_deltas, proc_io_deltas};
 use crate::domain::{
     DeviceIoWindow, ProcessIoWindow, ProgressSnapshot, RsyncStreamEvent, TransferOutcome,
@@ -10,6 +11,7 @@ use crate::output::{
     TransferEtaEstimator,
 };
 use regex::Regex;
+use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::io::{self, BufRead};
 use std::process::{Command, Stdio};
@@ -130,34 +132,50 @@ pub(crate) fn run_rsync_transfer(
     delete_destination_extras: bool,
     size_only: bool,
 ) -> TransferOutcome {
+    run_rsync_transfer_os(
+        OsStr::new(src_path),
+        OsStr::new(dst_path),
+        planned_bytes,
+        use_sudo,
+        remove_source_during,
+        delete_destination_extras,
+        size_only,
+    )
+}
+
+pub(crate) fn run_rsync_transfer_os(
+    src_path: &OsStr,
+    dst_path: &OsStr,
+    planned_bytes: u64,
+    use_sudo: bool,
+    remove_source_during: bool,
+    delete_destination_extras: bool,
+    size_only: bool,
+) -> TransferOutcome {
     super::copy_engine::install_interrupt_handler();
-    let mut cmd: Vec<String> = vec![
-        "rsync".to_string(),
-        "-aH".to_string(),
-        "--partial".to_string(),
-        "--protect-args".to_string(),
+    let mut cmd: Vec<OsString> = vec![
+        OsString::from("rsync"),
+        OsString::from("-aH"),
+        OsString::from("--partial"),
+        OsString::from("--protect-args"),
     ];
     if size_only {
-        cmd.push("--size-only".to_string());
+        cmd.push(OsString::from("--size-only"));
     }
     if delete_destination_extras {
-        cmd.push("--delete".to_string());
+        cmd.push(OsString::from("--delete"));
     }
     if remove_source_during {
-        cmd.push("--remove-source-files".to_string());
+        cmd.push(OsString::from("--remove-source-files"));
     }
     cmd.extend([
-        "--info=progress2,stats2,name0".to_string(),
-        "--".to_string(),
-        src_path.to_string(),
-        dst_path.to_string(),
+        OsString::from("--info=progress2,stats2,name0"),
+        OsString::from("--"),
+        src_path.to_os_string(),
+        dst_path.to_os_string(),
     ]);
 
-    let mut full_cmd = Vec::new();
-    if use_sudo {
-        full_cmd.push("pkexec".to_string());
-    }
-    full_cmd.extend(cmd);
+    let full_cmd = privileged_command_os(&cmd, use_sudo);
 
     let mut child = match Command::new(&full_cmd[0])
         .args(&full_cmd[1..])
@@ -186,7 +204,9 @@ pub(crate) fn run_rsync_transfer(
     let mut io_window = ProcessIoWindow::from_pid(child.id());
     let _ = io_window.sample();
     let io_start_counters = io_window.current_totals();
-    let device_window = DeviceIoWindow::from_transfer_paths(src_path, dst_path);
+    let src_path_display = src_path.to_string_lossy();
+    let dst_path_display = dst_path.to_string_lossy();
+    let device_window = DeviceIoWindow::from_transfer_paths(&src_path_display, &dst_path_display);
     let device_start_totals = device_window.current_totals();
     let mut last_device_totals = device_start_totals;
     let mut last_device_at = transfer_start;
@@ -361,8 +381,8 @@ pub(crate) fn run_rsync_transfer(
 }
 
 pub(crate) fn run_rsync_transfer_sources(
-    src_paths: &[String],
-    dst_path: &str,
+    src_paths: &[OsString],
+    dst_path: &OsStr,
     planned_bytes: u64,
     use_sudo: bool,
     remove_source_during: bool,
@@ -370,8 +390,11 @@ pub(crate) fn run_rsync_transfer_sources(
     size_only: bool,
 ) -> TransferOutcome {
     if src_paths.len() <= 1 {
-        return run_rsync_transfer(
-            src_paths.first().map(String::as_str).unwrap_or(""),
+        return run_rsync_transfer_os(
+            src_paths
+                .first()
+                .map(OsString::as_os_str)
+                .unwrap_or_default(),
             dst_path,
             planned_bytes,
             use_sudo,
@@ -388,8 +411,8 @@ pub(crate) fn run_rsync_transfer_sources(
         progress_snapshot: None,
     };
     for (index, source) in src_paths.iter().enumerate() {
-        let transfer = run_rsync_transfer(
-            source,
+        let transfer = run_rsync_transfer_os(
+            source.as_os_str(),
             dst_path,
             if index + 1 == src_paths.len() {
                 planned_bytes.saturating_sub(aggregate.bytes_done)

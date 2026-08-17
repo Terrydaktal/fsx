@@ -17,7 +17,7 @@ pub(crate) use resolve::{
     to_real_path_os,
 };
 pub(crate) use scanner::{
-    build_destination_index, count_tree_any, map_dir_dest, map_dir_dest_path,
-    map_dir_dest_relative_path, normalize_rel, pre_scan_directory, pre_scan_file,
-    rel_matches_prefix, top_level_rel_component, DestinationKind,
+    build_destination_index, count_tree_any, map_dir_dest_path, map_dir_dest_relative_path,
+    normalize_rel, pre_scan_directory, pre_scan_file, rel_matches_prefix, top_level_rel_component,
+    DestinationKind,
 };

@@ -1,7 +1,9 @@
 use super::*;
 use rusqlite::Connection;
 use std::borrow::Cow;
+use std::ffi::OsString;
 use std::io::Write;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -17,6 +19,7 @@ fn base_opts() -> Options {
         sizes: false,
         counts: false,
         regex_mode: false,
+        case_sensitive: false,
         sort_field: None,
         sort_order: None,
         limit: None,
@@ -30,6 +33,7 @@ fn base_opts() -> Options {
         cache_output: false,
         snapshot_cache: false,
         snapshot_refresh: false,
+        live_only: false,
         index_mode: false,
         index_if_watched: false,
         index_binary: false,
@@ -42,6 +46,7 @@ fn base_opts() -> Options {
         watch_metrics: None,
         watch_metrics_os: None,
         absolute_paths: false,
+        lossless_paths: false,
         force_dir: false,
         force_file: false,
         force_full: false,
@@ -134,7 +139,14 @@ fn indexed_executables_use_live_mode_for_color_and_classification() {
 fn media_root_prefers_single_thread() {
     assert!(root_prefers_single_thread(Path::new("/media")));
     assert!(root_prefers_single_thread(Path::new("/media/disk")));
-    assert!(!root_prefers_single_thread(Path::new("/mnt")));
+    assert_eq!(
+        root_prefers_single_thread(Path::new("/storage")),
+        cfg!(target_os = "android")
+    );
+    assert_eq!(
+        root_prefers_single_thread(Path::new("/mnt")),
+        cfg!(target_os = "android")
+    );
     assert!(!root_prefers_single_thread(Path::new("/home/lewis")));
 }
 
@@ -167,10 +179,25 @@ fn manifest_optional_i64_round_trip() {
 
 #[test]
 fn sql_prefilter_skips_unrestricted_wildcards() {
-    assert!(sql_prefilter_for_term("*", false, true, "path", true).is_none());
-    assert!(sql_prefilter_for_term("**", false, true, "path", true).is_none());
-    assert!(sql_prefilter_for_term("passwords", false, true, "path", true).is_some());
-    assert!(sql_prefilter_for_term("pass*", false, true, "path", true).is_some());
+    assert!(sql_prefilter_for_term("*", false, false, true, "path", true).is_none());
+    assert!(sql_prefilter_for_term("**", false, false, true, "path", true).is_none());
+    assert!(sql_prefilter_for_term("passwords", false, false, true, "path", true).is_some());
+    assert!(sql_prefilter_for_term("pass*", false, false, true, "path", true).is_some());
+    assert!(sql_prefilter_for_term("passwords", false, true, true, "path", true).is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn lossless_path_transport_round_trips_special_bytes() {
+    let original = PathBuf::from(OsString::from_vec(b"/tmp/name-\xff\n%".to_vec()));
+    let encoded = fsx::encode_lossless_path(&original);
+    let decoded = fsx::decode_lossless_path(&encoded);
+
+    assert_eq!(encoded, "/tmp/name-%FF%0A%25");
+    assert_eq!(
+        decoded.as_os_str().as_bytes(),
+        original.as_os_str().as_bytes()
+    );
 }
 
 #[test]

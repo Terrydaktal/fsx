@@ -12,8 +12,8 @@ use super::presentation::{
     final_transform, init_raw_cache_state, render_styled_path, style_enabled, RenderCache,
     RenderContext,
 };
-use super::{live_scan_incomplete, reset_live_scan_errors};
-use crossbeam_channel::{bounded, Sender};
+use super::LiveScanStatus;
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use rayon::prelude::*;
 use regex::{Regex, RegexBuilder};
 use std::io::{self, BufWriter, IsTerminal, Write};
@@ -51,12 +51,19 @@ impl Drop for TimeoutGuard {
     }
 }
 
+/// A root-discovery walk finishes before its results are consumed, so this
+/// channel must not apply backpressure. The discovered roots must be retained
+/// for the second-stage search in any case.
+fn deferred_walk_channel<T>() -> (Sender<T>, Receiver<T>) {
+    unbounded()
+}
+
 pub(crate) fn run_standard(
     opts: &Options,
     cache: &mut DirStatsCache,
     colors: &ColorSpec,
 ) -> Result<SearchRun, String> {
-    reset_live_scan_errors();
+    let scan_status = LiveScanStatus::default();
     let stdout_is_tty = io::stdout().is_terminal();
     let use_style = style_enabled(opts, stdout_is_tty);
     let name = parse_name_pattern(&opts.positional[0], opts.regex_mode);
@@ -69,7 +76,7 @@ pub(crate) fn run_standard(
     }
     let stream_direct = can_stream_direct(opts, use_style);
     let re = RegexBuilder::new(&name.regex)
-        .case_insensitive(true)
+        .case_insensitive(!opts.case_sensitive)
         .build()
         .map_err(|e| format!("Invalid regex: {}", e))?;
     let is_catch_all = name.regex == ".*" || name.regex == "^.*$";
@@ -81,6 +88,7 @@ pub(crate) fn run_standard(
         let opts_clone = opts.clone();
         let timeout_fast = timeout_triggered.clone();
         if opts.positional.len() == 1 {
+            let scan_status_walk = scan_status.clone();
             rayon::spawn(move || {
                 walk_fast(
                     PathBuf::from("."),
@@ -95,6 +103,7 @@ pub(crate) fn run_standard(
                     false,
                     false,
                     &timeout_fast,
+                    &scan_status_walk,
                 )
             });
         } else {
@@ -103,12 +112,13 @@ pub(crate) fn run_standard(
             let sd_re = match &sd {
                 SearchDirMode::Pattern(pattern) => Some(
                     RegexBuilder::new(pattern)
-                        .case_insensitive(true)
+                        .case_insensitive(!opts.case_sensitive)
                         .build()
                         .map_err(|e| format!("Invalid search-directory regex: {}", e))?,
                 ),
                 SearchDirMode::Path(_) => None,
             };
+            let scan_status_walk = scan_status.clone();
             rayon::spawn(move || match sd {
                 SearchDirMode::Path(p) => {
                     let root_serial = root_prefers_single_thread(Path::new(&p));
@@ -125,11 +135,12 @@ pub(crate) fn run_standard(
                         false,
                         root_serial,
                         &timeout_fast,
+                        &scan_status_walk,
                     )
                 }
                 SearchDirMode::Pattern(_) => {
                     let mut roots = Vec::new();
-                    let (rtx, rrx) = bounded::<Vec<PathInfo>>(64);
+                    let (rtx, rrx) = deferred_walk_channel::<Vec<PathInfo>>();
                     let Some(sd_re) = sd_re else {
                         return;
                     };
@@ -146,6 +157,7 @@ pub(crate) fn run_standard(
                         false,
                         false,
                         &timeout_fast,
+                        &scan_status_walk,
                     );
                     drop(rtx);
                     for chunk in rrx {
@@ -168,6 +180,7 @@ pub(crate) fn run_standard(
                             false,
                             next_serial,
                             &timeout_fast,
+                            &scan_status_walk,
                         );
                     });
                 }
@@ -189,10 +202,15 @@ pub(crate) fn run_standard(
                 if opts.limit.is_some_and(|limit| emitted >= limit) {
                     continue;
                 }
+                let path_encoded = opts.lossless_paths;
+                let raw_path = if path_encoded {
+                    fsx::encode_lossless_path(&info.path)
+                } else {
+                    info.path.to_string_lossy().into_owned()
+                };
                 if let Some(state) = cache_state.as_mut() {
-                    cache_raw_record_path(&info.path.to_string_lossy(), info.is_dir, false, state);
+                    cache_raw_record_path(&raw_path, info.is_dir, path_encoded, state);
                 }
-                let raw_path = info.path.to_string_lossy();
                 let display_path = escape_terminal_text(&raw_path);
                 lock.write_all(display_path.as_bytes())
                     .map_err(|e| e.to_string())?;
@@ -215,7 +233,7 @@ pub(crate) fn run_standard(
         return Ok(SearchRun {
             lines: Vec::new(),
             timed_out: timeout_triggered.load(Ordering::Relaxed) && !stopped_by_limit,
-            incomplete: live_scan_incomplete(),
+            incomplete: scan_status.is_incomplete(),
         });
     }
 
@@ -225,6 +243,7 @@ pub(crate) fn run_standard(
     let opts_clone = opts.clone();
     if opts.positional.len() == 1 {
         let timeout_walk = timeout_triggered.clone();
+        let scan_status_walk = scan_status.clone();
         rayon::spawn(move || {
             walk_rayon_worker(
                 PathBuf::from("."),
@@ -238,6 +257,7 @@ pub(crate) fn run_standard(
                 needs_metadata,
                 false,
                 &timeout_walk,
+                &scan_status_walk,
             )
         });
     } else {
@@ -245,6 +265,7 @@ pub(crate) fn run_standard(
         match parse_search_dir(p_raw, opts.regex_mode, opts.force_pattern_mode) {
             SearchDirMode::Path(p) => {
                 let timeout_walk = timeout_triggered.clone();
+                let scan_status_walk = scan_status.clone();
                 rayon::spawn(move || {
                     let root_serial = root_prefers_single_thread(Path::new(&p));
                     walk_rayon_worker(
@@ -259,18 +280,20 @@ pub(crate) fn run_standard(
                         needs_metadata,
                         root_serial,
                         &timeout_walk,
+                        &scan_status_walk,
                     )
                 })
             }
             SearchDirMode::Pattern(sd_rx) => {
                 let sd_re = RegexBuilder::new(&sd_rx)
-                    .case_insensitive(true)
+                    .case_insensitive(!opts.case_sensitive)
                     .build()
                     .map_err(|e| format!("Invalid search-directory regex: {}", e))?;
                 let timeout_walk = timeout_triggered.clone();
+                let scan_status_walk = scan_status.clone();
                 rayon::spawn(move || {
                     let mut roots = Vec::new();
-                    let (rtx, rrx) = bounded::<Vec<SearchResult>>(64);
+                    let (rtx, rrx) = deferred_walk_channel::<Vec<SearchResult>>();
                     walk_rayon_worker(
                         PathBuf::from("/"),
                         &sd_re,
@@ -283,6 +306,7 @@ pub(crate) fn run_standard(
                         false,
                         false,
                         &timeout_walk,
+                        &scan_status_walk,
                     );
                     drop(rtx);
                     for chunk in rrx {
@@ -304,6 +328,7 @@ pub(crate) fn run_standard(
                             needs_metadata,
                             next_serial,
                             &timeout_walk,
+                            &scan_status_walk,
                         );
                     });
                 });
@@ -314,7 +339,10 @@ pub(crate) fn run_standard(
         results.extend(chunk);
     }
     let highlight_spec = if opts.highlight_match {
-        Some(compile_highlight_spec(&[(name.regex.clone(), false)])?)
+        Some(compile_highlight_spec(
+            &[(name.regex.clone(), false)],
+            opts.case_sensitive,
+        )?)
     } else {
         None
     };
@@ -329,7 +357,7 @@ pub(crate) fn run_standard(
             highlight_spec.as_ref(),
         ),
         timed_out: timeout_triggered.load(Ordering::Relaxed),
-        incomplete: live_scan_incomplete(),
+        incomplete: scan_status.is_incomplete(),
     })
 }
 
@@ -339,7 +367,7 @@ pub(crate) fn run_contains_all(
     cache: &mut DirStatsCache,
     colors: &ColorSpec,
 ) -> Result<SearchRun, String> {
-    reset_live_scan_errors();
+    let scan_status = LiveScanStatus::default();
     let stdout_is_tty = io::stdout().is_terminal();
     let use_style = style_enabled(opts, stdout_is_tty);
     let timeout_triggered = Arc::new(AtomicBool::new(false));
@@ -369,14 +397,14 @@ pub(crate) fn run_contains_all(
         return Ok(SearchRun {
             lines: Vec::new(),
             timed_out: false,
-            incomplete: live_scan_incomplete(),
+            incomplete: scan_status.is_incomplete(),
         });
     }
     let compiled_regexes: Vec<Regex> = regexes
         .iter()
         .map(|pattern| {
             RegexBuilder::new(pattern)
-                .case_insensitive(true)
+                .case_insensitive(!opts.case_sensitive)
                 .build()
                 .map_err(|e| format!("Invalid regex: {}", e))
         })
@@ -389,6 +417,7 @@ pub(crate) fn run_contains_all(
     let root = spec.root.clone();
     let root_serial = root_prefers_single_thread(&root);
     let timeout_walk = timeout_triggered.clone();
+    let scan_status_walk = scan_status.clone();
     rayon::spawn(move || {
         walk_rayon_worker(
             root,
@@ -402,6 +431,7 @@ pub(crate) fn run_contains_all(
             needs_metadata,
             root_serial,
             &timeout_walk,
+            &scan_status_walk,
         )
     });
 
@@ -432,7 +462,10 @@ pub(crate) fn run_contains_all(
             .cloned()
             .map(|rx| (rx, opts.force_full))
             .collect();
-        Some(compile_highlight_spec(&highlight_patterns)?)
+        Some(compile_highlight_spec(
+            &highlight_patterns,
+            opts.case_sensitive,
+        )?)
     } else {
         None
     };
@@ -448,7 +481,7 @@ pub(crate) fn run_contains_all(
             highlight_spec.as_ref(),
         ),
         timed_out: timeout_triggered.load(Ordering::Relaxed),
-        incomplete: live_scan_incomplete(),
+        incomplete: scan_status.is_incomplete(),
     })
 }
 
@@ -457,7 +490,7 @@ pub(crate) fn run_full(
     cache: &mut DirStatsCache,
     colors: &ColorSpec,
 ) -> Result<SearchRun, String> {
-    reset_live_scan_errors();
+    let scan_status = LiveScanStatus::default();
     let stdout_is_tty = io::stdout().is_terminal();
     let use_style = style_enabled(opts, stdout_is_tty);
     let mut search_root = ".".to_string();
@@ -497,7 +530,7 @@ pub(crate) fn run_full(
         .iter()
         .map(|(pattern, _)| {
             RegexBuilder::new(pattern)
-                .case_insensitive(true)
+                .case_insensitive(!opts.case_sensitive)
                 .build()
                 .map_err(|e| format!("Invalid regex: {}", e))
         })
@@ -512,6 +545,7 @@ pub(crate) fn run_full(
     let prune_matched_dir_subtrees = false;
     let root_serial = root_prefers_single_thread(Path::new(&search_root));
     let timeout_walk = timeout_triggered.clone();
+    let scan_status_walk = scan_status.clone();
     rayon::spawn(move || {
         walk_rayon_worker(
             PathBuf::from(search_root),
@@ -528,6 +562,7 @@ pub(crate) fn run_full(
                 || opts_clone.classify,
             root_serial,
             &timeout_walk,
+            &scan_status_walk,
         );
     });
     // Full-path searches with plain output do not need a result buffer. Stream
@@ -550,7 +585,7 @@ pub(crate) fn run_full(
             None
         };
         let highlight_spec = if opts.highlight_match {
-            Some(compile_highlight_spec(&pattern_specs)?)
+            Some(compile_highlight_spec(&pattern_specs, opts.case_sensitive)?)
         } else {
             None
         };
@@ -592,7 +627,7 @@ pub(crate) fn run_full(
         return Ok(SearchRun {
             lines: Vec::new(),
             timed_out: timeout_triggered.load(Ordering::Relaxed) && !stopped_by_limit,
-            incomplete: live_scan_incomplete(),
+            incomplete: scan_status.is_incomplete(),
         });
     }
     let mut rows = Vec::new();
@@ -620,7 +655,7 @@ pub(crate) fn run_full(
     }
     rows.sort_by(|a, b| a.path.cmp(&b.path));
     let highlight_spec = if opts.highlight_match {
-        Some(compile_highlight_spec(&pattern_specs)?)
+        Some(compile_highlight_spec(&pattern_specs, opts.case_sensitive)?)
     } else {
         None
     };
@@ -635,6 +670,20 @@ pub(crate) fn run_full(
             highlight_spec.as_ref(),
         ),
         timed_out: timeout_triggered.load(Ordering::Relaxed),
-        incomplete: live_scan_incomplete(),
+        incomplete: scan_status.is_incomplete(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::deferred_walk_channel;
+
+    #[test]
+    fn deferred_walk_channel_cannot_fill_before_its_consumer_starts() {
+        let (sender, receiver) = deferred_walk_channel();
+        for value in 0..65 {
+            sender.try_send(value).unwrap();
+        }
+        assert_eq!(receiver.len(), 65);
+    }
 }

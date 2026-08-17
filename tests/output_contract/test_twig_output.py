@@ -163,6 +163,42 @@ class TwigOutputContractTests(unittest.TestCase):
         self.assertIn("src", doubled.plain)
         self.assertNotEqual(deduped.plain, doubled.plain)
 
+    def test_long_true_size_retains_the_long_metadata_columns(self) -> None:
+        common = [
+            "-F",
+            "--almost-all",
+            "-la",
+            "--color",
+            "never",
+            "--hyperlink=never",
+            self.fixture.src,
+        ]
+        date_sorted = run_tool("twig", [*common[:-1], "-D", common[-1]])
+        size_sorted = run_tool("twig", [*common[:-1], "-S", common[-1]])
+        self.assertEqual(date_sorted.returncode, 0, date_sorted.plain)
+        self.assertEqual(size_sorted.returncode, 0, size_sorted.plain)
+
+        metadata_line = re.compile(
+            r"^(?P<mode>\S{10})\s+(?P<size>\S+)\s+(?P<owner>\S+)\s+"
+            r"(?P<time>.+?)\s+(?P<name>a\.txt)$"
+        )
+
+        def parsed_a_txt(result):
+            line = next(
+                line
+                for line in output_lines(result)
+                if line.endswith(" a.txt") and " -> " not in line
+            )
+            match = metadata_line.fullmatch(line)
+            self.assertIsNotNone(match, line)
+            return match.groupdict()
+
+        date_fields = parsed_a_txt(date_sorted)
+        size_fields = parsed_a_txt(size_sorted)
+        self.assertEqual(size_fields["mode"], date_fields["mode"])
+        self.assertEqual(size_fields["owner"], date_fields["owner"])
+        self.assertEqual(size_fields["time"], date_fields["time"])
+
     def test_multi_path_headers_and_absolute_output_are_unambiguous(self) -> None:
         result = run_tool(
             "twig",

@@ -214,7 +214,7 @@ pub(crate) fn run_recent_indexed(
         let parsed = parse_name_pattern(term, opts.regex_mode);
         regexes.push(
             RegexBuilder::new(&parsed.regex)
-                .case_insensitive(true)
+                .case_insensitive(!opts.case_sensitive)
                 .build()
                 .map_err(|e| format!("Invalid regex: {}", e))?,
         );
@@ -249,6 +249,7 @@ pub(crate) fn run_recent_indexed(
         if let Some((condition, extra_params)) = sql_prefilter_for_term(
             term,
             opts.regex_mode,
+            opts.case_sensitive,
             opts.force_full,
             sql_field_expr,
             fts_ready,
@@ -407,7 +408,7 @@ where
         let parsed = parse_name_pattern(term, opts.regex_mode);
         regexes.push(
             RegexBuilder::new(&parsed.regex)
-                .case_insensitive(true)
+                .case_insensitive(!opts.case_sensitive)
                 .build()
                 .map_err(|e| format!("Invalid regex: {}", e))?,
         );
@@ -439,6 +440,7 @@ where
         if let Some((condition, extra_params)) = sql_prefilter_for_term(
             term,
             opts.regex_mode,
+            opts.case_sensitive,
             opts.force_full,
             sql_field_expr,
             fts_ready,
@@ -576,7 +578,7 @@ where
         }
         regexes.push(
             RegexBuilder::new(&parsed.regex)
-                .case_insensitive(true)
+                .case_insensitive(!opts.case_sensitive)
                 .build()
                 .map_err(|e| format!("Invalid regex: {}", e))?,
         );
@@ -608,6 +610,7 @@ where
         if let Some((condition, extra_params)) = sql_prefilter_for_term(
             term,
             opts.regex_mode,
+            opts.case_sensitive,
             opts.force_full,
             sql_field_expr,
             fts_ready,
@@ -752,6 +755,12 @@ pub(crate) fn run_indexed_via_daemon(
     cache: &mut DirStatsCache,
     colors: &ColorSpec,
 ) -> Result<Option<SearchRun>, String> {
+    /* The daemon protocol predates case-sensitive requests. Use the local
+     * indexed query path until that protocol grows a versioned flag. */
+    if opts.case_sensitive {
+        return Ok(None);
+    }
+
     let socket =
         query_socket_path().ok_or_else(|| "Could not determine fsx cache dir".to_string())?;
     if !fs::symlink_metadata(&socket)
@@ -813,8 +822,13 @@ pub(crate) fn run_indexed_via_daemon(
                 write_binary_path_record(&mut output, &result.path, result.path_encoded)
                     .map_err(|e| e.to_string())?;
             } else {
+                let display_path = if opts.lossless_paths && !result.path_encoded {
+                    fsx::encode_lossless_path(Path::new(&result.path))
+                } else {
+                    result.path.clone()
+                };
                 output
-                    .write_all(escape_terminal_text(&result.path).as_bytes())
+                    .write_all(escape_terminal_text(&display_path).as_bytes())
                     .and_then(|_| output.write_all(b"\n"))
                     .map_err(|e| e.to_string())?;
             }
@@ -898,7 +912,7 @@ pub(crate) fn run_indexed(
         }
         regexes.push(
             RegexBuilder::new(&parsed.regex)
-                .case_insensitive(true)
+                .case_insensitive(!opts.case_sensitive)
                 .build()
                 .map_err(|e| format!("Invalid regex: {}", e))?,
         );
@@ -939,6 +953,7 @@ pub(crate) fn run_indexed(
         if let Some((condition, extra_params)) = sql_prefilter_for_term(
             term,
             opts.regex_mode,
+            opts.case_sensitive,
             opts.force_full,
             sql_field_expr,
             fts_ready,

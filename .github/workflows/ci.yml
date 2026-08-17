@@ -54,6 +54,7 @@ jobs:
       - name: Unearth integration tests
         run: |
           bash tools/unearth/tests/help_matrix.sh
+          bash tools/unearth/tests/live_no_index.sh
           bash tools/unearth/tests/live_watcher.sh
       - name: Dependency audit
         run: |
@@ -69,3 +70,19 @@ jobs:
           shellcheck tools/copy/copy tools/copy/tests/test_copy_linux_faults.sh
           tools/copy/tests/coverage.sh
           tools/unearth/tests/help_matrix.sh tools/unearth/tests/live_watcher.sh
+          tools/unearth/tests/live_no_index.sh
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - name: Cross-check SQLite-free standalone tools
+        run: >-
+          cargo check --target aarch64-linux-android
+          -p tree -p unearth -p twig -p copy-rs --no-default-features
+      - name: Check Android helper scripts
+        run: >-
+          shellcheck tools/android/build.sh tools/android/smoke.sh

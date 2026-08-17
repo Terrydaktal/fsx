@@ -65,7 +65,7 @@ pub(crate) fn print_help() {
     println!("options:");
     println!("  -h, --help            show this help message and exit");
     println!("  -m, --move            Move mode: transfer then remove source data (equivalent to move behavior).");
-    println!("  -s, --sudo            Run privileged transfer commands through pkexec");
+    println!("  -s, --sudo            Run privileged transfer commands through sudo");
     println!(
         "  -o, --overwrite       Replace the destination target itself instead of merging it."
     );

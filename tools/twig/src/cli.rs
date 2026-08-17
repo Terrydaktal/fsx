@@ -169,6 +169,14 @@ pub(crate) struct Cli {
     #[arg(short = 'v', long)]
     pub(crate) header: bool,
 
+    /// Omit the rendered name column (used for metadata-only output)
+    #[arg(long, hide = true)]
+    pub(crate) omit_name: bool,
+
+    /// Resolve and render external commands in the native `which` format
+    #[arg(long)]
+    pub(crate) which: bool,
+
     /// Internal path currently being rendered
     #[arg(skip)]
     pub(crate) path: PathBuf,
@@ -182,6 +190,7 @@ pub(crate) struct Context {
     pub(crate) lscolors: LsColors,
     pub(crate) fsx_colors: fsx::colors::ColorSpec,
     pub(crate) color_enabled: bool,
+    pub(crate) omit_name: bool,
     pub(crate) classify: bool,
     pub(crate) show_perms: bool,
     pub(crate) show_size_logical: bool,
@@ -434,14 +443,23 @@ pub(crate) fn build_context_and_sort_state(cli: &Cli) -> (Context, bool, bool, b
     let color_enabled = output_enabled(cli.color, piped_output, false);
     let classify_enabled = cli.classify;
     let hyperlink_enabled = output_enabled(cli.hyperlink, piped_output, false);
-    let lscolors = LsColors::from_env().unwrap_or_default();
-    let fsx_colors =
-        fsx::colors::parse_ls_colors_value(&std::env::var("LS_COLORS").unwrap_or_default());
+    // Avoid parsing the user's (often very large) LS_COLORS value when the
+    // selected output mode will not emit colours. This matters for piped and
+    // machine-readable output, where the render path already bypasses styles.
+    let (lscolors, fsx_colors) = if color_enabled {
+        (
+            LsColors::from_env().unwrap_or_default(),
+            fsx::colors::parse_ls_colors_value(&std::env::var("LS_COLORS").unwrap_or_default()),
+        )
+    } else {
+        (LsColors::default(), fsx::colors::default_color_spec())
+    };
 
     let ctx = Context {
         lscolors,
         fsx_colors,
         color_enabled,
+        omit_name: cli.omit_name,
         classify: classify_enabled,
         show_perms: cli.permissions || cli.long,
         show_size_logical: (cli.size || cli.long) && !replace_logical_size,
@@ -507,5 +525,18 @@ mod tests {
         assert!(!dirs_only.no_traverse);
         assert!(no_traverse.no_traverse);
         assert!(!no_traverse.dirs_only);
+    }
+
+    #[test]
+    fn metadata_output_can_omit_names() {
+        let cli = Cli::try_parse_from(["twig", "--omit-name"]).unwrap();
+        assert!(cli.omit_name);
+    }
+
+    #[test]
+    fn native_which_mode_accepts_multiple_commands() {
+        let cli = Cli::try_parse_from(["twig", "--which", "first", "second"]).unwrap();
+        assert!(cli.which);
+        assert_eq!(cli.paths, [PathBuf::from("first"), PathBuf::from("second")]);
     }
 }

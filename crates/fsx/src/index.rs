@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 #[cfg(feature = "index")]
 use std::ffi::OsString;
 #[cfg(feature = "index")]
-use std::path::Path;
+use std::path::{Component, Path};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IndexFreshness {
@@ -95,7 +95,7 @@ fn query_recursive_stats_batch_with_metrics(
     require_sizes: bool,
 ) -> Option<RecursiveStatsBatch> {
     let root = std::fs::canonicalize(root).ok()?;
-    let root_key = root.to_string_lossy().into_owned();
+    let root_key = crate::path::encode_lossless_path(&root);
     let prefix = if root_key == "/" {
         "/".to_string()
     } else {
@@ -182,15 +182,8 @@ fn query_recursive_stats_batch_with_metrics(
             saw_root = true;
             continue;
         }
-        let relative = path.strip_prefix(&prefix)?;
-        let child_name = relative.split('/').next()?;
-        if child_name.is_empty() {
-            return None;
-        }
-        let child = batch
-            .children
-            .entry(OsString::from(child_name))
-            .or_default();
+        let child_name = indexed_child_name(&path, &prefix)?;
+        let child = batch.children.entry(child_name).or_default();
         child.allocated_size = child.allocated_size.saturating_add(stats.allocated_size);
         child.files = child.files.saturating_add(stats.files);
         child.dirs = child.dirs.saturating_add(stats.dirs);
@@ -270,8 +263,7 @@ fn deduct_duplicate_hardlinks(
         if parent == root {
             continue;
         }
-        let relative = parent.strip_prefix(prefix)?;
-        let name = OsString::from(relative.split('/').next()?);
+        let name = indexed_child_name(&parent, prefix)?;
         let seen = child_seen.entry(name.clone()).or_default();
         if !seen.insert(identity) {
             let child = batch.children.get_mut(&name)?;
@@ -279,6 +271,20 @@ fn deduct_duplicate_hardlinks(
         }
     }
     Some(())
+}
+
+#[cfg(feature = "index")]
+fn indexed_child_name(path: &str, prefix: &str) -> Option<OsString> {
+    let encoded = path.strip_prefix(prefix)?.split('/').next()?;
+    if encoded.is_empty() {
+        return None;
+    }
+    let decoded = crate::path::decode_lossless_path(encoded);
+    let mut components = decoded.components();
+    let Component::Normal(name) = components.next()? else {
+        return None;
+    };
+    components.next().is_none().then(|| name.to_os_string())
 }
 
 /// Return the canonical fsx cache directory.
@@ -453,5 +459,30 @@ mod tests {
         assert_eq!(batch.root.allocated_size, 100);
         assert_eq!(batch.children[&OsString::from("a")].allocated_size, 100);
         assert_eq!(batch.children[&OsString::from("b")].allocated_size, 100);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn indexed_child_names_round_trip_losslessly_without_percent_collisions() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let root = Path::new("/tmp/index-root");
+        let prefix = format!("{}/", crate::path::encode_lossless_path(root));
+        let raw_name = OsString::from_vec(b"raw-\xff".to_vec());
+        let literal_name = OsString::from("raw-%FF");
+        let raw_path = crate::path::encode_lossless_path(&root.join(&raw_name));
+        let literal_path = crate::path::encode_lossless_path(&root.join(&literal_name));
+
+        assert_ne!(raw_path, literal_path);
+        assert_eq!(
+            indexed_child_name(&raw_path, &prefix)
+                .expect("decode raw child")
+                .as_bytes(),
+            raw_name.as_bytes()
+        );
+        assert_eq!(
+            indexed_child_name(&literal_path, &prefix).expect("decode literal child"),
+            literal_name
+        );
     }
 }

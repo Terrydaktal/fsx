@@ -467,7 +467,7 @@ fn run_multi_source_file_batch_inner(
 
     let dst_real = realpath_allow_missing(&dst_mnt);
     let dst_display = format!("{}/", dst_mnt.display().to_string().trim_end_matches('/'));
-    let mut seen_names: FxHashSet<String> = FxHashSet::default();
+    let mut seen_names: FxHashSet<OsString> = FxHashSet::default();
     let mut batch_items: Vec<(PathBuf, u64, bool)> = Vec::new();
     let mut planned_bytes: u64 = 0;
     let mut total_regular_files: u64 = 0;
@@ -508,16 +508,25 @@ fn run_multi_source_file_batch_inner(
             return 1;
         }
 
-        let src_name = src_mnt
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "source".to_string());
-        if !seen_names.insert(src_name.clone()) {
+        let Some(src_name) = src_mnt.file_name() else {
+            log(
+                requested_mode,
+                "A source file has no basename.",
+                LogLevel::Error,
+            );
+            return 1;
+        };
+        let src_name_display = src_name
+            .to_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| fsx::encode_lossless_path(Path::new(src_name)));
+        let src_name_identity = fsx::encode_lossless_path(Path::new(src_name));
+        if !seen_names.insert(src_name.to_os_string()) {
             log(
                 requested_mode,
                 &format!(
                     "Multiple source paths resolve to the same destination name: {}",
-                    src_name
+                    src_name_display
                 ),
                 LogLevel::Error,
             );
@@ -526,7 +535,7 @@ fn run_multi_source_file_batch_inner(
 
         let ps = pre_scan_file(
             &src_mnt,
-            &dst_display,
+            &dst_mnt,
             DstObjKind::DirExisting,
             true,
             preview_only,
@@ -540,20 +549,20 @@ fn run_multi_source_file_batch_inner(
         add_files = add_files.saturating_add(ps.add_files);
         mod_files = mod_files.saturating_add(ps.mod_files);
         display_change_preview.extend(ps.change_preview);
-        source_top_entries.insert(src_name.clone());
+        source_top_entries.insert(src_name_display.clone());
         file_relation_breakdown.add_assign(ps.file_relation_breakdown);
         if ps.has_planned_changes {
             has_planned_changes = true;
         }
-        source_rel_files.insert(src_name.clone());
+        source_rel_files.insert(src_name_identity);
         batch_items.push((src_mnt, ps.planned_bytes, ps.has_planned_changes));
     }
 
     let uncollided_files = destination_index
         .entries
         .iter()
-        .filter(|(rel, entry)| {
-            entry.kind == DestinationKind::Regular && !source_rel_files.contains(*rel)
+        .filter(|(identity_rel, entry)| {
+            entry.kind == DestinationKind::Regular && !source_rel_files.contains(*identity_rel)
         })
         .count() as u64;
 
@@ -837,13 +846,13 @@ fn run_multi_source_file_batch_inner(
             .map(|(source, bytes, _)| (source, bytes))
             .collect();
     } else {
-        let source_args: Vec<String> = batch_items
+        let source_args: Vec<OsString> = batch_items
             .iter()
-            .map(|(source, _, _)| source.display().to_string())
+            .map(|(source, _, _)| source.as_os_str().to_os_string())
             .collect();
         let transfer = run_rsync_transfer_sources(
             &source_args,
-            &dst_display,
+            dst_mnt.as_os_str(),
             planned_bytes,
             use_sudo,
             false,
@@ -880,11 +889,9 @@ fn run_multi_source_file_batch_inner(
 
     if is_move {
         for (src_mnt, item_planned_bytes) in completed_batch_items {
-            let src_path = src_mnt.display().to_string();
             let cleanup = run_move_cleanup_phase(
-                &src_path,
-                &dst_display,
                 &src_mnt,
+                &dst_mnt,
                 SrcObjKind::File,
                 false,
                 false,
@@ -1348,11 +1355,10 @@ fn render_cleanup_phase_completion(
 }
 
 pub(crate) fn run_move_cleanup_phase(
-    src_path: &str,
-    dst_path: &str,
     src_mnt: &Path,
+    dst_mnt: &Path,
     src_obj_kind: SrcObjKind,
-    contents_mode_requested: bool,
+    include_root: bool,
     source_contents_mode: bool,
     exclude_rel: Option<&str>,
     rename_dir_to_new_path: bool,
@@ -1376,15 +1382,15 @@ pub(crate) fn run_move_cleanup_phase(
 
     let pid = std::process::id();
     let proc_start = read_proc_io_counters(pid);
-    let device_window = DeviceIoWindow::from_transfer_paths(src_path, src_path);
+    let device_window = DeviceIoWindow::from_local_paths(src_mnt, src_mnt);
     let device_start = device_window.current_totals();
 
     let cleanup_start = Instant::now();
     let deleted = prune_move_source_duplicates(
-        src_path,
-        dst_path,
+        src_mnt,
+        dst_mnt,
         src_obj_kind,
-        contents_mode_requested && src_obj_kind == SrcObjKind::Dir,
+        include_root,
         exclude_rel,
         use_sudo,
         mode,
@@ -1441,8 +1447,9 @@ pub(crate) fn run_move_cleanup_phase(
 }
 
 pub(crate) fn run_sync_cleanup_phase(
-    src_path: &str,
-    dst_path: &str,
+    src_root: &Path,
+    dst_base: &Path,
+    include_root: bool,
     mode: TransferMode,
     manifest: &TransferManifest,
 ) -> SyncCleanupPhaseResult {
@@ -1450,15 +1457,14 @@ pub(crate) fn run_sync_cleanup_phase(
     println!();
     reset_progress_render_state();
 
-    let src_root = Path::new(src_path.trim_end_matches('/'));
-    let dst_base = Path::new(dst_path.trim_end_matches('/'));
-    let include_root = !src_path.ends_with('/');
-    let src_base = src_root
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_default();
+    let Some(src_base) = src_root.file_name() else {
+        return SyncCleanupPhaseResult {
+            stats: CleanupPhaseStats::default(),
+            success: false,
+        };
+    };
     let destination_root = if include_root {
-        dst_base.join(&src_base)
+        dst_base.join(src_base)
     } else {
         dst_base.to_path_buf()
     };
@@ -1469,8 +1475,7 @@ pub(crate) fn run_sync_cleanup_phase(
         .sum();
 
     let proc_start = read_proc_io_counters(std::process::id());
-    let destination_key = destination_root.display().to_string();
-    let device_window = DeviceIoWindow::from_transfer_paths(&destination_key, &destination_key);
+    let device_window = DeviceIoWindow::from_local_paths(&destination_root, &destination_root);
     let device_start = device_window.current_totals();
     let cleanup_start = Instant::now();
     let deletion = delete_sync_destination_extras(&destination_root, manifest);
@@ -1485,7 +1490,7 @@ pub(crate) fn run_sync_cleanup_phase(
         src_root,
         dst_base,
         include_root,
-        &src_base,
+        src_base,
         Some(&manifest.dir_times),
     )
     .is_ok();

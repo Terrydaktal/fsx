@@ -17,7 +17,7 @@ pub(crate) use backup::{
     backup_base_path, backup_path_with_base, copy_path_to_backup, plan_backup_path,
 };
 pub(crate) use cleanup::remove_path_recursive;
-pub(crate) use command::run_command_capture;
+pub(crate) use command::run_command_capture_os;
 pub(crate) use copy_engine::{
     preflight_source_file_reads, preserve_directory_times_tree, run_test_hook,
 };
@@ -29,5 +29,5 @@ pub(crate) use orchestrator::{
 };
 pub(crate) use remote::run_remote_transfer_mode;
 pub(crate) use rename::premerge_fast_rename_noncolliding_children;
-pub(crate) use rsync::run_rsync_transfer;
+pub(crate) use rsync::run_rsync_transfer_os;
 pub(crate) use telemetry::prefer_hdd_scheduler_for_paths;

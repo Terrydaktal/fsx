@@ -2,11 +2,11 @@
 set -euo pipefail
 
 if [[ ${COPY_RS_RUN_ROOT_FAULT_TESTS:-0} != 1 ]]; then
-	echo "SKIP: set COPY_RS_RUN_ROOT_FAULT_TESTS=1 and run through pkexec for mount/device fault coverage"
+	echo "SKIP: set COPY_RS_RUN_ROOT_FAULT_TESTS=1 and run as root for mount/device fault coverage"
 	exit 0
 fi
 if [[ $EUID -ne 0 ]]; then
-	echo "ERROR: run this suite with pkexec" >&2
+	echo "ERROR: run this suite as root" >&2
 	exit 1
 fi
 

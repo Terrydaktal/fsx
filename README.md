@@ -31,7 +31,7 @@ and dim terminal style, so equivalent long-output columns do not drift between
 the listing and search tools.
 
 Traversal policy is shared wherever the workload permits it. Twig's ordinary
-filesystem aggregation now consumes `fsx::scan`, including its symlink,
+filesystem aggregation now consumes `fsx::scan::scan_top_level`, including its symlink,
 hardlink, and completion/error contract; Unearth's live walker exposes the same
 incomplete-result distinction. Tree's hierarchical renderer, Twig's NTFS/MFT
 fast path, Unearth's streaming/indexed pipeline, and Copy's one-pass planner
@@ -56,7 +56,7 @@ The feature matrix is intentionally narrow:
 | Consumer | fsx features | Purpose |
 | --- | --- | --- |
 | `tree` | `colors`, `git`, `ignore`, `terminal` | Git display, lazy ignore rules, shared LS_COLORS, hyperlinks |
-| `twig` | `colors`, `git`, `index`, `ntfs`, `terminal` | Indexed-or-live aggregation, NTFS sizing, shared Git/LS_COLORS, hyperlinks |
+| `twig` | `colors`, `git`, `index`, `ntfs`, `scan`, `terminal` | Indexed-or-live aggregation, NTFS sizing, shared Git/LS_COLORS, hyperlinks |
 | `unearth` | `colors`, `ignore`, `ntfs`, `terminal` | LS_COLORS, shared ignore rules, NTFS search, terminal output |
 | `copy` | `terminal` | Metadata/mount primitives and safe terminal escaping for previews |
 

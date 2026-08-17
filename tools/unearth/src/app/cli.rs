@@ -1,4 +1,5 @@
 use super::filesystem::effective_threads_override;
+#[cfg(feature = "index")]
 use super::index::{
     clean_watcher_covers_search, print_watch_status, purge_index_root, purge_index_root_path,
     rebuild_index_snapshot, rebuild_index_snapshot_path, refresh_index_root,
@@ -16,6 +17,7 @@ use rayon::ThreadPoolBuilder;
 use std::collections::HashMap;
 use std::env;
 use std::ffi::{OsStr, OsString};
+#[cfg(feature = "index")]
 use std::fs;
 use std::io::{self, BufWriter, IsTerminal, Write};
 #[cfg(unix)]
@@ -46,13 +48,14 @@ Usage:
                        [--reverse]
                        [--no-recurse|-R] [--follow-links]
                        [--ignore] [--hidden|-H] [--threads N]
-                       [--cache-raw] [--snapshot-cache]
+                       [--cache-raw] [--snapshot-cache] [--live|--no-index]
                        [--index|--index-if-watched] [--index-binary]
                        [--recent N]
                        [--index-refresh DIR] [--index-snapshot DIR]
                        [--index-purge DIR]
                        [--watch ROOT ...] [--watch-status] [--watch-metrics FILE]
                        [--color=auto|always|never] [--hyperlink]
+                       [--case-sensitive] [--lossless-paths]
                        [--highlight-match|--match-red]
   unearth (--version|-V)
 
@@ -119,6 +122,9 @@ Arguments:
     immediately, then refreshes that snapshot in the background. Timed-out
     scans do not replace an existing snapshot. Background refreshes use a long
     timeout by default unless --timeout is passed explicitly.
+  - --live (alias: --no-index) forces a live filesystem traversal. It never
+    reads, opens, creates, or refreshes the SQLite index, including for full-path
+    (-F) searches.
   - --index queries the global pooled path database in
     ~/.cache/fsx/index/fsx.db instead of walking the filesystem. It
     returns current DB rows immediately and starts one background refresh when
@@ -134,6 +140,9 @@ Arguments:
     watcher covers the root; --index-if-watched remains available explicitly.
   - --index-binary writes --index results as repeated little-endian
     u32-length-prefixed path bytes instead of newline-delimited text.
+  - --case-sensitive disables the default case-insensitive pattern matching.
+  - --lossless-paths percent-encodes invalid filename bytes as %XX in textual
+    output so paths can be transported without replacement characters.
   - --recent N queries the indexed database for the N most recently
     created-or-modified entries under DIR (or '.' when DIR is omitted), ordered
     newest-first. It synchronously refreshes the covering indexed root before
@@ -363,6 +372,7 @@ where
         sizes: false,
         counts: false,
         regex_mode: false,
+        case_sensitive: false,
         sort_field: None,
         sort_order: None,
         limit: None,
@@ -376,6 +386,7 @@ where
         cache_output: false,
         snapshot_cache: false,
         snapshot_refresh: false,
+        live_only: false,
         index_mode: false,
         index_if_watched: false,
         index_binary: false,
@@ -388,6 +399,7 @@ where
         watch_metrics: None,
         watch_metrics_os: None,
         absolute_paths: false,
+        lossless_paths: false,
         force_dir: false,
         force_file: false,
         force_full: false,
@@ -556,6 +568,8 @@ where
             "--classify" | "-C" => opts.classify = true,
             "--absolute-paths" | "-A" => opts.absolute_paths = true,
             "--regex" | "-r" => opts.regex_mode = true,
+            "--case-sensitive" => opts.case_sensitive = true,
+            "--lossless-paths" => opts.lossless_paths = true,
             "--sort" => {
                 if i + 2 >= args.len() {
                     return Err("--sort requires a field and order".to_string());
@@ -607,6 +621,7 @@ where
             "--cache-raw" => opts.cache_output = true,
             "--snapshot-cache" => opts.snapshot_cache = true,
             "--snapshot-refresh" => opts.snapshot_refresh = true,
+            "--live" | "--no-index" => opts.live_only = true,
             "--index" => opts.index_mode = true,
             "--index-if-watched" => opts.index_if_watched = true,
             "--index-binary" => {
@@ -771,6 +786,40 @@ where
     if opts.watch_metrics.is_some() && !opts.watch {
         return Err("--watch-metrics requires --watch".to_string());
     }
+    if opts.live_only
+        && (opts.index_mode
+            || opts.index_if_watched
+            || opts.recent_limit.is_some()
+            || opts.index_refresh.is_some()
+            || opts.index_snapshot.is_some()
+            || opts.index_purge.is_some()
+            || opts.watch
+            || opts.watch_status
+            || opts.snapshot_cache
+            || opts.snapshot_refresh)
+    {
+        return Err(
+            "--live/--no-index cannot be combined with index, watcher, recent, or snapshot modes"
+                .to_string(),
+        );
+    }
+    if !cfg!(feature = "index")
+        && (opts.index_mode
+            || opts.index_if_watched
+            || opts.recent_limit.is_some()
+            || opts.index_refresh.is_some()
+            || opts.index_snapshot.is_some()
+            || opts.index_purge.is_some()
+            || opts.watch
+            || opts.watch_status
+            || opts.snapshot_cache
+            || opts.snapshot_refresh)
+    {
+        return Err(
+            "this unearth binary was built without the index feature; use --live for filesystem traversal"
+                .to_string(),
+        );
+    }
     if opts.force_dir && opts.force_file {
         return Err("--dir and --file are mutually exclusive".to_string());
     }
@@ -813,6 +862,7 @@ pub(crate) fn cli_main() -> ExitCode {
     if opts.snapshot_refresh && !opts.timeout_explicit {
         opts.timeout_dur = SNAPSHOT_REFRESH_TIMEOUT;
     }
+    #[cfg(feature = "index")]
     if let Some(root) = opts.index_refresh.as_deref() {
         let result = opts
             .index_refresh_os
@@ -828,6 +878,7 @@ pub(crate) fn cli_main() -> ExitCode {
             }
         };
     }
+    #[cfg(feature = "index")]
     if let Some(root) = opts.index_snapshot.as_deref() {
         let result = opts
             .index_snapshot_os
@@ -843,6 +894,7 @@ pub(crate) fn cli_main() -> ExitCode {
             }
         };
     }
+    #[cfg(feature = "index")]
     if let Some(root) = opts.index_purge.as_deref() {
         let result = opts
             .index_purge_os
@@ -858,6 +910,7 @@ pub(crate) fn cli_main() -> ExitCode {
             }
         };
     }
+    #[cfg(feature = "index")]
     if opts.watch_status {
         return match print_watch_status() {
             Ok(()) => ExitCode::SUCCESS,
@@ -870,6 +923,7 @@ pub(crate) fn cli_main() -> ExitCode {
     if opts.watch {
         return run_watch(&opts);
     }
+    #[cfg(feature = "index")]
     let snapshot_path = if opts.snapshot_cache || opts.snapshot_refresh {
         snapshot_cache_path()
     } else {
@@ -878,6 +932,7 @@ pub(crate) fn cli_main() -> ExitCode {
     let content_spec = match contains_all_spec_from_opts(&opts) {
         Ok(v) => v,
         Err(e) => {
+            #[cfg(feature = "index")]
             if opts.snapshot_refresh {
                 if let Some(path) = snapshot_path.as_deref() {
                     let _ = fs::remove_file(snapshot_lock_path(path));
@@ -889,6 +944,7 @@ pub(crate) fn cli_main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    #[cfg(feature = "index")]
     if opts.snapshot_cache {
         if let Some(path) = snapshot_path.as_deref() {
             if path.is_file() {
@@ -918,12 +974,15 @@ pub(crate) fn cli_main() -> ExitCode {
     } else {
         parse_ls_colors()
     };
+    #[cfg(feature = "index")]
     let implicit_watched_index = opts.force_full
         && !opts.index_mode
+        && !opts.live_only
         && opts.recent_limit.is_none()
         && !opts.snapshot_cache
         && !opts.snapshot_refresh
         && content_spec.is_none();
+    #[cfg(feature = "index")]
     let use_watched_index = if opts.index_if_watched || implicit_watched_index {
         match clean_watcher_covers_search(&opts, content_spec.as_ref()) {
             Ok(covered) => covered,
@@ -935,6 +994,7 @@ pub(crate) fn cli_main() -> ExitCode {
     } else {
         false
     };
+    #[cfg(feature = "index")]
     let result = if opts.recent_limit.is_some() {
         run_recent_indexed(&opts, &mut cache, &colors)
     } else if opts.index_mode || use_watched_index {
@@ -946,8 +1006,17 @@ pub(crate) fn cli_main() -> ExitCode {
     } else {
         run_standard(&opts, &mut cache, &colors)
     };
+    #[cfg(not(feature = "index"))]
+    let result = if let Some(spec) = content_spec {
+        run_contains_all(&opts, spec, &mut cache, &colors)
+    } else if opts.force_full {
+        run_full(&opts, &mut cache, &colors)
+    } else {
+        run_standard(&opts, &mut cache, &colors)
+    };
     match result {
         Ok(run) => {
+            #[cfg(feature = "index")]
             if (opts.snapshot_cache || opts.snapshot_refresh) && !run.timed_out && !run.incomplete {
                 if let Some(path) = snapshot_path.as_deref() {
                     if let Err(e) = write_snapshot_cache(path, &run.lines) {
@@ -955,6 +1024,7 @@ pub(crate) fn cli_main() -> ExitCode {
                     }
                 }
             }
+            #[cfg(feature = "index")]
             if opts.snapshot_refresh {
                 if let Some(path) = snapshot_path.as_deref() {
                     let _ = fs::remove_file(snapshot_lock_path(path));
@@ -1071,6 +1141,47 @@ mod tests {
             b"/tmp/raw-\xff"
         );
         assert!(positional.is_empty());
+    }
+
+    #[test]
+    fn path_transport_options_parse() {
+        let options = parse_args_from(
+            ["--case-sensitive", "--lossless-paths", "needle"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .expect("path transport options");
+
+        assert!(options.case_sensitive);
+        assert!(options.lossless_paths);
+        assert_eq!(options.positional, vec!["needle"]);
+    }
+
+    #[test]
+    fn live_mode_disables_implicit_full_path_indexing() {
+        let options = parse_args_from(
+            ["--live", "-F", "needle", "/tmp"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .expect("live options");
+
+        assert!(options.live_only);
+        assert!(options.force_full);
+        assert!(!options.index_mode);
+        assert!(!options.index_if_watched);
+    }
+
+    #[test]
+    fn live_mode_rejects_explicit_indexing() {
+        let error = parse_args_from(
+            ["--no-index", "--index", "needle"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .expect_err("conflicting live/index modes");
+
+        assert!(error.contains("cannot be combined"));
     }
 }
 
