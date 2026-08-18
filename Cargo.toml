@@ -6,7 +6,7 @@ members = [
     "tools/twig",
     "tools/unearth",
     "tools/fsxd",
-   "tools/copy",
+    "tools/copy",
 ]
 
 [workspace.dependencies]
@@ -22,3 +22,19 @@ incremental = false
 debug = 0
 debug-assertions = false
 overflow-checks = true
+
+# Fault-injection and symbolization artifact. This is never used by the
+# normal release build and enables Copy's diagnostic-only hooks explicitly.
+[profile.diagnostic]
+inherits = "release"
+debug = 2
+strip = "none"
+lto = "thin"
+codegen-units = 16
+
+# Optimized post-mortem build. The artifact script splits and strips its
+# debuginfo into target/fsx-artifacts; ordinary release binaries remain small.
+[profile.release-symbols]
+inherits = "release"
+debug = 2
+strip = "none"

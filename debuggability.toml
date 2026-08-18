@@ -1,0 +1,237 @@
+# Copy to the repository root. Set template=false, replace every REPLACE_ME,
+# select a proportional profile, and keep evidence states honest.
+# Status values: implemented_tested | implemented_untested | planned | absent |
+#                not_applicable | waived
+# Every not_applicable or waived status field requires a matching
+# [[exceptions.items]] entry; [controls] records carry their own concrete reason.
+schema_version = 5
+template = false
+profile = "stateful"
+owner = "fsx maintainers"
+expected_failure_modes = ["optimized crash and symbolization", "fsxd backend failure or stale index", "fsxd queue overflow and SQLite contention", "Copy interruption, publication failure and remote transfer failure", "diagnostic overhead regression"]
+
+[architecture]
+state_owners = ["fsxd watcher/root state", "Copy planner/journal/transfer workers", "CLI process-local render/search state"]
+mutation_points = ["fsxd SQLite transaction and snapshot publication", "Copy staged publication and source cleanup", "CLI stdout and cache output"]
+side_effect_boundaries = ["filesystem traversal", "SQLite/index protocol", "rsync subprocess", "journal and metrics files"]
+fault_containment = "Bounded queues, staged publication, fail-closed preflight, journal recovery, bounded diagnostics and process-supervised service restart."
+
+[errors]
+typed_codes = "implemented_tested"
+preserves_source_chain = "implemented_tested"
+preserves_first_failure = "implemented_tested"
+causal_ids = ["Copy operation_id and journal transition_sequence", "fsxd watcher root/generation and PID/boot/start identity", "build Git SHA and ELF Build ID"]
+
+[invariants]
+release_checks = ["release binaries contain no COPY_RS_TEST_* hooks", "staged publication and journal transitions remain atomic at process-crash boundaries"]
+progress_rules = ["Copy transfer bytes/files advance or terminate with a contextual error", "fsxd heartbeat and event queue remain bounded; recovery scan is required after overflow"]
+resource_balances = ["Copy telemetry/journal threads and files are stopped/removed or retained by bounded policy", "fsxd worker/query threads have named ownership and bounded channels"]
+
+[configuration]
+effective_config = "implemented_tested"
+decision_provenance = "implemented_tested"
+dynamic_change_history = "implemented_tested"
+
+[build]
+identity = "All tools expose --build-info; release-artifacts.sh records Git SHA, Rust/toolchain, Build ID, checksums and split DWARF."
+exact_artifact_retention = "implemented_tested"
+symbols_and_unwind = "implemented_tested"
+source_retrieval = "implemented_tested"
+
+[artifacts]
+cache_identity = "implemented_tested"
+atomic_publication = "implemented_tested"
+generation_manifest = "implemented_tested"
+
+[live]
+capabilities_command = "--build-info and --help on every executable"
+snapshot_command = "unearth --watch-status-json"
+snapshot_consistency = "best-effort" # atomic | generation-consistent | best-effort | not_applicable
+independent_of_failure_loop = "implemented_tested"
+capture_timeout_ms = 2000
+
+[history]
+flight_recorder = "implemented_tested"
+schema = "Copy journal v2 plus fsxd semantic watch_history records with stable sequence, timestamp, kind, error code and detail."
+capacity_events = 256
+drop_and_overwrite_reporting = "implemented_tested"
+
+# This is a conditional durable product record, not the bounded diagnostic ring.
+# Mark the status fields not_applicable with matching exceptions when the
+# application has no credible persistent-mutation accountability requirement.
+[audit_trail]
+mutation_audit = "not_applicable"
+event_schema = "not applicable: fsxd owns a rebuildable derived cache; Copy is a directly invoked personal CLI"
+actor_writer_and_reason = "not applicable under the single-user deployment; OS audit facilities remain authoritative for privileged use"
+attribution_policy = "not applicable for the default personal deployment"
+transaction_binding = "not applicable: Copy journals are recovery evidence, not an append-only accountability sink"
+attempted_write_policy = "not applicable for the default personal deployment"
+provenance_and_deduplication = "not applicable for the default personal deployment"
+change_representation = "not applicable for the default personal deployment"
+direct_write_coverage = "not_applicable"
+tamper_evidence = "not applicable for the default personal deployment"
+retention_and_access = "not applicable for the default personal deployment"
+query_and_export = "not applicable for the default personal deployment"
+sink_failure_policy = "not applicable for the default personal deployment"
+cost_and_backpressure = "not applicable for the default personal deployment"
+assurance_test = "not applicable for the default personal deployment"
+max_event_bytes = 0
+max_added_commit_p99_ms = 0.0
+max_throughput_regression_percent = 0.0
+max_audit_wait_ms = 0
+max_storage_bytes_per_day = 0
+
+[concurrency]
+task_registry = "implemented_tested"
+lock_wait_introspection = "implemented_tested"
+cross_process_correlation = "implemented_tested"
+
+[resources]
+ownership_reporting = "implemented_tested"
+declared_budgets = ["fsxd event queue 16,384; batch 4,096; cache 32,768; query queue 64", "metrics 300 seconds/16 MiB by default", "Copy journals 128 files"]
+high_water_reporting = "implemented_tested"
+
+[reproduction]
+recorded_inputs = ["CLI argv, environment, build-info JSON, journal source/destination/mode, fsxd root/backend/generation"]
+replay_command = "cargo test --locked --workspace --all-targets --all-features; tools/build/diagnostic-overhead.py"
+fault_injection = ["COPY_RS_TEST_* in the diagnostic Cargo profile only", "Copy SIGINT/SIGTERM/crash/publication/mutation tests", "Unearth overflow/cancellation harness"]
+
+[postmortem]
+crash_capture = "implemented_tested"
+includes_history = "implemented_tested"
+oom_or_external_kill_detection = "implemented_tested"
+retention_policy = "Private Copy journals retain at most 128 files; release artifacts are retained by CI according to artifact policy."
+
+[recovery]
+pre_repair_evidence = "implemented_tested"
+restart_or_fallback_history = "implemented_tested"
+last_failure_retention = "implemented_tested"
+
+[domain]
+state_dump = "unearth --watch-status-json plus Copy journal v2"
+cross_boundary_ids = ["build Git SHA/ELF Build ID", "fsxd PID/boot/start identity", "Copy operation_id"]
+
+[security]
+authorization = "Owner-readable 0600 state/journal files and owner-restricted fsxd socket; no public diagnostic socket."
+redaction = ["Do not export raw paths outside the owner-controlled bundle; JSON status escapes strings but does not redact them.", "Do not collect file contents in diagnostics."]
+max_bundle_bytes = 0
+retention_days = 0
+
+[budgets]
+measurement_status = "implemented_tested"
+steady_cpu_percent = 0.5
+steady_memory_bytes = 8388608
+activated_cpu_percent = 10.0
+
+[deployment_modes]
+minimal_release = "Cargo release keeps opt-level=3/fat-LTO/codegen-units=1; Copy test hooks are compile-time absent; build identity and external split symbols remain."
+observable_release = "Same optimized binaries with bounded persisted recovery evidence and opt-in fsxd metrics."
+global_runtime_switch = "FSX_DIAGNOSTICS=off disables optional fsxd metrics for a run."
+per_category_switches = ["fsxd --watch-metrics with --watch-metrics-ttl/--watch-metrics-max-bytes", "Copy --verify is an explicit data-verification category"]
+diagnostic_builds = ["Cargo profile diagnostic plus copy-rs/diagnostic-hooks for crash, signal and mutation tests", "release-symbols split-debuginfo artifact build"]
+optional_diagnostics_default_enabled = false
+lazy_buffer_allocation = true
+lazy_helper_start = true
+
+[performance_isolation]
+preserves_release_optimization = true
+compile_time_exclusion_supported = false # set true when the project can remove optional instrumentation at build time
+critical_hot_paths = ["Copy regular-file transfer/open/publication loop", "fsxd event receive and SQLite batch loop", "Twig/Tree traversal and render loop"]
+disabled_hot_path_extra_instructions = 0
+baseline_comparison = "tools/build/diagnostic-overhead.py compares normal release and diagnostic Copy preview medians; full pre-change baseline remains unrecorded."
+minimal_mode_test = "tools/build/release-artifacts.sh plus diagnostic-overhead.py hook-string assertion"
+runtime_disabled_test = "FSX_DIAGNOSTICS=off and unearth CLI parser/metrics-bound tests"
+always_on_test = "Copy fault suite and workspace tests; journal retention and release hook absence checks"
+activated_mode_tests = ["bounded fsxd metrics TTL/byte behavior", "release/diagnostic Copy preview benchmark"]
+
+[instrumentation_policy]
+facility_admission = "required" # required: every new facility needs an admission record
+default_class = "activated" # always_on | activated | diagnostic_build
+max_steady_cpu_percent = 0.5
+max_steady_memory_bytes = 8388608
+max_event_rate_per_second = 1000
+max_disk_bytes_per_day = 0 # zero means no always-on diagnostic disk writes
+max_snapshot_pause_ms = 100
+max_activation_ttl_seconds = 300
+max_activated_capture_bytes = 67108864
+max_minimal_cpu_regression_percent = 0.0
+max_runtime_disabled_cpu_regression_percent = 0.1
+max_steady_p99_latency_regression_percent = 1.0
+max_activated_cpu_percent = 10.0
+synchronous_hot_path_io = false
+global_contended_event_index = false
+require_overhead_test = true
+promotion_requires_measurement = true
+
+[assurance]
+contract_test = "python3 scripts/validate_contract.py --strict debuggability.toml"
+synthetic_scenarios = ["Copy crash/publication/signal/mutation faults", "fsxd unreadable subtree, overflow and cancellation tests", "release artifact Build ID/DWARF check"]
+symbolization_test = "tools/build/release-artifacts.sh plus tools/build/verify-symbolization.sh verify matching stripped/private Build IDs and resolve a debug line from an isolated artifact pair."
+redaction_test = "JSON escaping, owner-only permissions and opt-in stable path hashing are tested by status/journal integration paths."
+overhead_test = "python3 tools/build/diagnostic-overhead.py"
+snapshot_test = "unearth --watch-status-json with unavailable/locked bounded-read behavior"
+
+[exceptions]
+# Example after setting artifacts.atomic_publication="not_applicable":
+# items = [{ control="artifacts.atomic_publication", disposition="not_applicable", reason="single atomic stdout result" }]
+items = [
+  { control = "audit_trail.mutation_audit", disposition = "not_applicable", reason = "fsxd stores a rebuildable derived cache and Copy is a directly invoked personal CLI; privileged/shared deployments must add an authenticated audit layer." },
+  { control = "audit_trail.direct_write_coverage", disposition = "not_applicable", reason = "Durable mutation auditing is not applicable under the default single-user deployment." },
+]
+
+# Every non-status control must declare whether it applies. For a genuine
+# exception use status="not_applicable" or "waived" with a concrete reason;
+# do not write ceremonial values such as "not applicable" into implementation
+# fields. Applicable controls must describe their implementation and test.
+[controls]
+"architecture.state_owners" = { status = "implemented_tested", reason = "Every long-lived state owner is documented.", implementation = "fsxd watcher roots, Copy journal/transfer workers and CLI process state are explicit.", test = "Workspace tests and watcher integration tests." }
+"architecture.mutation_points" = { status = "implemented_tested", reason = "Mutation boundaries need crash evidence.", implementation = "SQLite transactions, staged Copy publication, cleanup and journal transitions are named boundaries.", test = "Copy fault suite and fsxd recovery tests." }
+"architecture.side_effect_boundaries" = { status = "implemented_tested", reason = "Filesystem, SQLite, rsync and diagnostic files are isolated boundaries.", implementation = "Dedicated traversal, protocol, transfer, journal and metrics modules.", test = "Workspace integration and fault tests." }
+"architecture.fault_containment" = { status = "implemented_tested", reason = "Failure must not silently publish partial state.", implementation = "Bounded queues, fail-closed scans, staged publication, journals and service restart.", test = "Copy crash/mutation tests and Unearth recovery tests." }
+"errors.causal_ids" = { status = "implemented_tested", reason = "Cross-process evidence needs stable correlation.", implementation = "Build SHA/ELF Build ID, Copy operation_id and fsxd root/generation/owner identity.", test = "--build-info, journal and watch-status-json checks." }
+"invariants.release_checks" = { status = "implemented_tested", reason = "Release artifacts must exclude test-only controls.", implementation = "Diagnostic hooks are behind the diagnostic-hooks feature.", test = "diagnostic-overhead.py string assertion." }
+"invariants.progress_rules" = { status = "implemented_tested", reason = "Transfers and watcher recovery have bounded progress conditions.", implementation = "Copy counters/signals and fsxd queue, heartbeat and reconciliation limits.", test = "Copy signal suite and watcher tests." }
+"invariants.resource_balances" = { status = "implemented_tested", reason = "Diagnostic threads/files must have bounded lifetimes.", implementation = "Metrics logger joins on drop; journals are bounded to 128 retained files.", test = "Fault suite and metrics bound parser tests." }
+"build.identity" = { status = "implemented_tested", reason = "Post-mortem artifacts require exact identity.", implementation = "Shared --build-info JSON and release artifact Build ID manifest.", test = "All binary --build-info commands and artifact script." }
+"live.capabilities_command" = { status = "implemented_tested", reason = "Operators need discoverable capability information.", implementation = "--help and --build-info on every executable.", test = "Help matrix and binary smoke checks." }
+"live.snapshot_command" = { status = "implemented_tested", reason = "Daemon state must be inspectable outside the watcher loop.", implementation = "Read-only unearth --watch-status-json with bounded rows and SQLite timeout.", test = "Unavailable database JSON smoke test and watcher integration." }
+"history.schema" = { status = "implemented_tested", reason = "Recovery history needs a versioned on-disk format.", implementation = "Copy journal version 2 plus fsxd watch_history records with stable sequence, timestamp, semantic kind, detail and optional error code.", test = "Copy crash journal assertions and watcher history capacity/order tests." }
+"audit_trail.event_schema" = { status = "not_applicable", reason = "Default deployment has no durable accountability overlay.", implementation = "", test = "" }
+"audit_trail.actor_writer_and_reason" = { status = "not_applicable", reason = "Default deployment is a single-user directly invoked CLI.", implementation = "", test = "" }
+"audit_trail.attribution_policy" = { status = "not_applicable", reason = "Privileged/shared deployments must use an external authenticated audit layer.", implementation = "", test = "" }
+"audit_trail.transaction_binding" = { status = "not_applicable", reason = "Copy journals are recovery evidence, not accountability records.", implementation = "", test = "" }
+"audit_trail.attempted_write_policy" = { status = "not_applicable", reason = "No durable mutation audit sink is required by the default deployment.", implementation = "", test = "" }
+"audit_trail.provenance_and_deduplication" = { status = "not_applicable", reason = "No shared audit sink exists in the default deployment.", implementation = "", test = "" }
+"audit_trail.change_representation" = { status = "not_applicable", reason = "The index is a rebuildable derived cache.", implementation = "", test = "" }
+"audit_trail.tamper_evidence" = { status = "not_applicable", reason = "Owner-only recovery files are not a tamper-evident audit system.", implementation = "", test = "" }
+"audit_trail.retention_and_access" = { status = "not_applicable", reason = "No durable accountability record is retained by default.", implementation = "", test = "" }
+"audit_trail.query_and_export" = { status = "not_applicable", reason = "No audit query/export surface exists in the default deployment.", implementation = "", test = "" }
+"audit_trail.sink_failure_policy" = { status = "not_applicable", reason = "No audit sink exists in the default deployment.", implementation = "", test = "" }
+"audit_trail.cost_and_backpressure" = { status = "not_applicable", reason = "No audit sink exists in the default deployment.", implementation = "", test = "" }
+"audit_trail.assurance_test" = { status = "not_applicable", reason = "No audit sink exists in the default deployment.", implementation = "", test = "" }
+"resources.declared_budgets" = { status = "implemented_tested", reason = "Queues, journals and metrics output need explicit caps and observed high-water values.", implementation = "debuggability.toml declares queue, journal, TTL and byte budgets; metrics reports queue, batch and cache high-water marks.", test = "Parser, journal retention, metrics header and live watcher smoke tests." }
+"domain.state_dump" = { status = "implemented_tested", reason = "Generic logs cannot distinguish watcher state, configuration and transfer recovery.", implementation = "watch-status-json includes effective config/provenance, cache identity, ownership, history and high-water diagnostics plus Copy journal v2.", test = "Snapshot, redaction and fault suites." }
+"assurance.contract_test" = { status = "implemented_tested", reason = "The contract must be structurally checked in CI.", implementation = "validate_contract.py --strict.", test = "CI contract-validation step." }
+"assurance.overhead_test" = { status = "implemented_tested", reason = "Optional diagnostics require measured isolation.", implementation = "diagnostic-overhead.py compares release and diagnostic Copy preview medians.", test = "CI overhead step." }
+"assurance.snapshot_test" = { status = "implemented_tested", reason = "Snapshot availability and bounded behavior must be checked.", implementation = "watch-status-json reports unavailable instead of blocking.", test = "Temporary-cache JSON smoke test." }
+"deployment_modes.minimal_release" = { status = "implemented_tested", reason = "Normal release must exclude optional fault hooks.", implementation = "release profile plus compile-time diagnostic-hooks feature.", test = "Release string assertion and artifact script." }
+"deployment_modes.observable_release" = { status = "implemented_tested", reason = "The default optimized build retains bounded recovery evidence.", implementation = "Build identity, journals and persisted watcher state remain enabled.", test = "Workspace and fault tests." }
+"deployment_modes.global_runtime_switch" = { status = "implemented_tested", reason = "Operators need one switch to disable optional metrics.", implementation = "FSX_DIAGNOSTICS=off is evaluated once when fsxd starts.", test = "Watcher startup and parser tests." }
+"deployment_modes.per_category_switches" = { status = "implemented_tested", reason = "Detailed metrics must be explicitly activated and bounded.", implementation = "--watch-metrics with TTL and byte-limit options; --verify remains explicit.", test = "CLI bound parser and metrics smoke tests." }
+"performance_isolation.critical_hot_paths" = { status = "implemented_tested", reason = "Copy per-file and fsxd event loops are sensitive paths.", implementation = "Copy hooks compile to no-op in release; metrics activate lazily.", test = "Binary hook assertion and preview benchmark." }
+"performance_isolation.minimal_mode_test" = { status = "implemented_tested", reason = "Minimal mode requires a release artifact and hot-path check.", implementation = "release-artifacts.sh and diagnostic-overhead.py.", test = "CI build and overhead steps." }
+"performance_isolation.runtime_disabled_test" = { status = "implemented_tested", reason = "Disabled metrics must not start a sampler.", implementation = "FSX_DIAGNOSTICS=off branch before MetricsLogger allocation.", test = "Metrics-disabled watcher smoke test." }
+"performance_isolation.always_on_test" = { status = "implemented_tested", reason = "Always-on recovery evidence must remain bounded.", implementation = "Journal retention and fsxd bounded queues.", test = "Copy journal and watcher tests." }
+"performance_isolation.activated_mode_tests" = { status = "implemented_tested", reason = "Activated diagnostics need explicit limits.", implementation = "Metrics TTL and maximum-byte enforcement.", test = "Metrics-bound integration smoke test and overhead benchmark." }
+"reproduction.recorded_inputs" = { status = "implemented_tested", reason = "Failures must be replayable with exact operands and build identity.", implementation = "CLI argv/build-info, Copy journal source/destination/mode, fsxd root/backend/generation.", test = "Fault and watcher integration suites." }
+"reproduction.replay_command" = { status = "implemented_tested", reason = "The workspace has deterministic commands for normal and diagnostic runs.", implementation = "Locked Cargo tests, diagnostic Copy fault suite and overhead script are documented.", test = "CI executes each command." }
+"reproduction.fault_injection" = { status = "implemented_tested", reason = "Crash and mutation boundaries need controlled reproduction.", implementation = "Copy hooks are restricted to the diagnostic-hooks feature; fsxd harness controls overflow/cancellation.", test = "test_copy_faults.py and live_watcher.sh." }
+"postmortem.retention_policy" = { status = "implemented_tested", reason = "Artifacts and journals need bounded retention.", implementation = "Copy keeps 128 journals; CI artifact output is grouped by commit/Build ID.", test = "Journal retention code and release-artifact manifest." }
+"domain.cross_boundary_ids" = { status = "implemented_tested", reason = "Cross-process evidence needs correlatable IDs.", implementation = "Build SHA/Build ID, fsxd owner identity/generation and Copy operation_id.", test = "Build-info and journal/status smoke checks." }
+"security.authorization" = { status = "implemented_tested", reason = "Diagnostic state contains sensitive paths and must stay owner-readable.", implementation = "0600 journals/database/socket and no public diagnostic listener.", test = "Existing journal/socket permission tests." }
+"security.redaction" = { status = "implemented_tested", reason = "Diagnostic output must support a path-safe mode without collecting file contents.", implementation = "FSX_DIAGNOSTICS_REDACT=1 replaces paths with stable hashes and error details with redacted while retaining stable codes.", test = "Storage redaction unit test and live status JSON smoke test." }
+"assurance.synthetic_scenarios" = { status = "implemented_tested", reason = "The principal failure classes have executable scenarios.", implementation = "Copy crash/signal/mutation suites, watcher recovery/external-exit tests, panic-marker checks and artifact checks.", test = "CI integration steps and workspace tests." }
+"assurance.symbolization_test" = { status = "implemented_tested", reason = "Private symbols must resolve on a machine without the build tree.", implementation = "release-artifacts.sh emits matching DWARF and verify-symbolization.sh resolves an address with isolated system addr2line.", test = "CI clean-machine symbolization step." }
+"assurance.redaction_test" = { status = "implemented_tested", reason = "Redaction must be deterministic and preserve machine-readable status shape.", implementation = "Owner-only state files, JSON escaping and opt-in stable path hashing.", test = "Storage hash test and live watcher status parser." }
+"deployment_modes.diagnostic_builds" = { status = "implemented_tested", reason = "Behavior-altering hooks must not ship in normal binaries.", implementation = "Cargo diagnostic profile and copy-rs/diagnostic-hooks feature.", test = "Diagnostic fault suite and release string assertion." }
+"performance_isolation.baseline_comparison" = { status = "implemented_tested", reason = "Release/diagnostic measurements need a checked-in allowance and a repeatable gate.", implementation = "diagnostic-overhead.py compares medians against tools/build/baselines/diagnostic-overhead.json and fails when the allowance is exceeded.", test = "CI overhead step and baseline parser." }

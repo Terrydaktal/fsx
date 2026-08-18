@@ -71,6 +71,12 @@ Copy's local backend additionally uses durable operation journals under
 no-follow destination publication on Linux. `copy --verify` enables an opt-in SHA-256
 post-publication verification pass for local regular-file transfers.
 
+Every executable accepts `--build-info` and emits the same JSON identity fields: package,
+version, Git commit/dirty state, target, profile and compiler. `tools/build/release-artifacts.sh`
+builds optimized stripped binaries with matching private debuginfo indexed by ELF Build ID;
+`tools/build/diagnostic-overhead.py` checks that diagnostic-only Copy hooks are absent from the
+normal release binary and measures their disabled-path preview overhead.
+
 SQLite path keys used by Unearth are lossless escaped UTF-8 strings supplied by
 `fsx::encode_lossless_path`; indexed binary output decodes them back to original OS bytes.
 

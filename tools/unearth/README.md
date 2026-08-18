@@ -147,15 +147,24 @@ Inspect persisted state with:
 unearth --watch-status
 ```
 
+For automation, use the bounded read-only JSON snapshot. It never repairs stale rows and returns
+`available=false` instead of waiting indefinitely for a locked writer:
+
+```bash
+unearth --watch-status-json
+```
+
 Collect one-second resource samples for a watcher with:
 
 ```bash
-fsxd --watch-metrics "$HOME/.cache/fsx/home-metrics.tsv" "$HOME"
+fsxd --watch-metrics "$HOME/.cache/fsx/home-metrics.tsv" --watch-metrics-ttl 300 "$HOME"
 ```
 
 The TSV contains current RSS and virtual memory, cumulative user/system CPU time, interval CPU
 percentage, thread count, event counters, and scan/database timings. It is truncated when the
 watcher starts and flushed after every sample, so it can be inspected while the watcher runs.
+Collection stops automatically at the requested TTL or 16 MiB (the default byte cap). Set
+`FSX_DIAGNOSTICS=off` to disable optional metrics globally for a run.
 
 Run the repeatable live-watcher integration test against a temporary tree:
 
@@ -191,6 +200,7 @@ Run from this repo:
 ../../target/release/unearth --help
 ../../target/release/fsxd --help
 ../../target/release/unearthd --help
+../../target/release/fsxd --build-info
 ```
 
 Install to your PATH:

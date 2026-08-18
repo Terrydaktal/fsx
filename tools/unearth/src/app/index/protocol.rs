@@ -326,8 +326,12 @@ pub(crate) fn query_server_loop(listener: UnixListener, stop: Arc<AtomicBool>) {
             std::thread::Builder::new()
                 .name(format!("fsxd-query-{index}"))
                 .spawn(move || {
-                    let Ok(conn) = open_index_db_readonly() else {
-                        return;
+                    let conn = match open_index_db_readonly() {
+                        Ok(conn) => conn,
+                        Err(error) => {
+                            eprintln!("fsxd: query worker {index} could not open index: {error}");
+                            return;
+                        }
                     };
                     while !worker_stop.load(Ordering::Acquire) {
                         match receiver.recv_timeout(Duration::from_millis(100)) {
@@ -335,7 +339,9 @@ pub(crate) fn query_server_loop(listener: UnixListener, stop: Arc<AtomicBool>) {
                                 if worker_stop.load(Ordering::Acquire) {
                                     break;
                                 }
-                                let _ = handle_query_connection(stream, &conn);
+                                if let Err(error) = handle_query_connection(stream, &conn) {
+                                    eprintln!("fsxd: query worker {index} request failed: {error}");
+                                }
                             }
                             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -361,7 +367,12 @@ pub(crate) fn query_server_loop(listener: UnixListener, stop: Arc<AtomicBool>) {
                     continue;
                 }
             }
-            Err(_) => break,
+            Err(error) => {
+                if !stop.load(Ordering::Acquire) {
+                    eprintln!("fsxd: query socket accept failed: {error}");
+                }
+                break;
+            }
         }
     }
     drop(sender);

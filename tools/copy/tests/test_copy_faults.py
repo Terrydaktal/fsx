@@ -12,7 +12,13 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-COPY_BIN = Path(os.environ.get("COPY_RS_COPY_BIN", ROOT / "copy"))
+DEFAULT_DIAGNOSTIC_BIN = ROOT.parents[1] / "target" / "diagnostic" / "copy-rs"
+COPY_BIN = Path(
+    os.environ.get(
+        "COPY_RS_COPY_BIN",
+        DEFAULT_DIAGNOSTIC_BIN if DEFAULT_DIAGNOSTIC_BIN.exists() else ROOT / "copy",
+    )
+)
 
 
 def test_env(state):

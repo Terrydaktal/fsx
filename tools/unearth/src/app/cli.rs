@@ -1,8 +1,8 @@
 use super::filesystem::effective_threads_override;
 #[cfg(feature = "index")]
 use super::index::{
-    clean_watcher_covers_search, print_watch_status, purge_index_root, purge_index_root_path,
-    rebuild_index_snapshot, rebuild_index_snapshot_path, refresh_index_root,
+    clean_watcher_covers_search, print_watch_status, print_watch_status_json, purge_index_root,
+    purge_index_root_path, rebuild_index_snapshot, rebuild_index_snapshot_path, refresh_index_root,
     refresh_index_root_path, run_indexed, run_recent_indexed, snapshot_cache_path,
     snapshot_lock_path, spawn_snapshot_refresh, stream_snapshot_cache, write_snapshot_cache,
 };
@@ -53,7 +53,7 @@ Usage:
                        [--recent N]
                        [--index-refresh DIR] [--index-snapshot DIR]
                        [--index-purge DIR]
-                       [--watch ROOT ...] [--watch-status] [--watch-metrics FILE]
+                       [--watch ROOT ...] [--watch-status|--watch-status-json] [--watch-metrics FILE]
                        [--color=auto|always|never] [--hyperlink]
                        [--case-sensitive] [--lossless-paths]
                        [--highlight-match|--match-red]
@@ -178,9 +178,13 @@ Arguments:
     existing owner to stop and replaces it with the new options.
   - --watch-status prints live watcher state recorded in the pooled database and exits.
     It marks a state stopped when the recorded watcher process is no longer alive.
+  - --watch-status-json prints a bounded, read-only JSON diagnostic snapshot. It never
+    mutates the database and returns an unavailable snapshot if SQLite cannot be read quickly.
   - --watch-metrics FILE samples the watch process once per second and writes a TSV report,
     truncating it at startup. It contains current RSS/virtual memory, user/system CPU time,
-    CPU percentage, thread count, event throughput, and refresh/database timings.
+    CPU percentage, thread count, event throughput, and refresh/database timings. Collection
+    expires after 300 seconds or 16 MiB by default; use --watch-metrics-ttl and
+    --watch-metrics-max-bytes to set smaller bounds.
   - --sizes prints compact sizes as SIZE<TAB>PATH (max 6 chars including
     unit, e.g., 1.111M, 111.1M),
     using recursive directory totals for directory matches.
@@ -311,6 +315,8 @@ fn raw_operands(args: &[OsString]) -> Result<(Option<OsString>, Vec<OsString>), 
             "--index-snapshot",
             "--index-purge",
             "--watch-metrics",
+            "--watch-metrics-ttl",
+            "--watch-metrics-max-bytes",
         ]
         .iter()
         .any(|option| inline_option_value(&args[i], option).is_some())
@@ -342,6 +348,8 @@ fn raw_operands(args: &[OsString]) -> Result<(Option<OsString>, Vec<OsString>), 
                         | "--index-snapshot"
                         | "--index-purge"
                         | "--watch-metrics"
+                        | "--watch-metrics-ttl"
+                        | "--watch-metrics-max-bytes"
                 ) =>
             {
                 i += if value == "--sort" { 2 } else { 1 };
@@ -396,8 +404,11 @@ where
         index_purge: None,
         watch: false,
         watch_status: false,
+        watch_status_json: false,
         watch_metrics: None,
         watch_metrics_os: None,
+        watch_metrics_ttl: 300,
+        watch_metrics_max_bytes: 16 * 1024 * 1024,
         absolute_paths: false,
         lossless_paths: false,
         force_dir: false,
@@ -702,6 +713,10 @@ where
             }
             "--watch" => opts.watch = true,
             "--watch-status" => opts.watch_status = true,
+            "--watch-status-json" => {
+                opts.watch_status = true;
+                opts.watch_status_json = true;
+            }
             "--watch-metrics" => {
                 i += 1;
                 if i < args.len() {
@@ -716,6 +731,34 @@ where
                     return Err("--watch-metrics requires a non-empty report file path".to_string());
                 }
                 opts.watch_metrics = Some(value.to_string());
+            }
+            "--watch-metrics-ttl" => {
+                i += 1;
+                opts.watch_metrics_ttl = args
+                    .get(i)
+                    .ok_or_else(|| "--watch-metrics-ttl requires seconds".to_string())?
+                    .parse::<u64>()
+                    .map_err(|_| "--watch-metrics-ttl must be an integer".to_string())?;
+            }
+            _ if arg.starts_with("--watch-metrics-ttl=") => {
+                opts.watch_metrics_ttl = arg
+                    .trim_start_matches("--watch-metrics-ttl=")
+                    .parse::<u64>()
+                    .map_err(|_| "--watch-metrics-ttl must be an integer".to_string())?;
+            }
+            "--watch-metrics-max-bytes" => {
+                i += 1;
+                opts.watch_metrics_max_bytes = args
+                    .get(i)
+                    .ok_or_else(|| "--watch-metrics-max-bytes requires bytes".to_string())?
+                    .parse::<u64>()
+                    .map_err(|_| "--watch-metrics-max-bytes must be an integer".to_string())?;
+            }
+            _ if arg.starts_with("--watch-metrics-max-bytes=") => {
+                opts.watch_metrics_max_bytes = arg
+                    .trim_start_matches("--watch-metrics-max-bytes=")
+                    .parse::<u64>()
+                    .map_err(|_| "--watch-metrics-max-bytes must be an integer".to_string())?;
             }
             "--cache" => return Err("--cache was renamed to --cache-raw".to_string()),
             "--bypass" | "-b" => opts.force_pattern_mode = true,
@@ -850,6 +893,13 @@ pub(crate) fn parse_color_when(v: &str) -> Result<ColorWhen, String> {
 }
 
 pub(crate) fn cli_main() -> ExitCode {
+    if env::args_os().skip(1).any(|arg| arg == "--build-info") {
+        fsx::build_info::print_json(fsx::build_info::current(
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+        ));
+        return ExitCode::SUCCESS;
+    }
     let mut opts = match parse_args() {
         Ok(v) => v,
         Err(e) => {
@@ -912,7 +962,12 @@ pub(crate) fn cli_main() -> ExitCode {
     }
     #[cfg(feature = "index")]
     if opts.watch_status {
-        return match print_watch_status() {
+        let result = if opts.watch_status_json {
+            print_watch_status_json()
+        } else {
+            print_watch_status()
+        };
+        return match result {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("{}", e);
@@ -1122,7 +1177,7 @@ pub(crate) fn run_watch(_opts: &Options) -> ExitCode {
 }
 
 pub(crate) fn daemon_usage() -> &'static str {
-    "fsx live filesystem index daemon\n\nUsage:\n  fsxd [--threads N] [--watch-metrics FILE] ROOT ...\n\nOptions:\n  --threads N             Metadata worker count (default: 8)\n  --watch-metrics FILE   Write one-second resource metrics to FILE\n  --help                 Show this help\n  --version              Show the version\n\nThe daemon owns the shared fsx SQLite index and stays in the foreground. Run\nit under systemd or another supervisor for automatic restart. unearthd is\nretained as a compatibility entry point.\n"
+    "fsx live filesystem index daemon\n\nUsage:\n  fsxd [--threads N] [--watch-metrics FILE] [--watch-metrics-ttl N] [--watch-metrics-max-bytes N] ROOT ...\n\nOptions:\n  --threads N             Metadata worker count (default: 8)\n  --watch-metrics FILE   Write one-second resource metrics to FILE\n  --watch-metrics-ttl N  Stop metrics collection after N seconds (default: 300)\n  --watch-metrics-max-bytes N  Stop metrics collection after N bytes (default: 16777216)\n  --help                 Show this help\n  --version              Show the version\n  --build-info           Print machine-readable build identity\n\nThe daemon owns the shared fsx SQLite index and stays in the foreground. Run\nit under systemd or another supervisor for automatic restart. unearthd is\nretained as a compatibility entry point.\n"
 }
 
 #[cfg(all(test, unix))]
@@ -1183,9 +1238,28 @@ mod tests {
 
         assert!(error.contains("cannot be combined"));
     }
+
+    #[test]
+    fn diagnostic_status_and_metrics_bounds_parse() {
+        let options = parse_args_from(
+            [
+                "--watch-status-json",
+                "--watch-metrics-ttl",
+                "7",
+                "--watch-metrics-max-bytes=4096",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .expect("diagnostic options");
+        assert!(options.watch_status);
+        assert!(options.watch_status_json);
+        assert_eq!(options.watch_metrics_ttl, 7);
+        assert_eq!(options.watch_metrics_max_bytes, 4096);
+    }
 }
 
-pub(crate) fn fsxd_main() -> ExitCode {
+pub(crate) fn fsxd_main(package: &'static str, version: &'static str) -> ExitCode {
     let raw_args: Vec<OsString> = env::args_os().skip(1).collect();
     if raw_args
         .iter()
@@ -1199,6 +1273,10 @@ pub(crate) fn fsxd_main() -> ExitCode {
         .any(|arg| arg == OsStr::new("--version") || arg == OsStr::new("-V"))
     {
         println!("fsxd {}", VERSION);
+        return ExitCode::SUCCESS;
+    }
+    if raw_args.iter().any(|arg| arg == OsStr::new("--build-info")) {
+        fsx::build_info::print_json(fsx::build_info::current(package, version));
         return ExitCode::SUCCESS;
     }
     let mut arguments = Vec::with_capacity(raw_args.len() + 1);

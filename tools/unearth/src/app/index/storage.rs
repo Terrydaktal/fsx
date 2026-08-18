@@ -129,6 +129,218 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
+const WATCH_HISTORY_CAPACITY: i64 = 256;
+const WATCH_CONFIG_HISTORY_CAPACITY: i64 = 64;
+
+/// Persist only semantic watcher transitions. Raw filesystem events remain
+/// in the bounded queue and are intentionally not copied into this history.
+pub(crate) fn record_watch_event(root: &str, kind: &str, detail: &str) {
+    let Ok(conn) = open_index_db_writer() else {
+        return;
+    };
+    let Ok(tx) = conn.unchecked_transaction() else {
+        return;
+    };
+    let now = unix_now();
+    let (next_sequence, dropped): (i64, i64) = tx
+        .query_row(
+            "SELECT next_sequence, dropped FROM watch_history_state WHERE root=?1",
+            [root],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap_or((0, 0));
+    let _ = tx.execute(
+        "INSERT INTO watch_history_state(root, next_sequence, dropped)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(root) DO UPDATE SET next_sequence=excluded.next_sequence",
+        params![root, next_sequence.saturating_add(1), dropped],
+    );
+    let code = (kind.contains("error") || kind == "failed")
+        .then(|| fsx::code_for_message(detail).as_str());
+    if tx
+        .execute(
+            "INSERT INTO watch_history(root, sequence, recorded_at, kind, error_code, detail)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![root, next_sequence, now, kind, code, detail],
+        )
+        .is_err()
+    {
+        return;
+    }
+    let excess: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) - ?2 FROM watch_history WHERE root=?1",
+            params![root, WATCH_HISTORY_CAPACITY],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let mut new_dropped = dropped;
+    if excess > 0 {
+        let _ = tx.execute(
+            "DELETE FROM watch_history
+             WHERE root=?1 AND sequence IN
+               (SELECT sequence FROM watch_history WHERE root=?1 ORDER BY sequence LIMIT ?2)",
+            params![root, excess],
+        );
+        new_dropped = new_dropped.saturating_add(excess);
+        let _ = tx.execute(
+            "UPDATE watch_history_state SET dropped=?2 WHERE root=?1",
+            params![root, new_dropped],
+        );
+    }
+    let _ = tx.commit();
+}
+
+pub(crate) fn update_watch_task(root: &str, name: &str, state: &str, error: Option<&str>) {
+    let Ok(conn) = open_index_db_writer() else {
+        return;
+    };
+    let _ = conn.execute(
+        "INSERT INTO watch_tasks(root, name, state, started_at, updated_at, error_code, error)
+         VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6)
+         ON CONFLICT(root, name) DO UPDATE SET state=excluded.state,
+             updated_at=excluded.updated_at, error_code=excluded.error_code, error=excluded.error",
+        params![
+            root,
+            name,
+            state,
+            unix_now(),
+            error.map(|value| fsx::code_for_message(value).as_str()),
+            error,
+        ],
+    );
+}
+
+/// Record the effective watcher configuration at each ownership transition.
+/// A restart with changed options therefore leaves an inspectable provenance
+/// trail without adding work to the filesystem-event hot path.
+pub(crate) fn record_watch_config(root: &str, opts: &Options) {
+    let Ok(conn) = open_index_db_writer() else {
+        return;
+    };
+    let source = config_source(opts);
+    let effective = effective_config_json(opts);
+    let now = unix_now();
+    let sequence: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(sequence), -1) + 1 FROM watch_config_history WHERE root=?1",
+            [root],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if conn
+        .execute(
+            "INSERT INTO watch_config_history(root, sequence, recorded_at, source, effective)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![root, sequence, now, source, effective],
+        )
+        .is_err()
+    {
+        return;
+    }
+    let excess = conn
+        .query_row(
+            "SELECT COUNT(*) - ?2 FROM watch_config_history WHERE root=?1",
+            params![root, WATCH_CONFIG_HISTORY_CAPACITY],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0);
+    if excess > 0 {
+        let _ = conn.execute(
+            "DELETE FROM watch_config_history WHERE root=?1 AND sequence IN
+             (SELECT sequence FROM watch_config_history WHERE root=?1 ORDER BY sequence LIMIT ?2)",
+            params![root, excess],
+        );
+    }
+}
+
+fn config_source(opts: &Options) -> &'static str {
+    if std::env::var_os("FSX_DIAGNOSTICS").is_some()
+        || std::env::var_os("UNEARTH_WATCH_RECONCILE_SECS").is_some()
+    {
+        if opts.threads_explicit || opts.timeout_explicit || opts.watch_metrics.is_some() {
+            "cli+env+defaults"
+        } else {
+            "env+defaults"
+        }
+    } else if opts.threads_explicit || opts.timeout_explicit || opts.watch_metrics.is_some() {
+        "cli+defaults"
+    } else {
+        "defaults"
+    }
+}
+
+fn effective_config_json(opts: &Options) -> String {
+    let diagnostics = !std::env::var("FSX_DIAGNOSTICS")
+        .map(|value| matches!(value.as_str(), "0" | "off" | "false"))
+        .unwrap_or(false);
+    let reconcile = std::env::var("UNEARTH_WATCH_RECONCILE_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    format!(
+        "{{\"threads\":{},\"timeout_seconds\":{},\"metrics_enabled\":{},\"metrics_ttl_seconds\":{},\"metrics_max_bytes\":{},\"diagnostics_enabled\":{},\"periodic_reconcile_seconds\":{}}}",
+        opts.threads_override.max(1),
+        opts.timeout_dur.as_secs(),
+        opts.watch_metrics.is_some(),
+        opts.watch_metrics_ttl.max(1),
+        opts.watch_metrics_max_bytes,
+        diagnostics,
+        reconcile,
+    )
+}
+
+fn lock_snapshot(path: Option<PathBuf>, kind: &str) -> String {
+    let Some(path) = path else {
+        return format!("{{\"kind\":\"{}\",\"available\":false}}", kind);
+    };
+    let content = fs::read_to_string(&path).unwrap_or_default();
+    let pid = content
+        .split_whitespace()
+        .next()
+        .and_then(|value| value.parse::<i64>().ok());
+    let held = path.exists();
+    let owner_alive = pid.is_some_and(|value| Path::new(&format!("/proc/{value}")).exists());
+    format!(
+        "{{\"kind\":\"{}\",\"path\":\"{}\",\"held\":{},\"owner_alive\":{},\"pid\":{}}}",
+        kind,
+        json_escape(&diagnostic_path(&path.to_string_lossy())),
+        held,
+        owner_alive,
+        optional_json_i64(pid),
+    )
+}
+
+fn diagnostic_redaction_enabled() -> bool {
+    std::env::var("FSX_DIAGNOSTICS_REDACT")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "on"))
+        .unwrap_or(false)
+}
+
+fn diagnostic_path(value: &str) -> String {
+    diagnostic_path_with(value, diagnostic_redaction_enabled())
+}
+
+fn diagnostic_path_with(value: &str, redact: bool) -> String {
+    if !redact {
+        return value.to_string();
+    }
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("path-hash:{hash:016x}")
+}
+
+fn diagnostic_text(value: &str) -> String {
+    if diagnostic_redaction_enabled() {
+        "redacted".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
 fn process_starttime(pid: i64) -> Option<i64> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     stat.rsplit_once(") ")?
@@ -229,6 +441,283 @@ pub(crate) fn print_watch_status() -> Result<(), String> {
     Ok(())
 }
 
+/// Emit a bounded, read-only status snapshot for automated diagnostics.
+/// Unlike the human status command this never repairs stale rows and uses a
+/// short SQLite busy timeout so a locked writer cannot hang the observer.
+pub(crate) fn print_watch_status_json() -> Result<(), String> {
+    let started = std::time::Instant::now();
+    let conn = match open_index_db_readonly_with_timeout(Duration::from_millis(250)) {
+        Ok(conn) => conn,
+        Err(error) => {
+            println!(
+                "{{\"schema\":1,\"consistency\":\"best-effort\",\"available\":false,\"error_code\":\"{}\",\"error_code_numeric\":{},\"reason\":\"{}\"}}",
+                fsx::code_for_message(&error).as_str(),
+                fsx::code_for_message(&error).numeric(),
+                json_escape(&diagnostic_text(&error)),
+            );
+            return Ok(());
+        }
+    };
+    let mut stmt = conn
+        .prepare(
+            "SELECT root, backend, status, generation, last_event, last_reconcile,
+                    dirty, online, watcher_pid, owner_boot_id, owner_starttime,
+                    heartbeat, COALESCE(error, '')
+             FROM watch_state ORDER BY root LIMIT 257",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<i64>>(10)?,
+                row.get::<_, Option<i64>>(11)?,
+                row.get::<_, String>(12)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut records = Vec::new();
+    let mut truncated = false;
+    for (index, row) in rows.enumerate() {
+        if index >= 256 {
+            truncated = true;
+            break;
+        }
+        let (
+            root,
+            backend,
+            status,
+            generation,
+            last_event,
+            last_reconcile,
+            dirty,
+            online,
+            pid,
+            owner_boot_id,
+            owner_starttime,
+            heartbeat,
+            error,
+        ) = row.map_err(|e| e.to_string())?;
+        let (error_code, error_code_numeric) = optional_error_code(&error);
+        let (history, history_dropped) = watch_history_json(&conn, &root);
+        let tasks = watch_tasks_json(&conn, &root);
+        let (config, config_history) = watch_config_json(&conn, &root);
+        let cache_identity = cache_identity_json(&root, generation);
+        let oom_kills = oom_kill_count();
+        let locks = format!(
+            "[{},{}]",
+            lock_snapshot(index_state_path(&root, "lock"), "index-refresh"),
+            lock_snapshot(
+                query_socket_path().map(|socket| socket.with_file_name("fsxd.sock.lock")),
+                "query-server"
+            )
+        );
+        records.push(format!(
+            "{{\"root\":\"{}\",\"backend\":\"{}\",\"status\":\"{}\",\"generation\":{},\"last_event\":{},\"last_reconcile\":{},\"dirty\":{},\"online\":{},\"pid\":{},\"heartbeat\":{},\"owner_boot_id\":{},\"owner_starttime\":{},\"oom_kill_count\":{},\"error_code\":{},\"error_code_numeric\":{},\"error\":\"{}\",\"history_dropped\":{},\"history\":[{}],\"tasks\":[{}],\"config\":{},\"config_history\":[{}],\"cache_identity\":{},\"locks\":{}}}",
+            json_escape(&diagnostic_path(&root)),
+            json_escape(&backend),
+            json_escape(&status),
+            generation,
+            optional_json_i64(last_event),
+            optional_json_i64(last_reconcile),
+            dirty != 0,
+            online != 0,
+            optional_json_i64(pid),
+            optional_json_i64(heartbeat),
+            owner_boot_id
+                .as_deref()
+                .map(|value| format!("\"{}\"", json_escape(value)))
+                .unwrap_or_else(|| "null".to_string()),
+            optional_json_i64(owner_starttime),
+            optional_json_i64(oom_kills.map(|value| value as i64)),
+            error_code,
+            error_code_numeric,
+            json_escape(&diagnostic_text(&error)),
+            history_dropped,
+            history,
+            tasks,
+            config,
+            config_history,
+            cache_identity,
+            locks,
+        ));
+    }
+    println!(
+        "{{\"schema\":1,\"consistency\":\"best-effort\",\"available\":true,\"elapsed_ms\":{},\"truncated\":{},\"watchers\":[{}]}}",
+        started.elapsed().as_millis(),
+        truncated,
+        records.join(",")
+    );
+    Ok(())
+}
+
+fn optional_json_i64(value: Option<i64>) -> String {
+    value.map_or_else(|| "null".to_string(), |value| value.to_string())
+}
+
+fn optional_error_code(message: &str) -> (String, String) {
+    if message.is_empty() {
+        ("null".to_string(), "null".to_string())
+    } else {
+        let code = fsx::code_for_message(message);
+        (format!("\"{}\"", code.as_str()), code.numeric().to_string())
+    }
+}
+
+fn watch_history_json(conn: &Connection, root: &str) -> (String, i64) {
+    let dropped = conn
+        .query_row(
+            "SELECT dropped FROM watch_history_state WHERE root=?1",
+            [root],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0);
+    let Ok(mut statement) = conn.prepare(
+        "SELECT sequence, recorded_at, kind, error_code, detail
+         FROM watch_history WHERE root=?1 ORDER BY sequence DESC LIMIT ?2",
+    ) else {
+        return (String::new(), dropped);
+    };
+    let rows = statement
+        .query_map(params![root, WATCH_HISTORY_CAPACITY], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .ok();
+    let Some(rows) = rows else {
+        return (String::new(), dropped);
+    };
+    let mut records = rows
+        .filter_map(|row| row.ok())
+        .map(|(sequence, recorded_at, kind, error_code, detail)| {
+            format!(
+                "{{\"sequence\":{},\"recorded_at\":{},\"kind\":\"{}\",\"error_code\":{},\"detail\":\"{}\"}}",
+                sequence,
+                recorded_at,
+                json_escape(&kind),
+                error_code.map_or_else(
+                    || "null".to_string(),
+                    |value| format!("\"{}\"", json_escape(&value)),
+                ),
+                json_escape(&diagnostic_text(&detail)),
+            )
+        })
+        .collect::<Vec<_>>();
+    records.reverse();
+    (records.join(","), dropped)
+}
+
+fn watch_tasks_json(conn: &Connection, root: &str) -> String {
+    let Ok(mut statement) = conn.prepare(
+        "SELECT name, state, started_at, updated_at, error_code, COALESCE(error, '')
+         FROM watch_tasks WHERE root=?1 ORDER BY name",
+    ) else {
+        return String::new();
+    };
+    let Ok(rows) = statement.query_map([root], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, String>(5)?,
+        ))
+    }) else {
+        return String::new();
+    };
+    rows.filter_map(|row| row.ok())
+        .map(|(name, state, started_at, updated_at, error_code, error)| {
+            format!(
+                "{{\"name\":\"{}\",\"state\":\"{}\",\"started_at\":{},\"updated_at\":{},\"error_code\":{},\"error\":\"{}\"}}",
+                json_escape(&name),
+                json_escape(&state),
+                started_at,
+                updated_at,
+                error_code.map_or_else(
+                    || "null".to_string(),
+                    |value| format!("\"{}\"", json_escape(&value)),
+                ),
+                json_escape(&diagnostic_text(&error)),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn cache_identity_json(root: &str, generation: i64) -> String {
+    let database = index_db_path()
+        .map(|path| diagnostic_path(&path.to_string_lossy()))
+        .unwrap_or_default();
+    format!(
+        "{{\"schema\":1,\"generation\":{},\"root\":\"{}\",\"database\":\"{}\",\"build_sha\":\"{}\",\"profile\":\"{}\"}}",
+        generation,
+        diagnostic_path(root),
+        json_escape(&database),
+        option_env!("FSX_GIT_SHA").unwrap_or("unknown"),
+        option_env!("FSX_PROFILE").unwrap_or("unknown"),
+    )
+}
+
+fn watch_config_json(conn: &Connection, root: &str) -> (String, String) {
+    let Ok(mut statement) = conn.prepare(
+        "SELECT sequence, recorded_at, source, effective
+         FROM watch_config_history WHERE root=?1 ORDER BY sequence DESC LIMIT ?2",
+    ) else {
+        return ("null".to_string(), String::new());
+    };
+    let Ok(rows) = statement.query_map(params![root, WATCH_CONFIG_HISTORY_CAPACITY], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    }) else {
+        return ("null".to_string(), String::new());
+    };
+    let mut records = rows
+        .filter_map(|row| row.ok())
+        .map(|(sequence, recorded_at, source, effective)| {
+            format!(
+                "{{\"sequence\":{},\"recorded_at\":{},\"source\":\"{}\",\"effective\":{}}}",
+                sequence,
+                recorded_at,
+                json_escape(&source),
+                effective,
+            )
+        })
+        .collect::<Vec<_>>();
+    records.reverse();
+    let latest = records
+        .last()
+        .cloned()
+        .unwrap_or_else(|| "null".to_string());
+    (latest, records.join(","))
+}
+
+fn json_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+}
+
 fn mark_dead_watch_states(conn: &Connection) -> Result<(), String> {
     let mut stmt = conn
         .prepare(
@@ -264,8 +753,29 @@ fn mark_dead_watch_states(conn: &Connection) -> Result<(), String> {
             [&root],
         )
         .map_err(|e| e.to_string())?;
+        record_watch_event(&root, "external-exit", "watcher owner disappeared");
+        update_watch_task(
+            &root,
+            "watcher",
+            "stopped",
+            Some("watcher owner disappeared"),
+        );
     }
     Ok(())
+}
+
+fn oom_kill_count() -> Option<u64> {
+    let path = std::env::var_os("FSX_MEMORY_EVENTS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/sys/fs/cgroup/memory.events"));
+    parse_oom_kill_count(&fs::read_to_string(path).ok()?)
+}
+
+fn parse_oom_kill_count(content: &str) -> Option<u64> {
+    content.lines().find_map(|line| {
+        let (name, value) = line.split_once(' ')?;
+        (name == "oom_kill").then(|| value.parse().ok()).flatten()
+    })
 }
 
 #[cfg(test)]
@@ -303,6 +813,24 @@ mod watch_state_tests {
     }
 
     #[test]
+    fn diagnostic_path_redaction_is_stable_and_non_reversible_in_output() {
+        assert_eq!(
+            diagnostic_path_with("/home/lewis/private", false),
+            "/home/lewis/private"
+        );
+        let redacted = diagnostic_path_with("/home/lewis/private", true);
+        assert!(redacted.starts_with("path-hash:"));
+        assert!(!redacted.contains("/home/lewis/private"));
+        assert_eq!(redacted, diagnostic_path_with("/home/lewis/private", true));
+    }
+
+    #[test]
+    fn oom_counter_parser_handles_linux_memory_events() {
+        assert_eq!(parse_oom_kill_count("low 0\nome 2\noom_kill 7\n"), Some(7));
+        assert_eq!(parse_oom_kill_count("oom 0\n"), None);
+    }
+
+    #[test]
     fn fresh_heartbeat_prevents_false_dead_owner_transition() {
         let connection = state_connection(unix_now());
         mark_dead_watch_states(&connection).unwrap();
@@ -324,6 +852,43 @@ mod watch_state_tests {
             })
             .unwrap();
         assert_eq!(state, ("stopped".to_string(), 1, 0));
+    }
+
+    #[test]
+    fn status_error_codes_are_null_for_clean_watchers() {
+        assert_eq!(
+            optional_error_code(""),
+            ("null".to_string(), "null".to_string())
+        );
+        assert_eq!(
+            optional_error_code("permission denied"),
+            ("\"FSX_PERMISSION_DENIED\"".to_string(), "1001".to_string())
+        );
+    }
+
+    #[test]
+    fn history_snapshot_preserves_order_and_drop_count() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE watch_history_state (
+                    root TEXT PRIMARY KEY, next_sequence INTEGER NOT NULL, dropped INTEGER NOT NULL
+                 );
+                 CREATE TABLE watch_history (
+                    root TEXT NOT NULL, sequence INTEGER NOT NULL, recorded_at INTEGER NOT NULL,
+                    kind TEXT NOT NULL, error_code TEXT, detail TEXT NOT NULL,
+                    PRIMARY KEY(root, sequence)
+                 );
+                 INSERT INTO watch_history_state VALUES ('/tmp/root', 3, 2);
+                 INSERT INTO watch_history VALUES
+                    ('/tmp/root', 1, 10, 'state', 'FSX_INTERNAL', 'starting'),
+                    ('/tmp/root', 2, 11, 'state', 'FSX_INTERNAL', 'running');",
+            )
+            .unwrap();
+        let (history, dropped) = watch_history_json(&connection, "/tmp/root");
+        assert_eq!(dropped, 2);
+        assert!(history.starts_with("{\"sequence\":1"));
+        assert!(history.contains("{\"sequence\":2"));
     }
 }
 
@@ -818,6 +1383,42 @@ pub(crate) fn initialize_index_db() -> Result<Connection, String> {
             owner_starttime INTEGER,
             heartbeat INTEGER
         );
+        CREATE TABLE IF NOT EXISTS watch_history_state (
+            root TEXT PRIMARY KEY,
+            next_sequence INTEGER NOT NULL DEFAULT 0,
+            dropped INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS watch_history (
+            root TEXT NOT NULL,
+            sequence INTEGER NOT NULL,
+            recorded_at INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            error_code TEXT,
+            detail TEXT NOT NULL,
+            PRIMARY KEY(root, sequence)
+        );
+        CREATE INDEX IF NOT EXISTS watch_history_root_time
+            ON watch_history(root, sequence);
+        CREATE TABLE IF NOT EXISTS watch_tasks (
+            root TEXT NOT NULL,
+            name TEXT NOT NULL,
+            state TEXT NOT NULL,
+            started_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            error_code TEXT,
+            error TEXT,
+            PRIMARY KEY(root, name)
+        );
+        CREATE TABLE IF NOT EXISTS watch_config_history (
+            root TEXT NOT NULL,
+            sequence INTEGER NOT NULL,
+            recorded_at INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            effective TEXT NOT NULL,
+            PRIMARY KEY(root, sequence)
+        );
+        CREATE INDEX IF NOT EXISTS watch_config_history_root_time
+            ON watch_config_history(root, sequence);
         CREATE VIRTUAL TABLE IF NOT EXISTS strings_fts USING fts5(
             value,
             content='strings',
@@ -1048,6 +1649,10 @@ pub(crate) fn open_index_db_writer() -> Result<Connection, String> {
 }
 
 pub(crate) fn open_index_db_readonly() -> Result<Connection, String> {
+    open_index_db_readonly_with_timeout(Duration::from_secs(30))
+}
+
+fn open_index_db_readonly_with_timeout(timeout: Duration) -> Result<Connection, String> {
     let path = fsx::index::database_read_path()
         .ok_or_else(|| "Could not determine fsx cache dir".to_string())?;
     let conn = Connection::open_with_flags(
@@ -1055,8 +1660,7 @@ pub(crate) fn open_index_db_readonly() -> Result<Connection, String> {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     )
     .map_err(|e| e.to_string())?;
-    conn.busy_timeout(Duration::from_secs(30))
-        .map_err(|e| e.to_string())?;
+    conn.busy_timeout(timeout).map_err(|e| e.to_string())?;
     conn.execute_batch(
         "PRAGMA query_only = ON;
          PRAGMA temp_store = MEMORY;

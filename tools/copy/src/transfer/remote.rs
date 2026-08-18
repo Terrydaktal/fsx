@@ -2,6 +2,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use super::cleanup::cleanup_source_dirs;
+use super::journal::TransferJournal;
 use super::orchestrator::flush_destination_writes;
 use super::rsync::run_rsync_transfer;
 use crate::domain::{Endpoint, LogLevel, RemoteSpec, SrcObjKind, TransferMode};
@@ -203,6 +204,28 @@ pub(crate) fn run_remote_transfer_mode(
         ),
         LogLevel::Info,
     );
+    let mut journal =
+        match TransferJournal::begin(Path::new(&src_path), Path::new(&dst_path), requested_mode) {
+            Ok(mut journal) => {
+                if let Err(error) = journal.mark("transferring") {
+                    log(
+                        requested_mode,
+                        &format!("Cannot persist remote operation journal: {error}"),
+                        LogLevel::Error,
+                    );
+                    return 1;
+                }
+                journal
+            }
+            Err(error) => {
+                log(
+                    requested_mode,
+                    &format!("Cannot create remote operation journal: {error}"),
+                    LogLevel::Error,
+                );
+                return 1;
+            }
+        };
     let start_ts = Instant::now();
     let transfer = run_rsync_transfer(
         &src_path, &dst_path, 0, use_sudo, false, sync_mode, !sync_mode,
@@ -278,6 +301,27 @@ pub(crate) fn run_remote_transfer_mode(
         false,
     );
     print_summary_rate_line("Overall throughput", avg_total_bps, total_elapsed_s, true);
+    if result == 0 {
+        if let Err(error) = journal.mark("published") {
+            log(
+                requested_mode,
+                &format!("Remote transfer published but journal update failed: {error}"),
+                LogLevel::Error,
+            );
+            return 1;
+        }
+        if let Err(error) = journal.complete() {
+            log(
+                requested_mode,
+                &format!("Remote transfer succeeded but journal cleanup failed: {error}"),
+                LogLevel::Error,
+            );
+            return 1;
+        }
+    } else {
+        let _ = journal.mark("failed");
+        let _ = journal.record_result(result);
+    }
     result
 }
 

@@ -7,6 +7,7 @@ edition = "2021"
 [features]
 default = ["jemalloc"]
 jemalloc = ["dep:jemallocator"]
+diagnostic-hooks = []
 
 [dependencies]
 fsx = { workspace = true, features = ["terminal"] }

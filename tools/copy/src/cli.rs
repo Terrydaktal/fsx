@@ -29,7 +29,7 @@ pub(crate) struct CliArgs {
 }
 pub(crate) fn usage() {
     eprintln!(
-        "usage: copy [-h] [-m] [-s] [-o] [-c] [--create-destination-parents] [-b] [--sync] [--verify] [--replace-dest-symlink] [-v|--verbose|--showall] [-L depth] [-T trunc] [--preview] [--preview-lite] source... destination"
+        "usage: copy [-h] [--build-info] [-m] [-s] [-o] [-c] [--create-destination-parents] [-b] [--sync] [--verify] [--replace-dest-symlink] [-v|--verbose|--showall] [-L depth] [-T trunc] [--preview] [--preview-lite] source... destination"
     );
 }
 
@@ -64,6 +64,7 @@ pub(crate) fn print_help() {
     println!();
     println!("options:");
     println!("  -h, --help            show this help message and exit");
+    println!("  --build-info          print machine-readable build identity and exit");
     println!("  -m, --move            Move mode: transfer then remove source data (equivalent to move behavior).");
     println!("  -s, --sudo            Run privileged transfer commands through sudo");
     println!(
@@ -186,6 +187,13 @@ pub(crate) fn parse_args() -> Result<CliArgs, i32> {
     };
     let mut positional: Vec<OsString> = Vec::new();
     let argv: Vec<OsString> = env::args_os().skip(1).collect();
+    if argv.iter().any(|arg| arg == "--build-info") {
+        fsx::build_info::print_json(fsx::build_info::current(
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+        ));
+        return Err(0);
+    }
     let mut i = 0usize;
     let mut options_done = false;
 

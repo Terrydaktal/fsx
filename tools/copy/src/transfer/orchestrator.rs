@@ -431,8 +431,13 @@ pub(crate) fn run_multi_source_file_batch(
             eprintln!("copy: transfer succeeded but operation journal cleanup failed: {error}");
             return 1;
         }
-    } else if let Err(error) = journal.mark("failed") {
-        eprintln!("copy: cannot persist failed operation state: {error}");
+    } else {
+        if let Err(error) = journal.mark("failed") {
+            eprintln!("copy: cannot persist failed operation state: {error}");
+        }
+        if let Err(error) = journal.record_result(result) {
+            eprintln!("copy: cannot persist failed operation result: {error}");
+        }
     }
     result
 }

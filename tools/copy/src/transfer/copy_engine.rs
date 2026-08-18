@@ -23,6 +23,7 @@ use tempfile::TempPath;
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 static INSTALL_INTERRUPT_HANDLER: Once = Once::new();
 
+#[cfg(feature = "diagnostic-hooks")]
 pub(crate) fn run_test_hook(name: &str, path: &Path) {
     if std::env::var("COPY_RS_TEST_CRASH_AT").as_deref() == Ok(name) {
         // Test-only failpoint: preserve the exact on-disk state at this
@@ -38,6 +39,11 @@ pub(crate) fn run_test_hook(name: &str, path: &Path) {
     let _ = command.status();
 }
 
+#[cfg(not(feature = "diagnostic-hooks"))]
+#[inline(always)]
+pub(crate) fn run_test_hook(_name: &str, _path: &Path) {}
+
+#[cfg(feature = "diagnostic-hooks")]
 fn mark_test_transfer_started(destination: &Path) {
     let Some(marker) = std::env::var_os("COPY_RS_TEST_TRANSFER_MARKER") else {
         return;
@@ -50,6 +56,10 @@ fn mark_test_transfer_started(destination: &Path) {
         std::thread::sleep(std::time::Duration::from_millis(milliseconds));
     }
 }
+
+#[cfg(not(feature = "diagnostic-hooks"))]
+#[inline(always)]
+fn mark_test_transfer_started(_destination: &Path) {}
 
 #[cfg(unix)]
 extern "C" fn handle_interrupt(_: nix::libc::c_int) {

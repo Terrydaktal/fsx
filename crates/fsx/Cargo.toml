@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Shared filesystem facts and traversal primitives for the fsx tools"
 license = "MIT"
+build = "build.rs"
 
 [features]
 default = []

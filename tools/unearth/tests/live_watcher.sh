@@ -126,6 +126,40 @@ if [[ "$backend" != "fanotify" && "$backend" != "inotify" ]]; then
 	exit 1
 fi
 
+# The machine-readable snapshot must expose the bounded semantic history and
+# task/lock diagnostics without requiring the observer to join the watcher.
+status_json="$($CLIENT_BIN --watch-status-json 2>/dev/null)"
+printf '%s\n' "$status_json" | python3 -c '
+import json
+import sys
+
+payload = json.load(sys.stdin)
+watchers = [item for item in payload.get("watchers", []) if item.get("root") == sys.argv[1]]
+assert len(watchers) == 1, payload
+watcher = watchers[0]
+assert watcher["error_code"] is None, watcher
+assert isinstance(watcher["history"], list), watcher
+assert isinstance(watcher["history_dropped"], int), watcher
+assert isinstance(watcher["tasks"], list), watcher
+assert isinstance(watcher["locks"], list), watcher
+assert isinstance(watcher["config"], dict), watcher
+assert isinstance(watcher["config_history"], list), watcher
+assert isinstance(watcher["cache_identity"], dict), watcher
+assert "owner_boot_id" in watcher and "owner_starttime" in watcher, watcher
+assert "oom_kill_count" in watcher, watcher
+' "$TEST_ROOT"
+
+redacted_json="$(FSX_DIAGNOSTICS_REDACT=1 "$CLIENT_BIN" --watch-status-json 2>/dev/null)"
+printf '%s\n' "$redacted_json" | python3 -c '
+import json
+import sys
+
+payload = json.load(sys.stdin)
+watchers = payload.get("watchers", [])
+assert watchers and watchers[0]["root"].startswith("path-hash:"), payload
+assert sys.argv[1] not in json.dumps(payload), payload
+' "$TEST_ROOT"
+
 query() {
 	"$CLIENT_BIN" --index --file --color=never "$1" "$TEST_ROOT" 2>/dev/null || true
 }
@@ -212,7 +246,28 @@ if ((FLOOD_COUNT > 0)); then
 	fi
 fi
 
-if [[ ! -s "$METRICS_FILE" ]] || ! grep -Fq $'timestamp_ms\telapsed_ms\tpid' "$METRICS_FILE"; then
+# Restart with a changed CLI option and confirm the effective configuration
+# history records both ownership transitions and their provenance.
+kill -CONT "$DAEMON_PID" 2>/dev/null || true
+kill -TERM "$DAEMON_PID" 2>/dev/null || true
+wait "$DAEMON_PID" 2>/dev/null || true
+DAEMON_PID=""
+"$DAEMON_BIN" --threads 2 "$TEST_ROOT" >"$LOG_FILE" 2>&1 &
+DAEMON_PID=$!
+for _ in $(seq 1 "$POLL_ATTEMPTS"); do
+	if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+		cat "$LOG_FILE" >&2
+		exit 1
+	fi
+	status_json="$($CLIENT_BIN --watch-status-json 2>/dev/null || true)"
+	if printf '%s\n' "$status_json" | python3 -c 'import json, sys; p=json.load(sys.stdin); w=p.get("watchers", []); assert w and w[0]["status"] == "running"; assert len(w[0]["config_history"]) >= 2; assert w[0]["config_history"][-1]["effective"]["threads"] == 2' 2>/dev/null; then
+		break
+	fi
+	sleep 0.05
+done
+
+if [[ ! -s "$METRICS_FILE" ]] || ! grep -Fq $'timestamp_ms\telapsed_ms\tpid' "$METRICS_FILE" ||
+	! grep -Fq $'queue_high_water\tbatch_high_water\tcache_high_water' "$METRICS_FILE"; then
 	echo "live watcher metrics file was not written" >&2
 	cat "$LOG_FILE" >&2
 	exit 1

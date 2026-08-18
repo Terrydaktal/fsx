@@ -11,6 +11,7 @@ pub(crate) struct TransferJournal {
     path: PathBuf,
     file: File,
     completed: bool,
+    sequence: u64,
 }
 
 impl TransferJournal {
@@ -33,16 +34,21 @@ impl TransferJournal {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let path = directory.join(format!(
-            "operation-{}-{timestamp}.journal",
-            std::process::id()
-        ));
+        let operation_id = format!("{}-{timestamp}", std::process::id());
+        let path = directory.join(format!("operation-{operation_id}.journal"));
         let mut file = OpenOptions::new()
             .create_new(true)
             .append(true)
             .mode(0o600)
             .open(&path)?;
-        writeln!(file, "version=1")?;
+        writeln!(file, "version=2")?;
+        writeln!(file, "operation_id={operation_id}")?;
+        writeln!(
+            file,
+            "build_git_sha={}",
+            fsx::build_info::current(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")).git_sha
+        )?;
+        writeln!(file, "started_unix_ms={}", timestamp / 1_000_000)?;
         writeln!(file, "mode={}", mode.word())?;
         for source in sources {
             writeln!(file, "source={}", fsx::encode_lossless_path(source))?;
@@ -59,14 +65,30 @@ impl TransferJournal {
             path,
             file,
             completed: false,
+            sequence: 0,
         })
     }
 
     pub(crate) fn mark(&mut self, state: &str) -> io::Result<()> {
+        self.sequence = self.sequence.saturating_add(1);
         writeln!(self.file, "state={state}")?;
+        writeln!(self.file, "transition_sequence={}", self.sequence)?;
+        writeln!(
+            self.file,
+            "transition_unix_ms={}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        )?;
         self.file.sync_all()?;
         crash_test_boundary(state);
         Ok(())
+    }
+
+    pub(crate) fn record_result(&mut self, result: i32) -> io::Result<()> {
+        writeln!(self.file, "result={result}")?;
+        self.file.sync_all()
     }
 
     pub(crate) fn complete(mut self) -> io::Result<()> {
@@ -82,6 +104,7 @@ impl TransferJournal {
     }
 }
 
+#[cfg(feature = "diagnostic-hooks")]
 fn crash_test_boundary(boundary: &str) {
     if std::env::var("COPY_RS_TEST_CRASH_AT").as_deref() == Ok(boundary) {
         // Test-only failpoint: `_exit` deliberately skips destructors so the
@@ -89,6 +112,10 @@ fn crash_test_boundary(boundary: &str) {
         unsafe { nix::libc::_exit(86) }
     }
 }
+
+#[cfg(not(feature = "diagnostic-hooks"))]
+#[inline(always)]
+fn crash_test_boundary(_boundary: &str) {}
 
 impl Drop for TransferJournal {
     fn drop(&mut self) {
@@ -125,11 +152,32 @@ fn report_stale_journals(directory: &Path) {
                 .find_map(|line| line.strip_prefix("state="))
                 .map(str::to_owned)
         });
-        if matches!(state.as_deref(), Some("transferring" | "published")) {
+        if matches!(
+            state.as_deref(),
+            Some("transferring" | "published" | "failed" | "aborted:source-read-preflight-failed")
+        ) {
             eprintln!(
                 "copy: incomplete operation journal retained at {}",
                 entry.path().display()
             );
         }
+    }
+
+    let mut journals = fs::read_dir(directory)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "journal"))
+        .filter_map(|entry| {
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some((modified, entry.path()))
+        })
+        .collect::<Vec<_>>();
+    journals.sort_by_key(|(modified, _)| *modified);
+    const MAX_RETAINED_JOURNALS: usize = 128;
+    let excess = journals.len().saturating_sub(MAX_RETAINED_JOURNALS);
+    for (_, path) in journals.into_iter().take(excess) {
+        let _ = fs::remove_file(path);
     }
 }

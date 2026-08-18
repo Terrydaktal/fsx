@@ -4,6 +4,7 @@
 //! own CLI policy, sorting, presentation layout, search behavior, and transfer
 //! decisions.
 
+pub mod build_info;
 #[cfg(feature = "colors")]
 pub mod colors;
 #[cfg(feature = "scan")]
@@ -30,7 +31,7 @@ pub mod terminal;
 
 #[cfg(feature = "scan")]
 pub use entry::EntrySnapshot;
-pub use error::{Error, Result};
+pub use error::{Error, ErrorCode, Result, code_for_message};
 pub use format::{
     format_count, format_size_compact, format_size_compact_3, format_size_iec, format_time_display,
 };

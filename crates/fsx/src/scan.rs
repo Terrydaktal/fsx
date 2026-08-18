@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+type ScanPoolCache = Mutex<Option<(usize, Arc<rayon::ThreadPool>)>>;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SizeMode {
     None,
@@ -344,7 +346,7 @@ fn scan_parallelism(request: &ScanRequest) -> jwalk::Parallelism {
         // order so aliases and cycles have one deterministic representative.
         jwalk::Parallelism::Serial
     } else {
-        static POOL: OnceLock<Mutex<Option<(usize, Arc<rayon::ThreadPool>)>>> = OnceLock::new();
+        static POOL: OnceLock<ScanPoolCache> = OnceLock::new();
         let cache = POOL.get_or_init(|| Mutex::new(None));
         let Ok(mut cached) = cache.lock() else {
             return jwalk::Parallelism::RayonNewPool(request.threads);

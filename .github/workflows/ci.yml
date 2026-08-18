@@ -18,8 +18,10 @@ jobs:
       - uses: taiki-e/install-action@cargo-llvm-cov
       - name: Check formatting
         run: cargo fmt --all -- --check
+      - name: Validate debuggability contract
+        run: python3 tools/build/validate-contract.py debuggability.toml
       - name: Test workspace
-        run: cargo test --workspace --all-targets --all-features
+        run: cargo test --locked --workspace --all-targets --all-features
       - name: Measure line and branch coverage
         run: bash tools/copy/tests/coverage.sh
       - name: Clippy (strict workspace)
@@ -28,7 +30,7 @@ jobs:
         # oversized Tree/Twig modules are decomposed; they do not hide new
         # lint classes or the shared fsx policy boundary.
         run: >-
-          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
           -A clippy::collapsible-if
           -A clippy::default-constructed-unit-structs
           -A clippy::write-literal
@@ -44,11 +46,36 @@ jobs:
           -A clippy::question-mark
           -A clippy::unnecessary-cast
       - name: Release build
-        run: cargo build --workspace --all-targets --all-features --release
+        # Deployable artifacts must use the production feature set.  The
+        # diagnostic Copy hooks are opt-in and are built separately below.
+        run: cargo build --locked --workspace --all-targets --release
+      - name: Verify build identity surface
+        run: |
+          for binary in tree twig unearth fsxd copy-rs; do
+            target/release/$binary --build-info | python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["git_sha"] and value["target"] and value["profile"]'
+          done
+      - name: Build diagnostic Copy binary for fault tests
+        run: cargo build --locked --profile diagnostic -p copy-rs --features diagnostic-hooks
+      - name: Check diagnostic overhead isolation
+        run: python3 tools/build/diagnostic-overhead.py
       - name: Copy integration tests
-        run: python3 -m unittest discover -s tools/copy/tests -v
+        run: >-
+          COPY_RS_COPY_BIN="$PWD/target/diagnostic/copy-rs"
+          python3 -m unittest discover -s tools/copy/tests -v
       - name: Copy privileged fault harness (syntax and safety gate)
         run: bash tools/copy/tests/test_copy_linux_faults.sh
+      - name: Build symbolized release artifacts
+        run: bash tools/build/release-artifacts.sh
+      - name: Verify clean-machine symbolization
+        run: bash tools/build/verify-symbolization.sh "$(find target/fsx-artifacts -mindepth 1 -maxdepth 1 -type d -print -quit)"
+      - name: Verify source retrieval
+        run: bash tools/build/verify-source-retrieval.sh "$(find target/fsx-artifacts -mindepth 1 -maxdepth 1 -type d -print -quit)"
+      - name: Upload symbolized release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: fsx-release-artifacts
+          path: target/fsx-artifacts/
+          if-no-files-found: error
       - name: Output contract integration tests
         run: python3 -m unittest discover -s tests/output_contract -v
       - name: Unearth integration tests
@@ -68,7 +95,9 @@ jobs:
       - name: Check shell scripts
         run: >-
           shellcheck tools/copy/copy tools/copy/tests/test_copy_linux_faults.sh
-          tools/copy/tests/coverage.sh
+          tools/copy/tests/coverage.sh tools/build/release-artifacts.sh
+          tools/build/capture-fsxd.sh tools/build/verify-symbolization.sh
+          tools/build/retrieve-source.sh tools/build/verify-source-retrieval.sh
           tools/unearth/tests/help_matrix.sh tools/unearth/tests/live_watcher.sh
           tools/unearth/tests/live_no_index.sh
 

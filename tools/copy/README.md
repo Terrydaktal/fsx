@@ -35,6 +35,12 @@ copy/
 ./copy [OPTIONS] [--preview] [--preview-lite] SOURCE DESTINATION
 ```
 
+All binaries expose a machine-readable identity for incident reports:
+
+```bash
+./copy-rs --build-info
+```
+
 - Default mode: copy
 - Move mode: `-m`, `--move`
 
@@ -83,7 +89,7 @@ copy/
   filenames are preserved. Remote endpoint syntax remains UTF-8 text by definition.
 - Rust regular-file and symlink replacements are staged and published atomically; interrupted copies leave only disposable `.copy-rs-partial-*` files.
 - Final regular-file creation and atomic publication use descriptor-relative, no-follow parent opens on Linux. A symlinked ancestor is rejected rather than allowing a path race to redirect the transfer; an existing final destination symlink keeps the documented follow-or-replace policy.
-- Every local operation, including multi-source batches, has a durable journal under `$XDG_STATE_HOME/copy-rs` (or `$HOME/.local/state/copy-rs`). Journal records are mode 0600 and fsynced through `planned`, `transferring`, `published`, `failed`, and `complete` states. Only journals that stop during an active transfer or publication are reported as interrupted; validated failures are retained for diagnostics without creating a false crash warning. A crash leaves the journal for inspection and the next operation reports it; staging and the idempotent planner make retrying safe without silently resuming an unknown partial transfer.
+- Every local and remote operation, including multi-source batches, has a durable journal under `$XDG_STATE_HOME/copy-rs` (or `$HOME/.local/state/copy-rs`). Journal records are mode 0600 and fsynced through `planned`, `transferring`, `published`, `failed`, and `complete` states, with an operation ID, build commit, transition sequence and timestamps. Retention is bounded to the newest 128 journal files. Only journals that stop during an active transfer or publication are reported as interrupted; validated failures are retained for diagnostics without creating a false crash warning. A crash leaves the journal for inspection and the next operation reports it; staging and the idempotent planner make retrying safe without silently resuming an unknown partial transfer.
 - The Rust backend handles `SIGINT` and `SIGTERM` at copy-buffer checkpoints, returns a non-zero interrupted status, and skips move cleanup when the transfer was interrupted. Rsync-backed modes also terminate and reap their child process when the wrapper receives either signal.
 - Rsync uses `--partial` and `--protect-args`, but exit status 24 is treated as an incomplete transfer and never committed as a move.
 - Incomplete source or destination scans fail closed before sync deletion or move cleanup.

@@ -22,6 +22,10 @@ static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 #[derive(Parser, Debug)]
 #[command(author, version, about = "A modern tree clone in Rust using jwalk")]
 struct Args {
+    /// Print machine-readable build identity and exit
+    #[arg(long)]
+    build_info: bool,
+
     /// Directory to list
     #[arg(value_name = "PATH")]
     path: Option<PathBuf>,
@@ -695,6 +699,13 @@ fn parse_args_with_depth_shorthand() -> Args {
 
 fn main() {
     let mut args = parse_args_with_depth_shorthand();
+    if args.build_info {
+        fsx::build_info::print_json(fsx::build_info::current(
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+        ));
+        return;
+    }
     let reverse_requested = args.reverse;
     // Reverse is applied after rendering so it reuses the same scan and does
     // not execute a second process with a different metadata snapshot.

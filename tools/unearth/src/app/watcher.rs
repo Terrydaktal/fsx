@@ -59,6 +59,9 @@ struct MetricsCounters {
     subtree_scan_nanos: AtomicU64,
     db_transactions: AtomicU64,
     db_nanos: AtomicU64,
+    queue_high_water: AtomicU64,
+    batch_high_water: AtomicU64,
+    cache_high_water: AtomicU64,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -77,6 +80,9 @@ struct MetricsSnapshot {
     subtree_scan_nanos: u64,
     db_transactions: u64,
     db_nanos: u64,
+    queue_high_water: u64,
+    batch_high_water: u64,
+    cache_high_water: u64,
 }
 
 impl MetricsCounters {
@@ -96,6 +102,9 @@ impl MetricsCounters {
             subtree_scan_nanos: self.subtree_scan_nanos.load(Ordering::Relaxed),
             db_transactions: self.db_transactions.load(Ordering::Relaxed),
             db_nanos: self.db_nanos.load(Ordering::Relaxed),
+            queue_high_water: self.queue_high_water.load(Ordering::Relaxed),
+            batch_high_water: self.batch_high_water.load(Ordering::Relaxed),
+            cache_high_water: self.cache_high_water.load(Ordering::Relaxed),
         }
     }
 }
@@ -211,6 +220,10 @@ impl<V> ClockCache<V> {
         self.entries.retain(|key, _| keep(key));
         self.clock.retain(|key| self.entries.contains_key(key));
     }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -275,7 +288,12 @@ struct MetricsLogger {
 }
 
 impl MetricsLogger {
-    fn start(path: &Path, counters: Arc<MetricsCounters>) -> Result<Self, String> {
+    fn start(
+        path: &Path,
+        counters: Arc<MetricsCounters>,
+        ttl: Duration,
+        max_bytes: u64,
+    ) -> Result<Self, String> {
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -293,12 +311,20 @@ impl MetricsLogger {
         let mut writer = BufWriter::new(file);
         writeln!(
             writer,
-            "timestamp_ms\telapsed_ms\tpid\trss_bytes\tvm_bytes\tthreads\tcpu_user_ms\tcpu_system_ms\tcpu_total_ms\tcpu_percent\traw_events\tcoalesced_events\tbatches\tupserts\tremoves\tmoves\treconciles\toverflows\trefreshes\trefresh_ms\tsubtree_scans\tsubtree_scan_ms\tdb_transactions\tdb_ms"
+            "timestamp_ms\telapsed_ms\tpid\trss_bytes\tvm_bytes\tthreads\tcpu_user_ms\tcpu_system_ms\tcpu_total_ms\tcpu_percent\traw_events\tcoalesced_events\tbatches\tupserts\tremoves\tmoves\treconciles\toverflows\trefreshes\trefresh_ms\tsubtree_scans\tsubtree_scan_ms\tdb_transactions\tdb_ms\tqueue_high_water\tbatch_high_water\tcache_high_water"
         )
         .map_err(|error| format!("cannot write metrics report header: {error}"))?;
         writer
             .flush()
             .map_err(|error| format!("cannot flush metrics report header: {error}"))?;
+        let header_bytes = writer
+            .get_ref()
+            .metadata()
+            .map_err(|error| format!("cannot inspect metrics report size: {error}"))?
+            .len();
+        if max_bytes == 0 || header_bytes > max_bytes {
+            return Err("metrics report byte limit is smaller than its header".to_string());
+        }
 
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
@@ -328,6 +354,9 @@ impl MetricsLogger {
 
                 while !thread_stop.load(Ordering::Relaxed) {
                     thread::sleep(Duration::from_secs(1));
+                    if started.elapsed() >= ttl {
+                        break;
+                    }
                     let now = Instant::now();
                     let sample = read_process_sample();
                     if let Err(error) = write_metrics_row(
@@ -343,6 +372,14 @@ impl MetricsLogger {
                         break;
                     }
                     let _ = writer.flush();
+                    if writer
+                        .get_ref()
+                        .metadata()
+                        .map(|metadata| metadata.len() >= max_bytes)
+                        .unwrap_or(true)
+                    {
+                        break;
+                    }
                     previous = Some((now, sample));
                     last_written = now;
                 }
@@ -414,7 +451,7 @@ fn write_metrics_row(
     let metrics = counters.snapshot();
     writeln!(
         writer,
-        "{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{:.3}\t{}\t{:.3}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{:.3}\t{}\t{:.3}\t{}\t{}\t{}",
         timestamp_ms,
         elapsed.as_millis(),
         pid,
@@ -439,6 +476,9 @@ fn write_metrics_row(
         metrics.subtree_scan_nanos as f64 / 1_000_000.0,
         metrics.db_transactions,
         metrics.db_nanos as f64 / 1_000_000.0,
+        metrics.queue_high_water,
+        metrics.batch_high_water,
+        metrics.cache_high_water,
     )
 }
 
@@ -455,6 +495,19 @@ fn metric_add(counter: Option<&AtomicU64>, amount: u64) {
 fn metric_elapsed(counter: Option<&AtomicU64>, started: Instant) {
     if let Some(counter) = counter {
         add_elapsed(counter, started);
+    }
+}
+
+fn metric_max(counter: Option<&AtomicU64>, value: u64) {
+    let Some(counter) = counter else {
+        return;
+    };
+    let mut current = counter.load(Ordering::Relaxed);
+    while value > current {
+        match counter.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
     }
 }
 
@@ -595,6 +648,10 @@ impl EventSender {
 }
 
 impl EventReceiver {
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+
     fn mark_dequeued(&self, event: &FsEvent) {
         if event.action == Action::Upsert && event.event_kind == EVENT_MODIFY {
             self.pending_modifies
@@ -813,7 +870,12 @@ fn claim_watch_states(roots: &[RootState]) -> Result<(), String> {
         )
         .map_err(|e| e.to_string())?;
     }
-    tx.commit().map_err(|e| e.to_string())
+    tx.commit().map_err(|e| e.to_string())?;
+    for root in roots {
+        record_watch_event(&root.key, "claim", "watcher claimed root");
+        update_watch_task(&root.key, "watcher", "starting", None);
+    }
+    Ok(())
 }
 
 fn heartbeat_states(
@@ -852,6 +914,11 @@ fn shutdown_states(roots: &[RootState]) {
                  WHERE root=?1 AND owner_boot_id=?2 AND owner_starttime=?3",
                 params![root.key, owner.boot_id, owner.starttime],
             );
+            record_watch_event(&root.key, "shutdown", "watcher stopped");
+            update_watch_task(&root.key, "watcher", "stopped", None);
+            update_watch_task(&root.key, "database", "stopped", None);
+            update_watch_task(&root.key, "query-server", "stopped", None);
+            update_watch_task(&root.key, "metrics", "stopped", None);
         }
     }
 }
@@ -1039,27 +1106,50 @@ pub(crate) fn run(opts: &Options) -> Result<(), String> {
     }
 
     claim_watch_states(&roots)?;
+    for root in &roots {
+        record_watch_config(&root.key, opts);
+    }
     let _watch_state_guard = WatchStateGuard {
         roots: roots.clone(),
     };
     let _query_server = start_query_server()?;
+    for root in &roots {
+        update_watch_task(&root.key, "query-server", "running", None);
+        update_watch_task(&root.key, "database", "starting", None);
+    }
     let mut metrics_counters = None;
-    let _metrics_logger = if let Some(path) = opts
-        .watch_metrics_os
-        .as_deref()
-        .map(Path::new)
-        .or_else(|| opts.watch_metrics.as_deref().map(Path::new))
-    {
-        let counters = Arc::new(MetricsCounters::default());
-        let logger = match MetricsLogger::start(path, Arc::clone(&counters)) {
-            Ok(logger) => logger,
-            Err(error) => {
-                return Err(error);
+    let diagnostics_disabled = std::env::var("FSX_DIAGNOSTICS")
+        .map(|value| matches!(value.as_str(), "0" | "off" | "false"))
+        .unwrap_or(false);
+    let _metrics_logger = if !diagnostics_disabled {
+        if let Some(path) = opts
+            .watch_metrics_os
+            .as_deref()
+            .map(Path::new)
+            .or_else(|| opts.watch_metrics.as_deref().map(Path::new))
+        {
+            let counters = Arc::new(MetricsCounters::default());
+            let logger = match MetricsLogger::start(
+                path,
+                Arc::clone(&counters),
+                Duration::from_secs(opts.watch_metrics_ttl.max(1)),
+                opts.watch_metrics_max_bytes,
+            ) {
+                Ok(logger) => logger,
+                Err(error) => {
+                    return Err(error);
+                }
+            };
+            metrics_counters = Some(counters);
+            for root in &roots {
+                update_watch_task(&root.key, "metrics", "running", None);
             }
-        };
-        metrics_counters = Some(counters);
-        Some(logger)
+            Some(logger)
+        } else {
+            None
+        }
     } else {
+        eprintln!("unearth: optional diagnostics disabled by FSX_DIAGNOSTICS");
         None
     };
     let (events, backend, backend_error, mut initial_scans) = match start_backend(&roots, opts) {
@@ -1076,6 +1166,9 @@ pub(crate) fn run(opts: &Options) -> Result<(), String> {
     }
     update_states(&roots, &backend, "starting", false, true, None, false)?;
     let mut event_conn = open_index_db_writer()?;
+    for root in &roots {
+        update_watch_task(&root.key, "database", "running", None);
+    }
     let owner = current_owner();
     let mut db_caches = DbCaches::default();
 
@@ -1130,6 +1223,18 @@ pub(crate) fn run(opts: &Options) -> Result<(), String> {
                 | Err(crossbeam_channel::TryRecvError::Disconnected) => break,
             }
         }
+        metric_max(
+            metrics_counters
+                .as_deref()
+                .map(|metrics| &metrics.queue_high_water),
+            events.len() as u64,
+        );
+        metric_max(
+            metrics_counters
+                .as_deref()
+                .map(|metrics| &metrics.batch_high_water),
+            startup_events.len() as u64,
+        );
         if let Err(error) = process_batch_reliably(
             &roots,
             &backend,
@@ -1232,6 +1337,18 @@ pub(crate) fn run(opts: &Options) -> Result<(), String> {
                 | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             }
         }
+        metric_max(
+            metrics_counters
+                .as_deref()
+                .map(|metrics| &metrics.queue_high_water),
+            events.len() as u64,
+        );
+        metric_max(
+            metrics_counters
+                .as_deref()
+                .map(|metrics| &metrics.batch_high_water),
+            batch.len() as u64,
+        );
         if let Err(error) = process_batch_reliably(
             &roots,
             &backend,
@@ -1277,6 +1394,15 @@ fn process_batch_reliably(
         })
         .cloned()
         .collect::<Vec<_>>();
+    if global_overflow {
+        for root in &affected_roots {
+            record_watch_event(
+                &root.key,
+                "overflow",
+                "watch queue overflow; reconciliation required",
+            );
+        }
+    }
     match process_batch(roots, backend, opts, batch, conn, db_caches, metrics) {
         Ok(()) => Ok(()),
         Err(batch_error) => {
@@ -1293,11 +1419,13 @@ fn process_batch_reliably(
                 db_caches.clear();
                 match result {
                     Ok(()) => {
+                        record_watch_event(&root.key, "recovery", "full reconciliation completed");
                         if let Err(error) = mark_reconciled(&root.key, backend) {
                             recovery_errors.push(format!("{}: {error}", root.key));
                         }
                     }
                     Err(error) => {
+                        record_watch_event(&root.key, "recovery-error", &error);
                         let _ = update_state_error(&root.key, backend, &error);
                         recovery_errors.push(format!("{}: {error}", root.key));
                     }
@@ -1388,7 +1516,13 @@ fn update_states(
         )
         .map_err(|e| e.to_string())?;
     }
-    tx.commit().map_err(|e| e.to_string())
+    tx.commit().map_err(|e| e.to_string())?;
+    for root in roots {
+        let detail = error.unwrap_or(status);
+        record_watch_event(&root.key, "state", detail);
+        update_watch_task(&root.key, "watcher", status, error);
+    }
+    Ok(())
 }
 
 fn update_state_error(root: &str, backend: &str, error: &str) -> Result<(), String> {
@@ -1413,6 +1547,8 @@ fn update_state_error(root: &str, backend: &str, error: &str) -> Result<(), Stri
         ],
     )
     .map_err(|e| e.to_string())?;
+    record_watch_event(root, "error", error);
+    update_watch_task(root, "watcher", "error", Some(error));
     Ok(())
 }
 
@@ -1448,6 +1584,8 @@ fn mark_reconciled_status(root: &str, backend: &str, status: &str) -> Result<(),
         ],
     )
     .map_err(|e| e.to_string())?;
+    record_watch_event(root, "reconcile", "root reconciled");
+    update_watch_task(root, "watcher", status, None);
     Ok(())
 }
 
@@ -1460,6 +1598,10 @@ fn process_batch(
     db_caches: &mut DbCaches,
     metrics: Option<&MetricsCounters>,
 ) -> Result<(), String> {
+    metric_max(
+        metrics.map(|metrics| &metrics.batch_high_water),
+        batch.len() as u64,
+    );
     metric_add(
         metrics.map(|metrics| &metrics.raw_events),
         batch.len() as u64,
@@ -1777,6 +1919,10 @@ fn process_batch(
             mark_reconciled(&root, backend)?;
         }
     }
+    metric_max(
+        metrics.map(|metrics| &metrics.cache_high_water),
+        db_caches.dirs.len() as u64 + db_caches.names.len() as u64 + db_caches.actors.len() as u64,
+    );
     if !failed_roots.is_empty() {
         return Err(format!(
             "watch recovery failed for {}",
@@ -2529,7 +2675,16 @@ fn start_inotify(
     let (tx, rx) = event_queue(WATCH_CHANNEL_CAPACITY);
     thread::Builder::new()
         .name("unearth-inotify".to_string())
-        .spawn(move || watcher.run(tx))
+        .spawn(move || {
+            if let Err(payload) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| watcher.run(tx)))
+            {
+                eprintln!(
+                    "unearth: inotify backend panicked: {}",
+                    panic_text(&payload)
+                );
+            }
+        })
         .map_err(|e| e.to_string())?;
     Ok((rx, scans))
 }
@@ -3371,9 +3526,26 @@ fn start_fanotify(roots: &[RootState]) -> Result<(EventReceiver, String), String
     };
     thread::Builder::new()
         .name("unearth-fanotify".to_string())
-        .spawn(move || watcher.run(tx))
+        .spawn(move || {
+            if let Err(payload) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| watcher.run(tx)))
+            {
+                eprintln!(
+                    "unearth: fanotify backend panicked: {}",
+                    panic_text(&payload)
+                );
+            }
+        })
         .map_err(|e| e.to_string())?;
     Ok((rx, "fanotify".to_string()))
+}
+
+fn panic_text(payload: &Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_owned())
 }
 
 #[cfg(target_os = "linux")]
@@ -4397,6 +4569,15 @@ mod tests {
             periodic_reconcile_interval_from(Some("3600")),
             Some(Duration::from_secs(3600))
         );
+    }
+
+    #[test]
+    fn high_water_metric_only_moves_forward() {
+        let value = AtomicU64::new(3);
+        metric_max(Some(&value), 2);
+        assert_eq!(value.load(Ordering::Relaxed), 3);
+        metric_max(Some(&value), 9);
+        assert_eq!(value.load(Ordering::Relaxed), 9);
     }
 
     #[cfg(target_os = "linux")]

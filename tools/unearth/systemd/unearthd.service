@@ -1,9 +1,18 @@
 [Unit]
 Description=Compatibility alias for the fsx live filesystem index daemon
 After=local-fs.target
+StartLimitIntervalSec=60s
+StartLimitBurst=5
 
 [Service]
 ExecStart=%h/.local/bin/fsxd %h
+Environment=RUST_BACKTRACE=1
+LimitCORE=infinity
+MemoryAccounting=yes
+OOMPolicy=stop
+SyslogIdentifier=fsxd
+KillSignal=SIGINT
+TimeoutStopSec=20s
 Restart=on-failure
 RestartSec=2s
 

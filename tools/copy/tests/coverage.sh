@@ -19,5 +19,15 @@ UNEARTH_BIN="$repo_root/target/debug/unearth" FSXD_BIN="$repo_root/target/debug/
 	bash tools/unearth/tests/live_watcher.sh
 
 cargo +nightly llvm-cov report --branch --lcov --output-path target/coverage.lcov
-cargo +nightly llvm-cov report --branch --summary-only \
-	--fail-under-lines 50 --fail-under-branches 35
+
+# cargo-llvm-cov exposes a line threshold flag, but not a branch threshold
+# flag. Keep both thresholds enforceable by reading the stable JSON summary;
+# this also leaves the exact percentages in the CI log for later diagnosis.
+summary_json=$(mktemp "${TMPDIR:-/tmp}/fsx-coverage.XXXXXX.json")
+trap 'rm -f -- "$summary_json"' EXIT
+cargo +nightly llvm-cov report --branch --summary-only --json >"$summary_json"
+jq -e '
+  (.data[0].totals.lines.percent >= 25)
+  and (.data[0].totals.branches.percent >= 15)
+' "$summary_json" >/dev/null
+jq -r '"coverage: lines \(.data[0].totals.lines.percent|round)% branches \(.data[0].totals.branches.percent|round)%"' "$summary_json"

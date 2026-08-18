@@ -1,0 +1,5 @@
+{
+  "schema": 1,
+  "max_release_vs_diagnostic_percent": 100.0,
+  "method": "five median --preview runs over a 32-file fixture; diagnostic hooks are compile-time enabled only in the diagnostic profile"
+}

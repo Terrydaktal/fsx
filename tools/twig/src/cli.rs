@@ -47,6 +47,10 @@ pub(crate) enum DetailColumn {
     long_about = None
 )]
 pub(crate) struct Cli {
+    /// Print machine-readable build identity and exit
+    #[arg(long)]
+    pub(crate) build_info: bool,
+
     /// List all files, including hidden ones
     #[arg(short, long)]
     pub(crate) all: bool,
