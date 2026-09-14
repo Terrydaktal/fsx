@@ -1076,11 +1076,57 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
 
     run_test_hook("after-preview-before-preflight", &src_mnt);
 
-    // Every operation must be able to read planned regular files before the
-    // user approves it. A move may use rename for non-colliding entries, but
-    // merged/colliding entries still copy bytes and can otherwise fail after
-    // the rename fast path has already mutated the destination.
-    if !use_sudo && has_planned_changes {
+    // Allow fast rename for contents-only moves when destination is a brand-new
+    // directory path. In this case, moving source children into a new target dir
+    // is equivalent to a single rename(src_dir -> dst_dir).
+    let contents_only_dirnew_fastpath = effective_contents_mode_requested
+        && src_obj_kind == SrcObjKind::Dir
+        && dst_obj_kind == DstObjKind::DirNew;
+
+    let maybe_fast_rename_target = if is_move
+        && !use_sudo
+        && !backup_requested
+        && !overwrite_requires_action
+        && !move_cleanup_only
+        && !effective_source_contents_mode
+        && (!effective_contents_mode_requested || contents_only_dirnew_fastpath)
+        && !merge_child_into_parent
+        && !overwrite_parent_from_child
+        && !overwrite_rename_dir_target
+        && !overwrite_replace_file_target
+    {
+        match src_obj_kind {
+            SrcObjKind::File => {
+                if matches!(dst_obj_kind, DstObjKind::Dir | DstObjKind::DirExisting) {
+                    src_mnt.file_name().map(|n| dst_mnt.join(n))
+                } else {
+                    Some(dst_mnt.clone())
+                }
+            }
+            SrcObjKind::Dir => match dst_obj_kind {
+                DstObjKind::Dir | DstObjKind::DirExisting => {
+                    src_mnt.file_name().map(|n| dst_mnt.join(n))
+                }
+                DstObjKind::DirNew => Some(dst_mnt.clone()),
+                _ => None,
+            },
+        }
+    } else {
+        None
+    };
+
+    let fast_rename_possible = maybe_fast_rename_target
+        .as_ref()
+        .map(|rename_target| {
+            can_fast_rename_same_fs(&src_mnt, rename_target)
+                && !rename_target.exists()
+                && *rename_target != src_mnt
+        })
+        .unwrap_or(false);
+
+    // Whole-tree renames need directory permissions, not readable file contents.
+    // Merges still preflight all reads before moving any individual children.
+    if !use_sudo && has_planned_changes && !fast_rename_possible {
         let planned_sources =
             planned_regular_source_paths(&src_mnt, src_obj_kind, transfer_manifest.as_ref());
         let failures = preflight_source_file_reads(&planned_sources);
@@ -1166,54 +1212,6 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
 
     run_test_hook("after-preflight-before-execution", &src_mnt);
 
-    // Allow fast rename for contents-only moves when destination is a brand-new
-    // directory path. In this case, moving source children into a new target dir
-    // is equivalent to a single rename(src_dir -> dst_dir).
-    let contents_only_dirnew_fastpath = effective_contents_mode_requested
-        && src_obj_kind == SrcObjKind::Dir
-        && dst_obj_kind == DstObjKind::DirNew;
-
-    let maybe_fast_rename_target = if is_move
-        && !use_sudo
-        && !backup_requested
-        && !overwrite_requires_action
-        && !move_cleanup_only
-        && !effective_source_contents_mode
-        && (!effective_contents_mode_requested || contents_only_dirnew_fastpath)
-        && !merge_child_into_parent
-        && !overwrite_parent_from_child
-        && !overwrite_rename_dir_target
-        && !overwrite_replace_file_target
-    {
-        match src_obj_kind {
-            SrcObjKind::File => {
-                if matches!(dst_obj_kind, DstObjKind::Dir | DstObjKind::DirExisting) {
-                    src_mnt.file_name().map(|n| dst_mnt.join(n))
-                } else {
-                    Some(dst_mnt.clone())
-                }
-            }
-            SrcObjKind::Dir => match dst_obj_kind {
-                DstObjKind::Dir | DstObjKind::DirExisting => {
-                    src_mnt.file_name().map(|n| dst_mnt.join(n))
-                }
-                DstObjKind::DirNew => Some(dst_mnt.clone()),
-                _ => None,
-            },
-        }
-    } else {
-        None
-    };
-
-    let fast_rename_possible = maybe_fast_rename_target
-        .as_ref()
-        .map(|rename_target| {
-            can_fast_rename_same_fs(&src_mnt, rename_target)
-                && !rename_target.exists()
-                && *rename_target != src_mnt
-        })
-        .unwrap_or(false);
-
     // A backup is an in-filesystem rename and does not require a second copy
     // of the backup tree. Counting it here rejects valid low-free-space moves.
     let required_space = planned_bytes;
@@ -1266,6 +1264,28 @@ fn run_local_transfer_inner(request: LocalTransferRequest<'_>) -> i32 {
             println!();
             log_transfer_complete(requested_mode);
             return 0;
+        }
+    }
+
+    // A failed rename has not moved the source. Before falling back to copying,
+    // perform the read and space checks skipped for the rename candidate.
+    if fast_rename_possible {
+        let planned_sources =
+            planned_regular_source_paths(&src_mnt, src_obj_kind, transfer_manifest.as_ref());
+        let failures = preflight_source_file_reads(&planned_sources);
+        if !failures.is_empty() {
+            report_source_read_preflight_failures(requested_mode, &failures);
+            return NONMUTATING_PREFLIGHT_FAILURE;
+        }
+        if let Ok((available_bytes, _)) = destination_available_bytes(&dst_mnt) {
+            if available_bytes < required_space {
+                log(
+                    requested_mode,
+                    "Insufficient free space for copy fallback after failed rename.",
+                    LogLevel::Error,
+                );
+                return NONMUTATING_PREFLIGHT_FAILURE;
+            }
         }
     }
 

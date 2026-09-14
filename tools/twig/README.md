@@ -145,7 +145,11 @@ For each invocation, `twig` runs roughly this pipeline:
      candidates; incomplete index metadata falls back to the live scanner
    - the live scanner makes one bounded pass, retaining only the root and
      immediate-child aggregates; partial walks keep usable totals, print one
-     diagnostic, and return a failing exit status
+     diagnostic such as `twig: recursive scan incomplete: 3 unreadable entries`
+     after the listing, and return a failing exit status. Multiple operands share
+     a combined count. This counts
+     observed scan failures: an unreadable directory counts as one failure,
+     with an unknown number of unvisited descendants.
    - on NTFS-like mounts, attempts MFT scan first and falls back automatically
 3. Scan one directory level for displayed entries (`std::fs::read_dir`).
 4. Build per-entry metadata struct:

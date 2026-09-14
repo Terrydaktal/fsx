@@ -7,24 +7,15 @@ type RecursiveStatsValues = (
     Option<(u64, u64)>,
 );
 
+#[derive(Default)]
 pub(crate) struct RecursiveStats {
     pub(crate) sizes: HashMap<OsString, u64>,
     pub(crate) counts: HashMap<OsString, (u64, u64)>,
     pub(crate) root_size: Option<u64>,
     pub(crate) root_counts: Option<(u64, u64)>,
-    pub(crate) complete: bool,
-}
-
-impl Default for RecursiveStats {
-    fn default() -> Self {
-        Self {
-            sizes: HashMap::new(),
-            counts: HashMap::new(),
-            root_size: None,
-            root_counts: None,
-            complete: true,
-        }
-    }
+    /// Failed scan operations, not the number of descendants hidden by them.
+    pub(crate) scan_errors: u64,
+    pub(crate) top_entries: Option<fsx::scan::TopLevelMetadata>,
 }
 
 impl RecursiveStats {
@@ -34,7 +25,8 @@ impl RecursiveStats {
             counts,
             root_size,
             root_counts,
-            complete: true,
+            scan_errors: 0,
+            top_entries: None,
         }
     }
 }
@@ -61,6 +53,7 @@ pub(crate) fn collect_recursive_stats_checked(
         return RecursiveStats::default();
     }
     let canonical_base = fs::canonicalize(base_path).unwrap_or_else(|_| base_path.to_path_buf());
+    let mut top_entries = None;
     if show_hidden
         && !is_ntfs_like_filesystem(&canonical_base)
         && let Some(indexed) = collect_recursive_stats_from_index(
@@ -68,9 +61,12 @@ pub(crate) fn collect_recursive_stats_checked(
             dedupe_hardlinks,
             need_sizes,
             need_counts,
+            &mut top_entries,
         )
     {
-        return RecursiveStats::complete(indexed);
+        let mut stats = RecursiveStats::complete(indexed);
+        stats.top_entries = top_entries;
+        return stats;
     }
     if is_ntfs_like_filesystem(&canonical_base) {
         return RecursiveStats::complete(collect_recursive_stats_legacy(
@@ -104,15 +100,7 @@ pub(crate) fn collect_recursive_stats_checked(
         threads: live_scan_threads(),
         ..fsx::scan::ScanRequest::default()
     };
-    let snapshot = fsx::scan::scan_top_level(&request);
-    if !snapshot.complete {
-        eprintln!(
-            "twig: recursive scan of {} is partial; skipped {} unreadable entr{}",
-            canonical_base.display(),
-            snapshot.errors,
-            if snapshot.errors == 1 { "y" } else { "ies" }
-        );
-    }
+    let snapshot = fsx::scan::scan_top_level_with_metadata(&request);
     if snapshot.overflowed {
         eprintln!(
             "twig: warning: one or more filesystem aggregates overflowed u64 and were saturated"
@@ -139,6 +127,7 @@ pub(crate) fn collect_recursive_stats_checked(
         root_size,
         root_counts: need_counts
             .then(|| (snapshot.root.dirs.saturating_add(1), snapshot.root.files)),
-        complete: snapshot.complete,
+        scan_errors: snapshot.errors,
+        top_entries: snapshot.top_entries,
     }
 }

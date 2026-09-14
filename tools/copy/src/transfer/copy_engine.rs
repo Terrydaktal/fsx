@@ -640,11 +640,11 @@ where
     )
 }
 
-pub(crate) fn copy_file_preserve_atomic_with_progress_buf<F>(
+pub(crate) fn copy_file_preserve_atomic_with_progress_buffer<F>(
     src: &Path,
     dst: &Path,
     media: MediaKind,
-    buf_bytes: usize,
+    buffer: &mut Vec<u8>,
     on_bytes: F,
 ) -> io::Result<u64>
 where
@@ -658,12 +658,11 @@ where
         .prefix(".copy-rs-partial-")
         .tempfile_in(parent)?
         .into_temp_path();
-    let mut buf = vec![0u8; buf_bytes.max(64 * 1024)];
     let copied = copy_file_preserve_with_progress_buffer_inner(
         src,
         staged.as_ref(),
         media,
-        &mut buf,
+        buffer,
         true,
         cancellation(),
         on_bytes,
@@ -712,16 +711,13 @@ where
     advise_sequential(&in_file);
 
     let desired = copy_chunk_bytes_for_file(media, meta.len()).max(64 * 1024);
-    if reusable_buf.len() < desired {
-        reusable_buf.resize(desired, 0);
-    }
-    let buf = reusable_buf;
     let sparse = meta.blocks().saturating_mul(512) < meta.len();
 
     let total = if meta.len() > 0 && try_reflink(&in_file, &out_file) {
         on_bytes(meta.len());
         meta.len()
     } else if sparse {
+        let buf = transfer_buffer(reusable_buf, desired);
         match copy_sparse_extents(
             &mut in_file,
             &mut out_file,
@@ -739,7 +735,7 @@ where
                 copy_buffered(
                     &mut in_file,
                     &mut out_file,
-                    buf,
+                    transfer_buffer(reusable_buf, desired),
                     media,
                     cancelled,
                     &mut on_bytes,
@@ -765,7 +761,7 @@ where
                 copy_buffered(
                     &mut in_file,
                     &mut out_file,
-                    buf,
+                    transfer_buffer(reusable_buf, desired),
                     media,
                     cancelled,
                     &mut on_bytes,
@@ -778,6 +774,13 @@ where
     apply_file_metadata_fd(&out_file, &meta)?;
     advise_drop_cache(&in_file);
     Ok(total)
+}
+
+fn transfer_buffer(buffer: &mut Vec<u8>, desired: usize) -> &mut [u8] {
+    if buffer.len() < desired {
+        buffer.resize(desired, 0);
+    }
+    &mut buffer[..desired]
 }
 
 pub(crate) fn copy_buffered<F>(
@@ -1101,6 +1104,35 @@ fn set_directory_times_checked(path: &Path, atime: FileTime, mtime: FileTime) ->
 mod tests {
     use super::*;
 
+    #[test]
+    fn transfer_buffer_reuses_storage_and_respects_small_chunks() {
+        let mut buffer = Vec::new();
+        assert_eq!(transfer_buffer(&mut buffer, 256 * 1024).len(), 256 * 1024);
+        let allocation = buffer.as_ptr();
+        assert_eq!(transfer_buffer(&mut buffer, 64 * 1024).len(), 64 * 1024);
+        assert_eq!(buffer.as_ptr(), allocation);
+    }
+
+    #[test]
+    fn atomic_empty_copy_does_not_allocate_transfer_buffer() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let destination = root.path().join("destination");
+        fs::write(&source, []).unwrap();
+        fs::write(&destination, b"old content").unwrap();
+        let mut buffer = Vec::new();
+        copy_file_preserve_atomic_with_progress_buffer(
+            &source,
+            &destination,
+            MediaKind::Nvme,
+            &mut buffer,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(buffer.capacity(), 0);
+        assert_eq!(fs::read(destination).unwrap(), b"");
+    }
+
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn destination_open_traverses_searchable_non_readable_ancestor() {
@@ -1174,11 +1206,11 @@ mod tests {
         let source = root.path().join("source");
         let destination = root.path().join("destination");
         fs::write(&source, b"verified bytes").expect("write source");
-        copy_file_preserve_atomic_with_progress_buf(
+        copy_file_preserve_atomic_with_progress_buffer(
             &source,
             &destination,
             MediaKind::Other,
-            4096,
+            &mut Vec::new(),
             |_| {},
         )
         .expect("copy source");

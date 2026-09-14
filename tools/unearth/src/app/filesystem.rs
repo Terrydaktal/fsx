@@ -3,7 +3,7 @@ use super::patterns::parse_search_dir;
 use super::scan_status::LiveScanStatus;
 use super::{NTFS_FS_TYPES, ROOT_SIZE_SKIP_TREES};
 use crossbeam_channel::Sender;
-use jwalk::{Parallelism, WalkDir};
+use jwalk::WalkDir;
 use rayon::prelude::*;
 use regex::Regex;
 use std::collections::HashSet;
@@ -683,29 +683,6 @@ pub(crate) fn get_dir_stats_native(path: &Path, count_files: bool) -> (u64, u64)
             get_dir_stats_walk(path, count_files)
         }
     }
-}
-
-pub(crate) fn get_dir_bytes_native_serial(path: &Path) -> u64 {
-    if let Ok((bytes, _)) = get_dir_stats_ntfs_mft(path, false) {
-        return bytes;
-    }
-    let mut bytes = 0u64;
-    for entry_res in WalkDir::new(path)
-        .follow_links(false)
-        .parallelism(Parallelism::Serial)
-    {
-        let Ok(entry) = entry_res else { continue };
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        if let Ok(meta) = entry.metadata() {
-            bytes = bytes.saturating_add(meta.len());
-        }
-    }
-    if bytes == u64::MAX {
-        eprintln!("unearth: warning: filesystem size overflowed u64 and was saturated");
-    }
-    bytes
 }
 
 pub(crate) fn normalize_dir_key(path: &str) -> String {

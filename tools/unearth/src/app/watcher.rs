@@ -572,6 +572,17 @@ enum IndexedPathState {
     Directory,
 }
 
+mod snapshot_budget;
+use snapshot_budget::{SnapshotBudget, SnapshotLease};
+
+const WATCH_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
+const WATCH_QUEUED_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+
+struct ReconcileScan {
+    entries: Arc<Vec<ScannedIndexEntry>>,
+    _lease: Option<Arc<SnapshotLease>>,
+}
+
 #[derive(Clone, Debug)]
 struct FsEvent {
     action: Action,
@@ -582,12 +593,14 @@ struct FsEvent {
     event_kind: i64,
     at: i64,
     scanned_entries: Option<Arc<Vec<ScannedIndexEntry>>>,
+    snapshot_lease: Option<Arc<SnapshotLease>>,
 }
 
 #[derive(Clone)]
 struct EventSender {
     inner: Sender<FsEvent>,
     pending_modifies: Arc<Mutex<HashSet<PathBuf>>>,
+    snapshot_budget: Arc<SnapshotBudget>,
 }
 
 struct EventReceiver {
@@ -602,6 +615,7 @@ fn event_queue(capacity: usize) -> (EventSender, EventReceiver) {
         EventSender {
             inner: sender,
             pending_modifies: Arc::clone(&pending_modifies),
+            snapshot_budget: SnapshotBudget::new(WATCH_QUEUED_SNAPSHOT_BYTES),
         },
         EventReceiver {
             inner: receiver,
@@ -611,7 +625,21 @@ fn event_queue(capacity: usize) -> (EventSender, EventReceiver) {
 }
 
 impl EventSender {
-    fn send(&self, event: FsEvent) -> Result<(), ()> {
+    fn send(&self, mut event: FsEvent) -> Result<(), ()> {
+        if let Some(entries) = event.scanned_entries.as_ref() {
+            let bytes = entries.iter().fold(
+                entries
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ScannedIndexEntry>()),
+                |bytes, entry| bytes.saturating_add(entry.path.capacity()),
+            );
+            event.snapshot_lease = self.snapshot_budget.reserve(bytes);
+            if event.snapshot_lease.is_none() {
+                // Retain the reconciliation event, not a partial snapshot.
+                // Its consumer performs a fresh full subtree reconciliation.
+                event.scanned_entries = None;
+            }
+        }
         let coalescible = event.action == Action::Upsert && event.event_kind == EVENT_MODIFY;
         if coalescible {
             let mut pending = self
@@ -1614,7 +1642,7 @@ fn process_batch(
     metric_add(metrics.map(|metrics| &metrics.batches), 1);
     let mut full_refresh = HashSet::<String>::new();
     let mut reconcile = HashSet::<PathBuf>::new();
-    let mut reconcile_scans = HashMap::<PathBuf, Arc<Vec<ScannedIndexEntry>>>::new();
+    let mut reconcile_scans = HashMap::<PathBuf, ReconcileScan>::new();
     let mut recovery_roots = HashSet::<String>::new();
     let mut touched_roots = HashMap::<String, i64>::new();
     let mut touched_parents = HashSet::<PathBuf>::new();
@@ -1713,7 +1741,13 @@ fn process_batch(
                     if state == IndexedPathState::Directory {
                         reconcile.insert(event.path.clone());
                         if let Some(entries) = event.scanned_entries.as_ref() {
-                            reconcile_scans.insert(event.path.clone(), Arc::clone(entries));
+                            reconcile_scans.insert(
+                                event.path.clone(),
+                                ReconcileScan {
+                                    entries: Arc::clone(entries),
+                                    _lease: event.snapshot_lease.clone(),
+                                },
+                            );
                         }
                     }
                     upsert_parent_directory_once(
@@ -1812,7 +1846,13 @@ fn process_batch(
                 if state == IndexedPathState::Directory {
                     reconcile.insert(event.path.clone());
                     if let Some(entries) = event.scanned_entries.as_ref() {
-                        reconcile_scans.insert(event.path.clone(), Arc::clone(entries));
+                        reconcile_scans.insert(
+                            event.path.clone(),
+                            ReconcileScan {
+                                entries: Arc::clone(entries),
+                                _lease: event.snapshot_lease.clone(),
+                            },
+                        );
                     }
                 } else if event.path == root.path {
                     full_refresh.insert(root.key.clone());
@@ -1880,8 +1920,8 @@ fn process_batch(
     reconcile.retain(|path| !full_refresh.iter().any(|root| path_in_root(root, path)));
     for path in collapse_reconcile_paths(reconcile) {
         let started = Instant::now();
-        let result = if let Some(entries) = reconcile_scans.remove(&path) {
-            let entries = match Arc::try_unwrap(entries) {
+        let result = if let Some(scan) = reconcile_scans.remove(&path) {
+            let entries = match Arc::try_unwrap(scan.entries) {
                 Ok(entries) => entries,
                 Err(entries) => entries.as_ref().clone(),
             };
@@ -1938,22 +1978,19 @@ fn process_batch(
 
 fn invalidate_stale_reconcile_scans(
     batch: &[FsEvent],
-    reconcile_scans: &mut HashMap<PathBuf, Arc<Vec<ScannedIndexEntry>>>,
+    reconcile_scans: &mut HashMap<PathBuf, ReconcileScan>,
 ) {
-    let scanned_paths: Vec<(PathBuf, String)> = reconcile_scans
-        .keys()
-        .map(|path| (path.clone(), normalize_index_dir(path)))
-        .collect();
-    for (scanned_path, scanned_key) in scanned_paths {
-        if batch.iter().any(|event| {
-            (event.path != scanned_path && path_in_root(&scanned_key, &event.path))
-                || event.old_path.as_deref().is_some_and(|old_path| {
-                    old_path != scanned_path && path_in_root(&scanned_key, old_path)
-                })
-        }) {
-            reconcile_scans.remove(&scanned_path);
+    let mut changed_ancestors = HashSet::new();
+    for event in batch {
+        for path in std::iter::once(&event.path).chain(event.old_path.as_ref()) {
+            let key = normalize_index_dir(path);
+            for parent in Path::new(&key).ancestors().skip(1) {
+                changed_ancestors.insert(parent.to_path_buf());
+            }
         }
     }
+    reconcile_scans
+        .retain(|path, _| !changed_ancestors.contains(Path::new(&normalize_index_dir(path))));
 }
 
 fn coalesce_batch(batch: Vec<FsEvent>) -> Vec<FsEvent> {
@@ -2001,23 +2038,12 @@ fn coalesce_batch(batch: Vec<FsEvent>) -> Vec<FsEvent> {
 }
 
 fn collapse_reconcile_paths(paths: HashSet<PathBuf>) -> Vec<PathBuf> {
-    let mut paths: Vec<PathBuf> = paths.into_iter().collect();
-    paths.sort_by(|left, right| {
-        left.components()
-            .count()
-            .cmp(&right.components().count())
-            .then_with(|| left.cmp(right))
-    });
-    let mut collapsed = Vec::with_capacity(paths.len());
-    'candidate: for path in paths {
-        if collapsed
-            .iter()
-            .any(|parent: &PathBuf| path.strip_prefix(parent).is_ok())
-        {
-            continue 'candidate;
-        }
-        collapsed.push(path);
-    }
+    let requests = fsx::hierarchy::PathRequests::new(paths);
+    let mut collapsed: Vec<_> = requests
+        .roots()
+        .map(|(_, path)| path.to_path_buf())
+        .collect();
+    collapsed.sort_by_cached_key(|path| path.components().count());
     collapsed
 }
 
@@ -2546,6 +2572,7 @@ fn event(action: Action, path: PathBuf, is_dir: bool, _backend: &str, actor: Act
         },
         at: now_nanos(),
         scanned_entries: None,
+        snapshot_lease: None,
     }
 }
 
@@ -2833,11 +2860,19 @@ impl InotifyWatcher {
     }
 
     fn add_recursive(&mut self, root: &Path) -> Result<(), String> {
-        self.walk_recursive(root, false, None).map(|_| ())
+        self.walk_recursive(root, false, None, None).map(|_| ())
     }
 
     fn add_recursive_collect(&mut self, root: &Path) -> Result<Vec<ScannedIndexEntry>, String> {
-        self.walk_recursive(root, true, Some(&WATCH_STOP))
+        self.walk_recursive(root, true, Some(&WATCH_STOP), None)
+            .map(|entries| entries.expect("unbounded initial scan is retained"))
+    }
+
+    fn add_recursive_snapshot(
+        &mut self,
+        root: &Path,
+    ) -> Result<Option<Vec<ScannedIndexEntry>>, String> {
+        self.walk_recursive(root, true, Some(&WATCH_STOP), Some(WATCH_SNAPSHOT_BYTES))
     }
 
     fn walk_recursive(
@@ -2845,10 +2880,12 @@ impl InotifyWatcher {
         root: &Path,
         collect_entries: bool,
         cancel: Option<&AtomicBool>,
-    ) -> Result<Vec<ScannedIndexEntry>, String> {
+        limit: Option<usize>,
+    ) -> Result<Option<Vec<ScannedIndexEntry>>, String> {
         let root_key = normalize_index_dir(root);
         let scan_root = root.to_path_buf();
-        let mut scanned = Vec::new();
+        let mut scanned = collect_entries.then(Vec::new);
+        let mut path_bytes = 0usize;
         let mut pending = vec![scan_root.clone()];
         while let Some(directory) = pending.pop() {
             if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
@@ -2902,10 +2939,13 @@ impl InotifyWatcher {
                 if file_type.is_dir() {
                     pending.push(path.clone());
                 }
-                if collect_entries && path != scan_root && path.file_name().is_some() {
-                    scanned.push(ScannedIndexEntry {
+                if let Some(entries) = scanned
+                    .as_mut()
+                    .filter(|_| path != scan_root && path.file_name().is_some())
+                {
+                    path_bytes = path_bytes.saturating_add(path_key.capacity());
+                    entries.push(ScannedIndexEntry {
                         path: path_key,
-                        raw_path: path.clone(),
                         kind: if file_type.is_dir() {
                             1
                         } else if file_type.is_symlink() {
@@ -2921,6 +2961,17 @@ impl InotifyWatcher {
                         inode: None,
                         link_count: None,
                     });
+                    if limit.is_some_and(|limit| {
+                        path_bytes.saturating_add(
+                            entries
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<ScannedIndexEntry>()),
+                        ) > limit
+                    }) {
+                        // Continue installing all watches, but do not publish a
+                        // truncated scan as if it described the whole subtree.
+                        scanned = None;
+                    }
                 }
             }
         }
@@ -2981,7 +3032,7 @@ impl InotifyWatcher {
         let removed: Vec<PathBuf> = self.mounted.difference(&current).cloned().collect();
         let mut failed_adds = HashSet::new();
         for mount in added {
-            match self.add_recursive_collect(&mount) {
+            match self.add_recursive_snapshot(&mount) {
                 Ok(entries) => {
                     let mut reconcile = event(
                         Action::Reconcile,
@@ -2990,7 +3041,7 @@ impl InotifyWatcher {
                         "inotify",
                         Actor::unknown(),
                     );
-                    reconcile.scanned_entries = Some(Arc::new(entries));
+                    reconcile.scanned_entries = entries.map(Arc::new);
                     let _ = tx.send(reconcile);
                 }
                 Err(error) => {
@@ -3263,7 +3314,7 @@ impl InotifyWatcher {
                         let _ = tx.send(moved);
                     } else {
                         if is_dir {
-                            let entries = match self.add_recursive_collect(&path) {
+                            let entries = match self.add_recursive_snapshot(&path) {
                                 Ok(entries) => entries,
                                 Err(error) => {
                                     let _ = tx.send(event(
@@ -3287,7 +3338,7 @@ impl InotifyWatcher {
                                 "inotify",
                                 Actor::unknown(),
                             );
-                            reconcile.scanned_entries = Some(Arc::new(entries));
+                            reconcile.scanned_entries = entries.map(Arc::new);
                             let _ = tx.send(reconcile);
                         } else {
                             let _ = tx.send(event(
@@ -3310,7 +3361,7 @@ impl InotifyWatcher {
                     }
                 } else if mask & libc::IN_CREATE != 0 {
                     if is_dir {
-                        let entries = match self.add_recursive_collect(&path) {
+                        let entries = match self.add_recursive_snapshot(&path) {
                             Ok(entries) => entries,
                             Err(error) => {
                                 let _ = tx.send(event(
@@ -3337,7 +3388,7 @@ impl InotifyWatcher {
                             "inotify",
                             Actor::unknown(),
                         );
-                        reconcile.scanned_entries = Some(Arc::new(entries));
+                        reconcile.scanned_entries = entries.map(Arc::new);
                         let _ = tx.send(reconcile);
                     }
                     if !is_dir {
@@ -4166,6 +4217,96 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn capped_snapshot_keeps_watch_coverage_and_can_rescan_every_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("target/nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("file"), b"fresh").unwrap();
+        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+        let mut watcher = InotifyWatcher {
+            fd,
+            roots: vec![RootState {
+                key: normalize_index_dir(root.path()),
+                path: root.path().into(),
+            }],
+            paths: HashMap::new(),
+            path_to_wd: BTreeMap::new(),
+            pending_moves: HashMap::new(),
+            pending_self_moves: HashMap::new(),
+            recently_rebased: HashMap::new(),
+            mounted: HashSet::new(),
+            last_mount_check: std::time::Instant::now(),
+        };
+        assert!(watcher
+            .walk_recursive(root.path(), true, None, Some(1))
+            .unwrap()
+            .is_none());
+        assert_eq!(watcher.paths.len(), 3);
+        assert!(watcher.path_to_wd.contains_key(nested.as_path()));
+        let entries = watcher
+            .walk_recursive(root.path(), true, None, None)
+            .unwrap()
+            .unwrap();
+        assert!(entries
+            .iter()
+            .any(|entry| entry.path == normalize_index_dir(&nested.join("file"))));
+    }
+
+    #[test]
+    fn snapshot_budget_exhaustion_retains_full_reconciliation_event() {
+        let (mut tx, rx) = event_queue(4);
+        tx.snapshot_budget = SnapshotBudget::new(0);
+        let mut reconcile = event(
+            Action::Reconcile,
+            PathBuf::from("/tmp/snapshot-budget"),
+            true,
+            "test",
+            Actor::unknown(),
+        );
+        reconcile.scanned_entries = Some(Arc::new(Vec::with_capacity(1)));
+        tx.send(reconcile).unwrap();
+        let retained = rx.inner.recv().unwrap();
+        assert_eq!(retained.action, Action::Reconcile);
+        assert!(retained.scanned_entries.is_none());
+        assert!(retained.snapshot_lease.is_none());
+    }
+
+    #[test]
+    fn reconciliation_ancestry_handles_many_disjoint_paths_and_both_move_sides() {
+        let paths: HashSet<_> = (0..4096)
+            .flat_map(|i| {
+                [
+                    PathBuf::from(format!("/r/d{i}")),
+                    PathBuf::from(format!("/r/d{i}/target/nested")),
+                ]
+            })
+            .collect();
+        assert_eq!(collapse_reconcile_paths(paths).len(), 4096);
+        let mut scans = HashMap::from_iter(["/r/a", "/r/b", "/r/ab"].map(|p| {
+            (
+                PathBuf::from(p),
+                ReconcileScan {
+                    entries: Arc::new(Vec::new()),
+                    _lease: None,
+                },
+            )
+        }));
+        let mut moved = event(
+            Action::Move,
+            PathBuf::from("/r/b/new"),
+            false,
+            "test",
+            Actor::unknown(),
+        );
+        moved.old_path = Some(PathBuf::from("/r/a/old"));
+        invalidate_stale_reconcile_scans(&[moved], &mut scans);
+        assert_eq!(scans.len(), 1);
+        assert!(scans.contains_key(Path::new("/r/ab")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn inotify_directory_move_reuses_pooled_watch_paths() {
         let old = PathBuf::from("/tmp/unearth-watch-old");
         let child = old.join("child");
@@ -4337,7 +4478,13 @@ mod tests {
             reconcile,
             event(Action::Upsert, child, false, "test", Actor::unknown()),
         ];
-        let mut scans = HashMap::from([(root, Arc::new(Vec::new()))]);
+        let mut scans = HashMap::from([(
+            root,
+            ReconcileScan {
+                entries: Arc::new(Vec::new()),
+                _lease: None,
+            },
+        )]);
 
         invalidate_stale_reconcile_scans(&batch, &mut scans);
 

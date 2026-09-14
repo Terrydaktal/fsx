@@ -1,16 +1,16 @@
 use super::filesystem::{root_prefers_single_thread, walk_fast, walk_rayon_worker, PathInfo};
 use super::model::{
     ColorSpec, ContainsAllSpec, DirStatsCache, Options, SearchDirMode, SearchResult, SearchRun,
-    TypeFlag,
+    SortField, TypeFlag,
 };
 use super::patterns::{
     expand_home_path, parse_name_pattern, parse_search_dir, pattern_prefers_full_path,
     term_selectivity_score,
 };
 use super::presentation::{
-    cache_raw_record_path, can_stream_direct, compile_highlight_spec, escape_terminal_text,
-    final_transform, init_raw_cache_state, render_styled_path, style_enabled, RenderCache,
-    RenderContext,
+    cache_raw_record_path, can_stream_direct, can_stream_rendered, compile_highlight_spec,
+    escape_terminal_text, final_transform, init_raw_cache_state, render_styled_path, style_enabled,
+    RenderCache, RenderContext,
 };
 use super::LiveScanStatus;
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
@@ -238,7 +238,11 @@ pub(crate) fn run_standard(
     }
 
     let mut results = Vec::new();
-    let needs_metadata = opts.long_format || opts.sort_field.is_some() || opts.sizes;
+    let needs_metadata = opts.long_format
+        || opts.classify
+        || stdout_is_tty
+        || matches!(opts.sort_field, Some(SortField::Date | SortField::Size))
+        || opts.sizes;
     let (tx, rx) = bounded::<Vec<SearchResult>>(64);
     let opts_clone = opts.clone();
     if opts.positional.len() == 1 {
@@ -335,9 +339,6 @@ pub(crate) fn run_standard(
             }
         }
     }
-    for chunk in rx {
-        results.extend(chunk);
-    }
     let highlight_spec = if opts.highlight_match {
         Some(compile_highlight_spec(
             &[(name.regex.clone(), false)],
@@ -346,6 +347,21 @@ pub(crate) fn run_standard(
     } else {
         None
     };
+    if can_stream_rendered(opts) {
+        return stream_rendered_results(
+            rx,
+            opts,
+            colors,
+            use_style,
+            stdout_is_tty,
+            highlight_spec.as_ref(),
+            &timeout_triggered,
+            &scan_status,
+        );
+    }
+    for chunk in rx {
+        results.extend(chunk);
+    }
     Ok(SearchRun {
         lines: final_transform(
             results,
@@ -358,6 +374,67 @@ pub(crate) fn run_standard(
         ),
         timed_out: timeout_triggered.load(Ordering::Relaxed),
         incomplete: scan_status.is_incomplete(),
+    })
+}
+
+fn stream_rendered_results(
+    batches: impl IntoIterator<Item = Vec<SearchResult>>,
+    opts: &Options,
+    colors: &ColorSpec,
+    use_style: bool,
+    stdout_is_tty: bool,
+    highlight: Option<&super::model::HighlightSpec>,
+    stop: &AtomicBool,
+    status: &LiveScanStatus,
+) -> Result<SearchRun, String> {
+    let stdout = io::stdout();
+    let mut output = BufWriter::with_capacity(64 * 1024, stdout.lock());
+    let mut render_cache = RenderCache::default();
+    let mut cache_state = opts.cache_output.then(init_raw_cache_state).flatten();
+    let mut context = RenderContext {
+        use_style,
+        add_decorator: stdout_is_tty || opts.classify,
+        colors,
+        opts,
+        highlight,
+        cache: &mut render_cache,
+    };
+    let mut emitted = 0usize;
+    let mut limited = opts.limit == Some(0);
+    if limited && !opts.cache_output {
+        stop.store(true, Ordering::Relaxed);
+    }
+    for batch in batches {
+        for row in batch {
+            if let Some(state) = cache_state.as_mut() {
+                cache_raw_record_path(&row.path, row.is_dir, row.path_encoded, state);
+            }
+            if limited {
+                continue;
+            }
+            let text = render_styled_path(&row, &mut context);
+            writeln!(output, "{text}").map_err(|e| e.to_string())?;
+            emitted += 1;
+            // Show the first result promptly; subsequent output is batched.
+            if emitted == 1 {
+                output.flush().map_err(|e| e.to_string())?;
+            }
+            if opts.limit.is_some_and(|limit| emitted >= limit) {
+                limited = true;
+                if !opts.cache_output {
+                    stop.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+    output.flush().map_err(|e| e.to_string())?;
+    if let Some(mut state) = cache_state {
+        let _ = state.cache.flush();
+    }
+    Ok(SearchRun {
+        lines: Vec::new(),
+        timed_out: stop.load(Ordering::Relaxed) && (!limited || opts.cache_output),
+        incomplete: status.is_incomplete(),
     })
 }
 
@@ -411,7 +488,11 @@ pub(crate) fn run_contains_all(
         .collect::<Result<_, _>>()?;
     let first_re = compiled_regexes[0].clone();
     let is_catch_all = regexes[0] == ".*" || regexes[0] == "^.*$";
-    let needs_metadata = opts.long_format || opts.sort_field.is_some() || opts.sizes;
+    let needs_metadata = opts.long_format
+        || opts.classify
+        || stdout_is_tty
+        || matches!(opts.sort_field, Some(SortField::Date | SortField::Size))
+        || opts.sizes;
     let (tx, rx) = bounded::<Vec<SearchResult>>(64);
     let opts_clone = opts.clone();
     let root = spec.root.clone();
@@ -557,7 +638,10 @@ pub(crate) fn run_full(
             first_full_path_match,
             prune_matched_dir_subtrees,
             opts_clone.long_format
-                || opts_clone.sort_field.is_some()
+                || matches!(
+                    opts_clone.sort_field,
+                    Some(SortField::Date | SortField::Size)
+                )
                 || opts_clone.sizes
                 || opts_clone.classify,
             root_serial,

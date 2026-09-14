@@ -78,6 +78,14 @@ jobs:
           if-no-files-found: error
       - name: Output contract integration tests
         run: python3 -m unittest discover -s tests/output_contract -v
+      - name: Performance regression workloads (correctness and resource report)
+        run: python3 tools/build/performance-regressions.py --files 2048 --repeat 2 > target/performance-regressions.json
+      - name: Upload performance report
+        uses: actions/upload-artifact@v4
+        with:
+          name: fsx-performance-regressions
+          path: target/performance-regressions.json
+          if-no-files-found: error
       - name: Unearth integration tests
         run: |
           bash tools/unearth/tests/help_matrix.sh

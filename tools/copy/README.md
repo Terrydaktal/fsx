@@ -2,6 +2,14 @@
 
 Rust CLI for local filesystem transfers with preview/confirm flow.
 
+Use `copy --move --create-destination-directory SOURCE DESTINATION` to create
+DESTINATION (including missing parents) as a container and move SOURCE into it
+under its original basename. Without this option, a missing destination is the
+new name of the source. This option supports local transfers and rejects
+`--contents-only` and `--sync`. Directory creation happens before planning, so
+empty directories remain after `--preview` or cancellation. Existing files and
+symlinks at the container path are rejected.
+
 ## Requirements
 
 - Linux

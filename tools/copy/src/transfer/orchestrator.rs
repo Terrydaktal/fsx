@@ -8,7 +8,7 @@ use super::cleanup::{
 use super::command::run_command_capture;
 use super::content::regular_file_contents_equal;
 use super::copy_engine::{
-    copy_file_preserve_atomic_with_progress_buf, copy_file_preserve_with_progress_buffer,
+    copy_file_preserve_atomic_with_progress_buffer, copy_file_preserve_with_progress_buffer,
     copy_symlink, interrupted, preflight_source_file_reads, preserve_directory_times_tree,
     remove_path_local_if_exists, verify_regular_file_pair,
 };
@@ -33,8 +33,8 @@ use crate::plan::{
     resolve_destination_for_dir_path, resolve_source_path, to_real_path_os, DestinationKind,
 };
 use crate::runtime::{
-    acquire_file_write_permit, configure_rayon_threads_for_media, copy_chunk_bytes_for_media,
-    dev_media_kind, inflight_max_bytes_for_media, option_u64_saturating_add, symlink_targets_equal,
+    acquire_file_write_permit, configure_rayon_threads_for_media, dev_media_kind,
+    inflight_max_bytes_for_media, option_u64_saturating_add, symlink_targets_equal,
     transfer_media_kind, transfer_profile_key,
 };
 use rayon::prelude::*;
@@ -268,11 +268,11 @@ pub(crate) fn run_rust_file_batch(
                 // worker cannot truncate the published file. Existing final
                 // symlinks intentionally retain their documented follow
                 // semantics and therefore remain in-place writes.
-                copy_file_preserve_atomic_with_progress_buf(
+                copy_file_preserve_atomic_with_progress_buffer(
                     source,
                     &target,
                     media,
-                    copy_chunk_bytes_for_media(media),
+                    buffer,
                     |count| {
                         done.fetch_add(count, Ordering::Relaxed);
                     },

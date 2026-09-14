@@ -1,5 +1,6 @@
 use super::super::presentation::{
-    cache_raw_record_path, can_stream_direct, escape_terminal_text, final_transform, style_enabled,
+    cache_raw_record_path, can_stream_direct, can_stream_rendered, escape_terminal_text,
+    final_transform_with_dirsizes, render_styled_path, style_enabled, RenderCache, RenderContext,
 };
 use super::*;
 use regex::RegexBuilder;
@@ -42,32 +43,61 @@ pub(crate) fn populate_indexed_dirsize_cache(
     needed_dirs.sort_unstable();
     needed_dirs.dedup();
 
+    let requests = fsx::hierarchy::PathRequests::new(needed_dirs.into_iter().map(PathBuf::from));
+    let mut totals = vec![[0u64; 3]; requests.len()];
     let mut stmt = conn
         .prepare_cached(
-            "SELECT
+            "SELECT d.path,
                  COALESCE(SUM(CASE WHEN e.kind = 0 THEN e.size ELSE 0 END), 0),
              COALESCE(SUM(CASE WHEN e.kind = 0 THEN 1 ELSE 0 END), 0),
              COALESCE(SUM(CASE WHEN e.kind = 0 AND e.size IS NULL THEN 1 ELSE 0 END), 0)
              FROM dirs d
-             JOIN entries e INDEXED BY idx_entries_dir ON e.dir_id = d.id
-             WHERE d.path = ?1 OR (d.path >= ?2 AND d.path < ?3)",
+             LEFT JOIN entries e INDEXED BY idx_entries_dir ON e.dir_id = d.id
+             WHERE d.path = ?1 OR (d.path >= ?2 AND d.path < ?3)
+             GROUP BY d.id",
         )
         .map_err(|e| e.to_string())?;
 
-    for path in needed_dirs {
-        let prefix = index_path_prefix(&path);
+    for (_, path) in requests.roots() {
+        let path = path.to_str().expect("index paths are encoded UTF-8");
+        let prefix = index_path_prefix(path);
         let prefix_end = format!("{}0", prefix.trim_end_matches('/'));
-        let (bytes, files, missing_sizes): (i64, i64, i64) = stmt
-            .query_row(rusqlite::params![path, prefix, prefix_end], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })
+        let mut rows = stmt
+            .query(rusqlite::params![path, prefix, prefix_end])
             .map_err(|e| e.to_string())?;
+        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            let parent: String = row.get(0).map_err(|e| e.to_string())?;
+            let Some(id) = requests.owner(Path::new(&parent)) else {
+                continue;
+            };
+            for column in 0..3 {
+                let value: i64 = row.get(column + 1).map_err(|e| e.to_string())?;
+                let value = u64::try_from(value).map_err(|_| "invalid indexed directory total")?;
+                totals[id][column] = totals[id][column]
+                    .checked_add(value)
+                    .ok_or("indexed directory total overflow")?;
+            }
+        }
+    }
+    let mut overflow = false;
+    requests.fold_children(|parent, child| {
+        for column in 0..3 {
+            let value = totals[child][column];
+            overflow |= fsx::overflow::checked_add_u64(&mut totals[parent][column], value);
+        }
+    });
+    if overflow {
+        return Err("indexed directory total overflow".into());
+    }
+    for (id, path) in requests.paths() {
+        let [bytes, files, missing_sizes] = totals[id];
         if missing_sizes != 0 {
             continue;
         }
-        let bytes =
-            u64::try_from(bytes).map_err(|_| "indexed directory size overflow".to_string())?;
-        let files = u64::try_from(files).map_err(|_| "indexed file count overflow".to_string())?;
+        let path = path
+            .to_str()
+            .expect("index paths are encoded UTF-8")
+            .to_owned();
         let stats = DirStats {
             files,
             bytes,
@@ -374,12 +404,21 @@ pub(crate) fn run_recent_indexed(
     });
     results.truncate(limit);
 
-    if live {
-        let _ = populate_indexed_dirsize_cache(&conn, &root_key, &results, opts, cache);
-    }
-
     Ok(SearchRun {
-        lines: final_transform(results, opts, use_style, stdout_is_tty, colors, cache, None),
+        lines: final_transform_with_dirsizes(
+            results,
+            opts,
+            use_style,
+            stdout_is_tty,
+            colors,
+            cache,
+            None,
+            |items, cache| {
+                if live {
+                    let _ = populate_indexed_dirsize_cache(&conn, &root_key, items, opts, cache);
+                }
+            },
+        ),
         timed_out: false,
         incomplete: false,
     })
@@ -850,6 +889,54 @@ pub(crate) fn run_indexed_via_daemon(
             incomplete: false,
         }));
     }
+    if can_stream_rendered(opts) {
+        let stdout = io::stdout();
+        let mut output = BufWriter::with_capacity(64 * 1024, stdout.lock());
+        let mut render_cache = RenderCache::default();
+        let mut cache_state = opts.cache_output.then(init_raw_cache_state).flatten();
+        let mut context = RenderContext {
+            use_style,
+            add_decorator: stdout_is_tty || opts.classify,
+            colors,
+            opts,
+            highlight: None,
+            cache: &mut render_cache,
+        };
+        let mut emitted = 0usize;
+        let result = read_query_results(&mut reader, |row| {
+            if let Some(state) = cache_state.as_mut() {
+                cache_raw_record_path(&row.path, row.is_dir, row.path_encoded, state);
+            }
+            if opts.limit.is_some_and(|limit| emitted >= limit) {
+                return if opts.cache_output {
+                    Ok(())
+                } else {
+                    Err(QUERY_CONSUMER_STOP.to_string())
+                };
+            }
+            writeln!(output, "{}", render_styled_path(&row, &mut context))
+                .map_err(|e| e.to_string())?;
+            emitted += 1;
+            if emitted == 1 {
+                output.flush().map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        });
+        if let Err(error) = result {
+            if error != QUERY_CONSUMER_STOP {
+                return Err(format!("indexed query failed after output: {error}"));
+            }
+        }
+        output.flush().map_err(|e| e.to_string())?;
+        if let Some(mut state) = cache_state {
+            let _ = state.cache.flush();
+        }
+        return Ok(Some(SearchRun {
+            lines: Vec::new(),
+            timed_out: false,
+            incomplete: false,
+        }));
+    }
     let mut results = Vec::new();
     read_query_results(&mut reader, |result| {
         results.push(result);
@@ -876,9 +963,19 @@ pub(crate) fn run_indexed_via_daemon(
     } else {
         results.sort_by(|a, b| a.path.cmp(&b.path));
     }
-    let _ = populate_indexed_dirsize_cache(&status_conn, &root_key, &results, opts, cache);
     Ok(Some(SearchRun {
-        lines: final_transform(results, opts, use_style, stdout_is_tty, colors, cache, None),
+        lines: final_transform_with_dirsizes(
+            results,
+            opts,
+            use_style,
+            stdout_is_tty,
+            colors,
+            cache,
+            None,
+            |items, cache| {
+                let _ = populate_indexed_dirsize_cache(&status_conn, &root_key, items, opts, cache);
+            },
+        ),
         timed_out: false,
         incomplete: false,
     }))
@@ -965,6 +1062,12 @@ pub(crate) fn run_indexed(
             sql_params.extend(extra_params);
         }
     }
+    let render_stream = can_stream_rendered(opts) && !can_stream_direct(opts, use_style);
+    if render_stream {
+        // Buffered styled output was lexically sorted by the complete path.
+        // Preserve that ordering while letting SQLite spill sorting to disk.
+        sql.push_str(" ORDER BY (CASE WHEN d.path = '/' THEN '/' || s.value ELSE d.path || '/' || s.value END) || CASE WHEN e.kind = 1 THEN '/' ELSE '' END COLLATE BINARY");
+    }
     let mut stmt = conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map(params_from_iter(sql_params.iter()), |row| {
@@ -979,9 +1082,18 @@ pub(crate) fn run_indexed(
         })
         .map_err(|e| e.to_string())?;
 
-    if can_stream_direct(opts, use_style) {
+    if can_stream_direct(opts, use_style) || render_stream {
         let stdout = io::stdout();
         let mut lock = BufWriter::with_capacity(64 * 1024, stdout.lock());
+        let mut render_cache = RenderCache::default();
+        let mut context = RenderContext {
+            use_style,
+            add_decorator: stdout_is_tty || opts.classify,
+            colors,
+            opts,
+            highlight: None,
+            cache: &mut render_cache,
+        };
         let mut cache_state = if opts.cache_output {
             init_raw_cache_state()
         } else {
@@ -1026,13 +1138,29 @@ pub(crate) fn run_indexed(
             if opts.force_full && regexes.len() > 1 && !regexes.iter().any(|re| re.is_match(base)) {
                 continue;
             }
-            if opts.limit.is_some_and(|limit| emitted >= limit) {
+            let limited = opts.limit.is_some_and(|limit| emitted >= limit);
+            if limited && !(render_stream && opts.cache_output) {
                 break;
             }
             if let Some(state) = cache_state.as_mut() {
                 cache_raw_record_path(&path, is_dir, true, state);
             }
-            if opts.index_binary {
+            if limited {
+                continue;
+            }
+            if render_stream {
+                let row = SearchResult {
+                    path,
+                    path_encoded: true,
+                    is_dir,
+                    is_symlink: kind == 2,
+                    metadata: None,
+                    indexed_size: None,
+                    indexed_activity_nanos: None,
+                };
+                writeln!(lock, "{}", render_styled_path(&row, &mut context))
+                    .map_err(|e| e.to_string())?;
+            } else if opts.index_binary {
                 write_binary_path_record(&mut lock, &path, true).map_err(|e| e.to_string())?;
             } else {
                 let display_path = escape_terminal_text(&path);
@@ -1042,7 +1170,7 @@ pub(crate) fn run_indexed(
             }
             emitted += 1;
             written_since_flush += 1;
-            if written_since_flush >= INDEX_STREAM_FLUSH_LINES {
+            if emitted == 1 || written_since_flush >= INDEX_STREAM_FLUSH_LINES {
                 lock.flush().map_err(|e| e.to_string())?;
                 written_since_flush = 0;
             }
@@ -1106,11 +1234,21 @@ pub(crate) fn run_indexed(
         });
     }
     results.sort_by(|a, b| a.path.cmp(&b.path));
-    if clean_index {
-        let _ = populate_indexed_dirsize_cache(&conn, &root_key, &results, opts, cache);
-    }
     Ok(SearchRun {
-        lines: final_transform(results, opts, use_style, stdout_is_tty, colors, cache, None),
+        lines: final_transform_with_dirsizes(
+            results,
+            opts,
+            use_style,
+            stdout_is_tty,
+            colors,
+            cache,
+            None,
+            |items, cache| {
+                if clean_index {
+                    let _ = populate_indexed_dirsize_cache(&conn, &root_key, items, opts, cache);
+                }
+            },
+        ),
         timed_out: false,
         incomplete: false,
     })

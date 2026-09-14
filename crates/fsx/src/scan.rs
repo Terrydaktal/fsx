@@ -10,6 +10,11 @@ use std::time::Duration;
 
 type ScanPoolCache = Mutex<Option<(usize, Arc<rayon::ThreadPool>)>>;
 
+mod hardlinks;
+use hardlinks::HardlinkSet;
+
+pub use crate::metadata::TopLevelMetadata;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SizeMode {
     None,
@@ -97,6 +102,8 @@ pub struct TopLevelScanSnapshot {
     pub complete: bool,
     pub errors: u64,
     pub overflowed: bool,
+    /// Invocation-local metadata, only collected by the listing entry point.
+    pub top_entries: Option<TopLevelMetadata>,
 }
 
 impl Default for TopLevelScanSnapshot {
@@ -107,6 +114,7 @@ impl Default for TopLevelScanSnapshot {
             complete: true,
             errors: 0,
             overflowed: false,
+            top_entries: None,
         }
     }
 }
@@ -116,6 +124,7 @@ struct TopLevelScanState {
     root: Aggregate,
     children: HashMap<OsString, Aggregate>,
     overflowed: bool,
+    top_entries: TopLevelMetadata,
 }
 
 /// Recursively aggregate only the root and its immediate children.
@@ -125,6 +134,16 @@ struct TopLevelScanState {
 /// different children contributes to both child totals but only once to the
 /// root total.
 pub fn scan_top_level(request: &ScanRequest) -> TopLevelScanSnapshot {
+    scan_top_level_inner(request, false)
+}
+
+/// Collect the metadata needed to render immediate children without a second
+/// readdir/stat pass. Descendant metadata is still discarded as it is consumed.
+pub fn scan_top_level_with_metadata(request: &ScanRequest) -> TopLevelScanSnapshot {
+    scan_top_level_inner(request, true)
+}
+
+fn scan_top_level_inner(request: &ScanRequest, retain_metadata: bool) -> TopLevelScanSnapshot {
     let root = crate::path::full_path(&request.root);
     if request.symlinks == SymlinkMode::DoNotFollow
         && let Ok(metadata) = std::fs::symlink_metadata(&root)
@@ -140,9 +159,9 @@ pub fn scan_top_level(request: &ScanRequest) -> TopLevelScanSnapshot {
     let errors = Arc::new(AtomicU64::new(0));
     let dedupe_sizes = request.size_mode != SizeMode::None
         && request.hardlinks == HardlinkMode::DeduplicateCandidates;
-    let root_seen = dedupe_sizes.then(|| Arc::new(Mutex::new(HashSet::<HardlinkKey>::new())));
-    let child_seen = dedupe_sizes
-        .then(|| Arc::new(Mutex::new(HashMap::<OsString, HashSet<HardlinkKey>>::new())));
+    let root_seen = dedupe_sizes.then(|| Arc::new(HardlinkSet::default()));
+    let child_seen =
+        dedupe_sizes.then(|| Arc::new(Mutex::new(HashMap::<OsString, Arc<HardlinkSet>>::new())));
     let followed_dirs = (request.symlinks == SymlinkMode::Follow)
         .then(|| Arc::new(Mutex::new(HashSet::<HardlinkKey>::new())));
 
@@ -203,14 +222,33 @@ pub fn scan_top_level(request: &ScanRequest) -> TopLevelScanSnapshot {
             let mut child_deltas = HashMap::<OsString, Aggregate>::new();
             let mut descendant_delta = Aggregate::default();
             let mut local_overflowed = false;
+            let mut top_entries = Vec::new();
+            // One child-set lookup per directory, not per hardlink candidate.
+            let mut descendant_seen = None;
 
             for child in children.iter_mut().filter_map(|entry| entry.as_mut().ok()) {
                 let mut metadata = None;
+                if depth == 0 && retain_metadata {
+                    match child.metadata() {
+                        Ok(value) => {
+                            metadata = Some(metadata_snapshot(&value));
+                            top_entries.push((child.file_name().to_os_string(), value));
+                        }
+                        Err(_) => {
+                            record_scan_error(&callback_errors);
+                            continue;
+                        }
+                    }
+                }
                 if child.file_type().is_dir()
                     && let Some(seen) = callback_followed_dirs.as_deref()
                 {
-                    let value = match child.metadata() {
-                        Ok(metadata) => metadata_snapshot(&metadata),
+                    let value = match metadata
+                        .take()
+                        .map(Ok)
+                        .unwrap_or_else(|| child.metadata().map(|m| metadata_snapshot(&m)))
+                    {
+                        Ok(metadata) => metadata,
                         Err(_) => {
                             record_scan_error(&callback_errors);
                             child.read_children_path = None;
@@ -240,28 +278,39 @@ pub fn scan_top_level(request: &ScanRequest) -> TopLevelScanSnapshot {
                 let owned_bucket = descendant_bucket
                     .is_none()
                     .then(|| child.file_name().to_os_string());
-                let bucket = descendant_bucket
-                    .as_ref()
-                    .or(owned_bucket.as_ref())
-                    .expect("root entries always provide an owned bucket");
                 let (root_includes_size, child_includes_size) = metadata
                     .as_ref()
                     .map(|metadata| {
+                        if metadata.is_hardlink_candidate()
+                            && metadata.kind != EntryKind::Directory
+                            && descendant_seen.is_none()
+                            && let Some(bucket) = descendant_bucket.as_ref()
+                        {
+                            descendant_seen =
+                                child_hardlink_set(bucket, callback_child_seen.as_deref());
+                        }
                         (
                             include_hardlink_size(
                                 metadata,
                                 callback_request.hardlinks,
                                 callback_root_seen.as_deref(),
                             ),
-                            include_child_hardlink_size(
+                            include_hardlink_size(
                                 metadata,
                                 callback_request.hardlinks,
-                                bucket,
-                                callback_child_seen.as_deref(),
+                                descendant_seen.as_deref(),
                             ),
                         )
                     })
                     .unwrap_or((false, false));
+
+                let child_includes_size = if depth == 0 {
+                    // Immediate files belong to distinct child totals. There is
+                    // nothing to deduplicate within that single-entry bucket.
+                    metadata.is_some()
+                } else {
+                    child_includes_size
+                };
 
                 local_overflowed |= add_entry_to_aggregate(
                     &mut root_delta,
@@ -289,6 +338,7 @@ pub fn scan_top_level(request: &ScanRequest) -> TopLevelScanSnapshot {
             }
 
             if let Ok(mut state) = callback_state.lock() {
+                state.top_entries.extend(top_entries);
                 state.overflowed |= local_overflowed;
                 state.overflowed |= merge_aggregate(&mut state.root, &root_delta);
                 if let Some(name) = descendant_bucket {
@@ -322,6 +372,7 @@ pub fn scan_top_level(request: &ScanRequest) -> TopLevelScanSnapshot {
                 root: state.root.clone(),
                 children: state.children.clone(),
                 overflowed: state.overflowed,
+                top_entries: state.top_entries.clone(),
             })
             .unwrap_or_default(),
     };
@@ -331,6 +382,7 @@ pub fn scan_top_level(request: &ScanRequest) -> TopLevelScanSnapshot {
         complete: error_count == 0,
         errors: error_count,
         overflowed: state.overflowed,
+        top_entries: retain_metadata.then_some(state.top_entries),
     }
 }
 
@@ -387,7 +439,7 @@ fn register_directory_identity(
 fn include_hardlink_size(
     metadata: &MetadataSnapshot,
     mode: HardlinkMode,
-    seen: Option<&Mutex<HashSet<HardlinkKey>>>,
+    seen: Option<&HardlinkSet>,
 ) -> bool {
     if mode == HardlinkMode::CountEveryEntry
         || metadata.kind == EntryKind::Directory
@@ -401,30 +453,20 @@ fn include_hardlink_size(
     let Some(seen) = seen else {
         return true;
     };
-    seen.lock().map(|mut seen| seen.insert(key)).unwrap_or(true)
+    seen.insert(key)
 }
 
-fn include_child_hardlink_size(
-    metadata: &MetadataSnapshot,
-    mode: HardlinkMode,
+fn child_hardlink_set(
     child: &OsString,
-    seen: Option<&Mutex<HashMap<OsString, HashSet<HardlinkKey>>>>,
-) -> bool {
-    if mode == HardlinkMode::CountEveryEntry
-        || metadata.kind == EntryKind::Directory
-        || !metadata.is_hardlink_candidate()
-    {
-        return true;
+    seen: Option<&Mutex<HashMap<OsString, Arc<HardlinkSet>>>>,
+) -> Option<Arc<HardlinkSet>> {
+    let mut seen = seen?.lock().ok()?;
+    if let Some(value) = seen.get(child) {
+        return Some(Arc::clone(value));
     }
-    let Some(key) = metadata.hardlink_key() else {
-        return true;
-    };
-    let Some(seen) = seen else {
-        return true;
-    };
-    seen.lock()
-        .map(|mut seen| seen.entry(child.clone()).or_default().insert(key))
-        .unwrap_or(true)
+    let value = Arc::new(HardlinkSet::default());
+    seen.insert(child.clone(), Arc::clone(&value));
+    Some(value)
 }
 
 fn add_metadata_to_aggregate(
@@ -714,6 +756,44 @@ fn _scan_duration_hint() -> Duration {
 mod tests {
     use super::*;
 
+    #[test]
+    fn listing_metadata_is_bounded_to_immediate_children() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("target/deep")).unwrap();
+        std::fs::write(temp.path().join("file"), b"12345").unwrap();
+        std::fs::write(temp.path().join("target/deep/nested"), b"123").unwrap();
+        let request = ScanRequest {
+            root: temp.path().into(),
+            count_files: true,
+            threads: 4,
+            ..ScanRequest::default()
+        };
+        let plain = scan_top_level(&request);
+        assert!(plain.top_entries.is_none());
+        let listing = scan_top_level_with_metadata(&request);
+        assert!(listing.complete);
+        assert_eq!(listing.root.files, 2);
+        let entries = listing.top_entries.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries
+                .iter()
+                .find(|(name, _)| name == "file")
+                .unwrap()
+                .1
+                .len(),
+            5
+        );
+        assert!(
+            entries
+                .iter()
+                .find(|(name, _)| name == "target")
+                .unwrap()
+                .1
+                .is_dir()
+        );
+    }
+
     fn file_metadata(logical_size: u64, allocated_size: u64) -> MetadataSnapshot {
         MetadataSnapshot {
             kind: EntryKind::File,
@@ -766,6 +846,7 @@ mod tests {
             root: merged,
             children: HashMap::new(),
             overflowed: overflowed || source.overflowed,
+            top_entries: Vec::new(),
         };
         let snapshot = TopLevelScanSnapshot {
             root: state.root,
@@ -773,6 +854,7 @@ mod tests {
             complete: true,
             errors: 0,
             overflowed: state.overflowed,
+            top_entries: None,
         };
         assert!(snapshot.overflowed);
         assert!(snapshot.root.overflowed);

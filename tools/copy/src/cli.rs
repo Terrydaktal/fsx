@@ -15,6 +15,7 @@ pub(crate) struct CliArgs {
     pub(crate) overwrite: bool,
     pub(crate) contents_only: bool,
     pub(crate) create_destination_parents: bool,
+    pub(crate) create_destination_directory: bool,
     pub(crate) backup: bool,
     pub(crate) sync_mode: bool,
     pub(crate) verify: bool,
@@ -75,6 +76,9 @@ pub(crate) fn print_help() {
     println!("                        In --move mode, source directories are removed if they become empty.");
     println!("  --create-destination-parents");
     println!("                        Create missing destination parent directories before planning the transfer.");
+    println!("  --create-destination-directory");
+    println!("                        Create destination and its parents as a container before planning (local only).");
+    println!("                        Source keeps its basename inside it. Empty directories remain after preview/cancellation.");
     println!(
         "                        The final destination target still follows the normal path rules."
     );
@@ -225,6 +229,7 @@ pub(crate) fn parse_args() -> Result<CliArgs, i32> {
             "-o" | "--overwrite" => args.overwrite = true,
             "-c" | "--contents-only" => args.contents_only = true,
             "--create-destination-parents" => args.create_destination_parents = true,
+            "--create-destination-directory" => args.create_destination_directory = true,
             "-b" | "--backup" => args.backup = true,
             "--sync" => args.sync_mode = true,
             "--verify" => args.verify = true,

@@ -1288,6 +1288,10 @@ pub(crate) fn write_stamp(path: &Path) {
     }
 }
 
+#[cfg(test)]
+#[path = "stats_tests.rs"]
+mod stats_tests;
+
 pub(crate) fn initialize_index_db() -> Result<Connection, String> {
     let path = index_db_path().ok_or_else(|| "Could not determine fsx cache dir".to_string())?;
     let custom_database = std::env::var_os("FSX_INDEX_DB").is_some();
@@ -1536,41 +1540,26 @@ pub(crate) fn initialize_index_db() -> Result<Connection, String> {
                     - CASE WHEN old.link_count IS NULL THEN 1 ELSE 0 END
             WHERE dir_id = old.dir_id;
         END;
-        CREATE TRIGGER IF NOT EXISTS entries_stats_au
-        AFTER UPDATE OF dir_id, kind, allocated_size, link_count ON entries BEGIN
-            UPDATE dir_stats SET
-                allocated_size = allocated_size - COALESCE(old.allocated_size, 0),
-                files = files - CASE WHEN old.kind <> 1 THEN 1 ELSE 0 END,
-                dirs = dirs - CASE WHEN old.kind = 1 THEN 1 ELSE 0 END,
-                missing_sizes = missing_sizes
-                    - CASE WHEN old.allocated_size IS NULL THEN 1 ELSE 0 END,
-                missing_hardlink_metadata = missing_hardlink_metadata
-                    - CASE WHEN old.link_count IS NULL THEN 1 ELSE 0 END
-            WHERE dir_id = old.dir_id;
-            INSERT INTO dir_stats(
-                dir_id, allocated_size, files, dirs, missing_sizes,
-                missing_hardlink_metadata
-            ) VALUES (
-                new.dir_id,
-                COALESCE(new.allocated_size, 0),
-                CASE WHEN new.kind <> 1 THEN 1 ELSE 0 END,
-                CASE WHEN new.kind = 1 THEN 1 ELSE 0 END,
-                CASE WHEN new.allocated_size IS NULL THEN 1 ELSE 0 END,
-                CASE WHEN new.link_count IS NULL THEN 1 ELSE 0 END
-            ) ON CONFLICT(dir_id) DO UPDATE SET
-                allocated_size = dir_stats.allocated_size + excluded.allocated_size,
-                files = dir_stats.files + excluded.files,
-                dirs = dir_stats.dirs + excluded.dirs,
-                missing_sizes = dir_stats.missing_sizes + excluded.missing_sizes,
-                missing_hardlink_metadata = dir_stats.missing_hardlink_metadata
-                    + excluded.missing_hardlink_metadata;
-        END;
         CREATE TRIGGER IF NOT EXISTS dirs_stats_ad AFTER DELETE ON dirs BEGIN
             DELETE FROM dir_stats WHERE dir_id = old.id;
         END;
         ",
     )
     .map_err(|e| e.to_string())?;
+    let delta_triggers_ready: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger'
+             AND name='entries_stats_au' AND instr(sql, 'fsx-net-delta-v2') > 0)
+         AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger'
+             AND name='entries_stats_au_move_v2')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if !delta_triggers_ready {
+        conn.execute_batch(include_str!("stats_update.sql"))
+            .map_err(|e| e.to_string())?;
+    }
     let direct_stats_version = conn
         .query_row(
             "SELECT value FROM index_meta WHERE key = 'dir_stats_version'",

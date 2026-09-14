@@ -28,6 +28,7 @@ rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 
 [dev-dependencies]
 criterion = "0.5.1"
+tempfile = "3"
 
 [[bench]]
 name = "fsx_primitives"

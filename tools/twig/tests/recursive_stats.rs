@@ -90,6 +90,10 @@ fn allocated_sum(paths: &[&Path]) -> u64 {
 }
 
 fn run_twig(root: &Path, flags: &[&str]) -> Output {
+    run_twig_paths(&[root], flags)
+}
+
+fn run_twig_paths(roots: &[&Path], flags: &[&str]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_twig"));
     command
         .args(flags)
@@ -103,10 +107,10 @@ fn run_twig(root: &Path, flags: &[&str]) -> Output {
             "never",
             "--hyperlink=never",
         ])
-        .arg(root)
+        .args(roots)
         // These are specifically live-traversal regressions. A nonexistent
         // read-only database prevents a running fsxd from changing the path.
-        .env("FSX_INDEX_DB", root.join(".missing-fsx-index.sqlite"));
+        .env("FSX_INDEX_DB", roots[0].join(".missing-fsx-index.sqlite"));
     command
         .output()
         .unwrap_or_else(|error| panic!("run twig: {error}"))
@@ -384,8 +388,58 @@ fn partial_live_scan_preserves_readable_child_and_fails_explicitly() {
         expected_row(readable_size, 1, 1)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("partial") || stderr.contains("incomplete"),
-        "partial scan lacked an explicit diagnostic: {stderr}"
+    assert_eq!(
+        stderr, "twig: recursive scan incomplete: 1 unreadable entry\n",
+        "partial scan must report its count exactly once"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn partial_scan_combines_error_counts_across_operands() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let fixture = Fixture::new("recursive-error-counts");
+    let first = fixture.root();
+    let second = fixture.path.join("second");
+    let blocked = [first.join("a"), first.join("b"), second.join("c")];
+    for path in &blocked {
+        fs::create_dir_all(path).unwrap();
+        // Unvisited descendants must not be guessed or added to the failure count.
+        write_allocated_file(&path.join("unvisited.bin"), 0xaa);
+        fs::set_permissions(path, fs::Permissions::from_mode(0o0)).unwrap();
+        if fs::read_dir(path).is_ok() {
+            return;
+        }
+    }
+
+    for flags in [vec![], vec!["-l"]] {
+        let output = run_twig(&first, &flags);
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            "twig: recursive scan incomplete: 2 unreadable entries\n"
+        );
+
+        let output = run_twig_paths(&[&first, &second], &flags);
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            "twig: recursive scan incomplete: 3 unreadable entries\n"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("root"), "first operand omitted: {stdout}");
+        assert!(
+            stdout.contains("second"),
+            "second operand omitted: {stdout}"
+        );
+    }
+
+    for path in &blocked {
+        make_tree_owner_accessible(path);
+    }
+    let output = run_twig_paths(&[&first, &second], &[]);
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
 }

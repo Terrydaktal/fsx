@@ -1,13 +1,9 @@
-use super::filesystem::{
-    get_dir_bytes_native_serial, get_dir_stats_native, normalize_dir_key,
-    should_skip_root_size_tree,
-};
+use super::filesystem::{get_dir_stats_native, normalize_dir_key, should_skip_root_size_tree};
 use super::model::{
     system_time_to_unix_nanos, ColorSpec, DirStats, DirStatsCache, HighlightSpec, Options,
     RawCacheState, SearchResult, SortField, SortOrder,
 };
 use chrono::{Datelike, Local};
-use rayon::prelude::*;
 use regex::{Regex, RegexBuilder};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -53,6 +49,22 @@ pub(crate) fn can_stream_direct(opts: &Options, use_style: bool) -> bool {
         && !opts.absolute_paths
         && !opts.lossless_paths
         && !opts.hyperlinks
+}
+
+/// These rows have no whole-result ordering/width dependency. The renderer is
+/// bounded; explicit raw-cache mode still retains its existing deduplication
+/// sets and must consume all matches even when the display is limited.
+pub(crate) fn can_stream_rendered(opts: &Options) -> bool {
+    !opts.counts
+        && opts.sort_field.is_none()
+        && !opts.long_format
+        && !opts.sizes
+        && !opts.reverse
+        && !opts.snapshot_cache
+        && !opts.snapshot_refresh
+        && !opts.absolute_paths
+        && !opts.index_binary
+        && opts.recent_limit.is_none()
 }
 pub(crate) fn format_size_iec(bytes: u64) -> String {
     fsx::format_size_iec(bytes)
@@ -114,32 +126,29 @@ pub(crate) fn precompute_dirsize_cache(
         .collect();
     needed_dirs.sort_by(|a, b| a.0.cmp(&b.0));
     needed_dirs.dedup_by(|a, b| a.0 == b.0);
-    if opts.long_extended {
-        for (dir, encoded) in needed_dirs {
-            if should_skip_root_size_tree(&dir) {
-                continue;
-            }
-            let _ = get_dirsize_stats(&dir, encoded, cache);
+    let mut keys = HashMap::<PathBuf, Vec<String>>::new();
+    for (dir, encoded) in needed_dirs {
+        if should_skip_root_size_tree(&dir)
+            || cache.map.contains_key(&dir)
+            || !opts.long_extended && cache.bytes_map.contains_key(&dir)
+        {
+            continue;
         }
-    } else {
-        let mut missing = Vec::new();
-        for (dir, encoded) in needed_dirs {
-            if should_skip_root_size_tree(&dir) {
-                continue;
-            }
-            if !cache.bytes_map.contains_key(&dir) && !cache.map.contains_key(&dir) {
-                missing.push((dir, encoded));
-            }
-        }
-        let computed: Vec<(String, u64)> = missing
-            .into_par_iter()
-            .map(|(dir, encoded)| {
-                let bytes = get_dir_bytes_native_serial(&result_path(&dir, encoded));
-                (dir, bytes)
-            })
-            .collect();
-        for (dir, bytes) in computed {
-            cache.bytes_map.insert(dir, bytes);
+        let path = fsx::path::full_path(&result_path(&dir, encoded));
+        keys.entry(path).or_default().push(dir);
+    }
+    let computed = super::aggregate::live_directory_stats(keys.keys().cloned().collect());
+    for (path, (bytes, files)) in computed {
+        for key in keys.remove(&path).unwrap_or_default() {
+            cache.bytes_map.insert(key.clone(), bytes);
+            cache.map.insert(
+                key,
+                DirStats {
+                    bytes,
+                    files,
+                    human: format_size_iec(bytes),
+                },
+            );
         }
     }
 }
@@ -177,34 +186,33 @@ pub(crate) fn sort_results(
         keyed.sort_by(compare);
         return keyed.into_iter().map(|(_, item)| item).collect();
     }
-    let mut compare = |a: &SearchResult, b: &SearchResult| {
-        let ord = match field {
-            SortField::Date => {
-                let da = result_activity_nanos(a).unwrap_or(0);
-                let db = result_activity_nanos(b).unwrap_or(0);
-                da.cmp(&db)
-            }
-            SortField::Size => {
-                let sa = size_bytes_for_result(a, opts, cache);
-                let sb = size_bytes_for_result(b, opts, cache);
-                sa.cmp(&sb)
-            }
-            SortField::Name => unreachable!("name sorting is handled above"),
-        };
+    let mut keyed: Vec<_> = items
+        .into_iter()
+        .map(|item| {
+            let key = match field {
+                SortField::Date => i128::from(result_activity_nanos(&item).unwrap_or(0)),
+                SortField::Size => i128::from(size_bytes_for_result(&item, opts, cache)),
+                SortField::Name => unreachable!("name sorting is handled above"),
+            };
+            (key, item)
+        })
+        .collect();
+    let compare = |a: &(i128, SearchResult), b: &(i128, SearchResult)| {
+        let ord = a.0.cmp(&b.0);
         let ordered = match order {
             SortOrder::Asc => ord,
             SortOrder::Desc => ord.reverse(),
         };
-        ordered.then_with(|| a.path.cmp(&b.path))
+        ordered.then_with(|| a.1.path.cmp(&b.1.path))
     };
     if let Some(limit) = opts.limit {
-        if limit < items.len() {
-            items.select_nth_unstable_by(limit, &mut compare);
-            items.truncate(limit);
+        if limit < keyed.len() {
+            keyed.select_nth_unstable_by(limit, compare);
+            keyed.truncate(limit);
         }
     }
-    items.sort_by(&mut compare);
-    items
+    keyed.sort_by(compare);
+    keyed.into_iter().map(|(_, item)| item).collect()
 }
 
 pub(crate) fn absolute_paths_transform(
@@ -288,10 +296,10 @@ pub(crate) fn get_dirsize_stats(
     cache: &mut DirStatsCache,
 ) -> Option<DirStats> {
     let key = normalize_dir_key(path);
-    let walk_path = result_path(&key, encoded);
     if let Some(v) = cache.map.get(&key) {
         return Some(v.clone());
     }
+    let walk_path = result_path(&key, encoded);
     let (bytes, files) = get_dir_stats_native(&walk_path, true);
     let stats = DirStats {
         files,
@@ -309,7 +317,6 @@ pub(crate) fn get_dirsize_bytes(
     cache: &mut DirStatsCache,
 ) -> Option<u64> {
     let key = normalize_dir_key(path);
-    let walk_path = result_path(&key, encoded);
     if let Some(v) = cache.bytes_map.get(&key) {
         return Some(*v);
     }
@@ -317,7 +324,7 @@ pub(crate) fn get_dirsize_bytes(
         cache.bytes_map.insert(key.clone(), v.bytes);
         return Some(v.bytes);
     }
-    let (bytes, _) = get_dir_stats_native(&walk_path, false);
+    let (bytes, _) = get_dir_stats_native(&result_path(&key, encoded), false);
     cache.bytes_map.insert(key, bytes);
     Some(bytes)
 }
@@ -783,6 +790,28 @@ pub(crate) fn final_transform(
     cache: &mut DirStatsCache,
     highlight: Option<&HighlightSpec>,
 ) -> Vec<String> {
+    final_transform_with_dirsizes(
+        items,
+        opts,
+        use_style,
+        stdout_is_tty,
+        colors,
+        cache,
+        highlight,
+        |_, _| {},
+    )
+}
+
+pub(crate) fn final_transform_with_dirsizes(
+    items: Vec<SearchResult>,
+    opts: &Options,
+    use_style: bool,
+    stdout_is_tty: bool,
+    colors: &ColorSpec,
+    cache: &mut DirStatsCache,
+    highlight: Option<&HighlightSpec>,
+    populate: impl FnOnce(&[SearchResult], &mut DirStatsCache),
+) -> Vec<String> {
     let items = absolute_paths_transform(items, opts);
     cache_transform(&items, opts);
     let mut render_cache = RenderCache::default();
@@ -802,17 +831,16 @@ pub(crate) fn final_transform(
         }
         return lines;
     }
-    let items = if opts.sort_field.is_none() {
-        if let Some(limit) = opts.limit {
-            items.into_iter().take(limit).collect()
-        } else {
-            items
-        }
+    let mut items = if opts.sort_field == Some(SortField::Size) {
+        populate(&items, cache);
+        precompute_dirsize_cache(&items, opts, cache);
+        sort_results(items, opts, cache)
     } else {
+        let items = sort_results(items, opts, cache);
+        populate(&items, cache);
+        precompute_dirsize_cache(&items, opts, cache);
         items
     };
-    precompute_dirsize_cache(&items, opts, cache);
-    let mut items = sort_results(items, opts, cache);
     if opts.reverse {
         items.reverse();
     }

@@ -69,6 +69,65 @@ fn base_opts() -> Options {
 }
 
 #[test]
+fn display_sizes_are_populated_only_after_name_or_date_top_k_selection() {
+    let colors = parse_ls_colors_value("");
+    for field in [SortField::Name, SortField::Date, SortField::Size] {
+        for limit in [0, 1, 3, 8] {
+            let mut opts = base_opts();
+            opts.sizes = true;
+            opts.sort_field = Some(field);
+            opts.sort_order = Some(SortOrder::Asc);
+            opts.limit = Some(limit);
+            let items: Vec<_> = (0..3)
+                .rev()
+                .map(|i| SearchResult {
+                    path: format!("/not-a-real-perf-fixture/d{i}"),
+                    path_encoded: false,
+                    is_dir: true,
+                    is_symlink: false,
+                    metadata: None,
+                    indexed_size: None,
+                    indexed_activity_nanos: Some(i),
+                })
+                .collect();
+            let mut populated = 0;
+            let lines = presentation::final_transform_with_dirsizes(
+                items,
+                &opts,
+                false,
+                false,
+                &colors,
+                &mut DirStatsCache::default(),
+                None,
+                |items, cache| {
+                    populated = items.len();
+                    for item in items {
+                        cache.bytes_map.insert(item.path.clone(), 8);
+                        cache.map.insert(
+                            item.path.clone(),
+                            DirStats {
+                                files: 1,
+                                bytes: 8,
+                                human: "8B".into(),
+                            },
+                        );
+                    }
+                },
+            );
+            assert_eq!(
+                populated,
+                if field == SortField::Size {
+                    3
+                } else {
+                    limit.min(3)
+                }
+            );
+            assert_eq!(lines.len(), limit.min(3));
+        }
+    }
+}
+
+#[test]
 fn incompatible_daemon_query_response_requests_local_fallback() {
     let (client, mut server) = UnixStream::pair().unwrap();
     server.write_all(b"UNRS0001").unwrap();
@@ -207,7 +266,6 @@ fn lossless_path_transport_round_trips_special_bytes() {
 fn scanned_index_entries_are_deduplicated_before_refresh() {
     let entry = |path: &str, kind| ScannedIndexEntry {
         path: path.to_string(),
-        raw_path: PathBuf::from(path),
         kind,
         mtime: Some(1),
         size: Some(2),
@@ -336,7 +394,7 @@ fn indexed_directory_stats_aggregate_complete_subtrees() {
 
     let mut opts = base_opts();
     opts.sizes = true;
-    let items = vec![SearchResult {
+    let mut items = vec![SearchResult {
         path: "/root/".to_string(),
         path_encoded: false,
         is_dir: true,
@@ -345,12 +403,26 @@ fn indexed_directory_stats_aggregate_complete_subtrees() {
         indexed_activity_nanos: None,
         indexed_size: None,
     }];
+    items.push(SearchResult {
+        path: "/root/nested/".into(),
+        path_encoded: false,
+        is_dir: true,
+        is_symlink: false,
+        metadata: None,
+        indexed_activity_nanos: None,
+        indexed_size: None,
+    });
     let mut cache = DirStatsCache::default();
 
     populate_indexed_dirsize_cache(&conn, "/root", &items, &opts, &mut cache).unwrap();
 
     assert_eq!(cache.bytes_map.get("/root"), Some(&12));
     assert_eq!(cache.map.get("/root").map(|stats| stats.files), Some(2));
+    assert_eq!(cache.bytes_map.get("/root/nested"), Some(&7));
+    assert_eq!(
+        cache.map.get("/root/nested").map(|stats| stats.files),
+        Some(1)
+    );
 }
 
 #[test]
@@ -462,7 +534,6 @@ fn index_diff_finds_additions_removals_and_kind_changes() {
     let scanned = vec![
         ScannedIndexEntry {
             path: "/root/added".to_string(),
-            raw_path: PathBuf::from("/root/added"),
             kind: 0,
             mtime: None,
             size: None,
@@ -474,7 +545,6 @@ fn index_diff_finds_additions_removals_and_kind_changes() {
         },
         ScannedIndexEntry {
             path: "/root/changed".to_string(),
-            raw_path: PathBuf::from("/root/changed"),
             kind: 1,
             mtime: None,
             size: None,
@@ -486,7 +556,6 @@ fn index_diff_finds_additions_removals_and_kind_changes() {
         },
         ScannedIndexEntry {
             path: "/root/kept".to_string(),
-            raw_path: PathBuf::from("/root/kept"),
             kind: 0,
             mtime: None,
             size: None,
@@ -550,7 +619,6 @@ fn index_diff_finds_additions_removals_and_kind_changes() {
 fn index_diff_detects_same_count_rename() {
     let scanned = vec![ScannedIndexEntry {
         path: "/root/new-name".to_string(),
-        raw_path: PathBuf::from("/root/new-name"),
         kind: 0,
         mtime: None,
         size: None,

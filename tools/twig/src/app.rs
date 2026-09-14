@@ -17,6 +17,13 @@ use std::io::{self, IsTerminal, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+fn recursive_scan_error(errors: u64) -> io::Error {
+    io::Error::other(format!(
+        "recursive scan incomplete: {errors} unreadable entr{}",
+        if errors == 1 { "y" } else { "ies" }
+    ))
+}
+
 pub(crate) fn sort_entries(entries: &mut [EntryInfo], ctx: &Context, reverse_sorted_output: bool) {
     entries.sort_unstable_by(|a, b| {
         match ctx.sort_by {
@@ -362,6 +369,7 @@ pub(crate) fn render_multiple_paths(cli: Cli) -> io::Result<()> {
     let mut group_cache: HashMap<u32, String> = HashMap::new();
     let mut entries = Vec::new();
     let mut first_error: Option<io::Error> = None;
+    let mut recursive_scan_errors = 0u64;
 
     let mut git_status_visible = false;
     let mut git_repo_visible = false;
@@ -411,7 +419,8 @@ pub(crate) fn render_multiple_paths(cli: Cli) -> io::Result<()> {
             counts: recursive_counts,
             root_size: root_true_size,
             root_counts: root_recursive_counts,
-            complete: recursive_complete,
+            scan_errors,
+            ..
         } = if is_actual_dir || (cli.dereference && is_target_dir) {
             collect_recursive_stats_checked(
                 &actual_path,
@@ -423,9 +432,7 @@ pub(crate) fn render_multiple_paths(cli: Cli) -> io::Result<()> {
         } else {
             RecursiveStats::default()
         };
-        if !recursive_complete {
-            first_error.get_or_insert_with(|| io::Error::other("recursive scan incomplete"));
-        }
+        recursive_scan_errors = recursive_scan_errors.saturating_add(scan_errors);
 
         let mut entry = create_entry_info(
             &display_name,
@@ -528,7 +535,13 @@ pub(crate) fn render_multiple_paths(cli: Cli) -> io::Result<()> {
         false,
         cache_raw_enabled,
     );
-    output_result.and_then(|()| first_error.map_or(Ok(()), Err))
+    output_result.and_then(|()| {
+        if recursive_scan_errors != 0 {
+            Err(recursive_scan_error(recursive_scan_errors))
+        } else {
+            first_error.map_or(Ok(()), Err)
+        }
+    })
 }
 
 pub(crate) fn render_path(cli: Cli) -> io::Result<()> {
@@ -562,7 +575,8 @@ pub(crate) fn render_path(cli: Cli) -> io::Result<()> {
         counts: recursive_counts,
         root_size: root_true_size,
         root_counts: root_recursive_counts,
-        complete: recursive_complete,
+        scan_errors: recursive_scan_errors,
+        top_entries,
     } = if stats_target_is_dir {
         collect_recursive_stats_checked(
             input_path,
@@ -595,10 +609,10 @@ pub(crate) fn render_path(cli: Cli) -> io::Result<()> {
     )? {
         let mut stdout = io::stdout().lock();
         stdout.write_all(output.as_bytes())?;
-        return if recursive_complete {
+        return if recursive_scan_errors == 0 {
             Ok(())
         } else {
-            Err(io::Error::other("recursive scan incomplete"))
+            Err(recursive_scan_error(recursive_scan_errors))
         };
     }
 
@@ -613,10 +627,10 @@ pub(crate) fn render_path(cli: Cli) -> io::Result<()> {
     )? {
         let mut stdout = io::stdout().lock();
         stdout.write_all(output.as_bytes())?;
-        return if recursive_complete {
+        return if recursive_scan_errors == 0 {
             Ok(())
         } else {
-            Err(io::Error::other("recursive scan incomplete"))
+            Err(recursive_scan_error(recursive_scan_errors))
         };
     }
 
@@ -663,26 +677,24 @@ pub(crate) fn render_path(cli: Cli) -> io::Result<()> {
     }
 
     if input_is_dir && !cli.no_traverse {
-        let read_dir = match fs::read_dir(&cli.path) {
-            Ok(v) => v,
-            Err(err) => return Err(err),
-        };
-
-        for dir_entry in read_dir {
-            let dir_entry = match dir_entry {
-                Ok(e) => e,
-                Err(_) => continue,
+        let metadata_entries: Box<dyn Iterator<Item = (OsString, fs::Metadata)>> =
+            if let Some(captured) = top_entries {
+                Box::new(captured.into_iter())
+            } else {
+                Box::new(fs::read_dir(&cli.path)?.filter_map(|entry| {
+                    let entry = entry.ok()?;
+                    let metadata = fs::symlink_metadata(entry.path()).ok()?;
+                    Some((entry.file_name(), metadata))
+                }))
             };
-            let file_name = dir_entry.file_name().to_string_lossy().to_string();
+
+        for (name, metadata) in metadata_entries {
+            let file_name = name.to_string_lossy().to_string();
             let is_hidden = file_name.starts_with('.');
             if is_hidden && !show_hidden {
                 continue;
             }
-            let entry_path = dir_entry.path();
-            let metadata = match fs::symlink_metadata(&entry_path) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
+            let entry_path = cli.path.join(name);
             let target_metadata = if metadata.file_type().is_symlink()
                 && (cli.dereference
                     || cli.dirs_only
@@ -785,10 +797,10 @@ pub(crate) fn render_path(cli: Cli) -> io::Result<()> {
         if cache_raw_enabled {
             write_cache_raw_paths(&[], &[])?;
         }
-        return if recursive_complete {
+        return if recursive_scan_errors == 0 {
             Ok(())
         } else {
-            Err(io::Error::other("recursive scan incomplete"))
+            Err(recursive_scan_error(recursive_scan_errors))
         };
     }
 
@@ -813,10 +825,10 @@ pub(crate) fn render_path(cli: Cli) -> io::Result<()> {
         cli.all && input_is_dir && pin_dot_entries,
         cache_raw_enabled,
     )?;
-    if recursive_complete {
+    if recursive_scan_errors == 0 {
         Ok(())
     } else {
-        Err(io::Error::other("recursive scan incomplete"))
+        Err(recursive_scan_error(recursive_scan_errors))
     }
 }
 

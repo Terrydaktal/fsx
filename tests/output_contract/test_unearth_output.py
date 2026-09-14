@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import re
+import os
+import secrets
 import tempfile
 import unittest
+from pathlib import Path
 
 try:
     from .harness import Fixture, osc8_links, output_lines, run_tool, strip_terminal_controls
@@ -38,6 +41,55 @@ class UnearthOutputContractTests(unittest.TestCase):
         }
         self.assertEqual(paths, expected, result.plain)
         self.assertNotIn(str(self.fixture.src / ".hidden"), paths)
+
+    def test_streamed_styles_match_buffered_rendering_and_limits(self) -> None:
+        for style in (["--color=always"], ["--color=never", "--classify"],
+                      ["--color=always", "--classify", "--hyperlink", "--highlight-match"]):
+            with self.subTest(style=style):
+                args = ["--live", *style, "a", self.fixture.src]
+                streamed = run_tool("unearth", args)
+                buffered = run_tool("unearth", ["--sort", "name", "asc", *args])
+                self.assertEqual(streamed.returncode, 0, streamed.plain)
+                self.assertEqual(buffered.returncode, 0, buffered.plain)
+                self.assertEqual(sorted(streamed.stdout.splitlines()), sorted(buffered.stdout.splitlines()))
+                zero = run_tool("unearth", ["--limit", "0", *args])
+                self.assertEqual(zero.returncode, 2, zero.plain)
+                for limit in (1, 2):
+                    limited = run_tool("unearth", ["--limit", str(limit), *args])
+                    self.assertEqual(limited.returncode, 0, limited.plain)
+                    self.assertEqual(len(limited.stdout.splitlines()), limit)
+                    self.assertNotIn("timed out", limited.stderr)
+
+    def test_streamed_raw_cache_keeps_all_matches_when_display_is_limited(self) -> None:
+        # Synthetic shell suffixes above Linux's PID range cannot overwrite an
+        # active shell's history. Only these exact two test files are removed.
+        suffix = 1_000_000_000 + secrets.randbelow(1_000_000_000)
+        user = re.sub(r"[^a-zA-Z0-9_-]", "_", os.environ.get("USER", "unknown")) or "unknown"
+        paths = [Path("/tmp") / f"fzf-history-{user}" / f"universal-last-{kind}-{suffix}"
+                 for kind in ("dirs", "files")]
+        self.assertFalse(any(path.exists() or path.is_symlink() for path in paths))
+        env = {"FISH_PID": str(suffix)}
+        args = ["--live", "--cache-raw", "--color=always", "--limit", "1", "a", self.fixture.src]
+        try:
+            buffered = run_tool("unearth", ["--sort", "name", "asc", *args], env=env)
+            self.assertEqual(buffered.returncode, 0, buffered.plain)
+            expected = [set(path.read_bytes().splitlines()) for path in paths]
+            self.assertGreater(len(expected[1]), 1)
+            streamed = run_tool("unearth", args, env=env)
+            self.assertEqual(streamed.returncode, 0, streamed.plain)
+            self.assertEqual(len(streamed.stdout.splitlines()), 1)
+            self.assertEqual([set(path.read_bytes().splitlines()) for path in paths], expected)
+        finally:
+            for path in paths:
+                if path.exists() or path.is_symlink():
+                    path.unlink()
+
+    def test_name_sort_preserves_special_file_classifiers(self) -> None:
+        pipe = self.fixture.src / "perf-pipe"
+        os.mkfifo(pipe)
+        result = run_tool("unearth", ["--live", "--classify", "--color=never", "--sort", "name", "asc", "perf-pipe", self.fixture.src])
+        self.assertEqual(result.returncode, 0, result.plain)
+        self.assertEqual(result.stdout.strip(), str(pipe) + "|")
 
     def test_full_regex_and_type_filters_are_composable(self) -> None:
         full = run_tool(

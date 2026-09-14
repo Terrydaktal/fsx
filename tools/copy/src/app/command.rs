@@ -85,6 +85,35 @@ pub(crate) fn run() -> i32 {
         return 1;
     }
 
+    if args.create_destination_directory {
+        if source_remote.is_some()
+            || destination_remote.is_some()
+            || contents_mode_requested
+            || args.sync_mode
+        {
+            log(requested_mode, "--create-destination-directory requires a local whole-source copy or move; it cannot be combined with --contents-only or --sync.", LogLevel::Error);
+            return 1;
+        }
+        // Include the final component in the existing symlink-ancestor check.
+        if let Err(code) = reject_symlink_parent_ancestors(
+            &destination_path.join(".copy-container-check"),
+            requested_mode,
+        ) {
+            return code;
+        }
+        if let Err(error) = std::fs::create_dir_all(&destination_path) {
+            log(
+                requested_mode,
+                &format!(
+                    "Could not create destination directory {}: {error}",
+                    destination_path.display()
+                ),
+                LogLevel::Error,
+            );
+            return 1;
+        }
+    }
+
     if (args.replace_dest_symlink || args.merge_collision_policy_explicit)
         && (use_sudo || source_remote.is_some() || destination_remote.is_some())
     {

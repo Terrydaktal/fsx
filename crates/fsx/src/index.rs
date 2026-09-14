@@ -75,7 +75,7 @@ pub fn query_recursive_stats_batch(
     root: &Path,
     dedupe_hardlinks: bool,
 ) -> Option<RecursiveStatsBatch> {
-    query_recursive_stats_batch_with_metrics(root, dedupe_hardlinks, true)
+    query_recursive_stats_batch_with_metrics(root, dedupe_hardlinks, true, None)
 }
 
 #[cfg(feature = "index")]
@@ -85,14 +85,45 @@ pub fn query_recursive_counts_batch(
     root: &Path,
     dedupe_hardlinks: bool,
 ) -> Option<RecursiveStatsBatch> {
-    query_recursive_stats_batch_with_metrics(root, dedupe_hardlinks, false)
+    query_recursive_stats_batch_with_metrics(root, dedupe_hardlinks, false, None)
 }
+
+#[cfg(feature = "index")]
+/// Retain only the live immediate-child metadata already visited for a listing.
+pub fn query_recursive_listing(
+    root: &Path,
+    dedupe_hardlinks: bool,
+    require_sizes: bool,
+) -> Option<(RecursiveStatsBatch, crate::metadata::TopLevelMetadata)> {
+    let mut entries = Vec::new();
+    let stats = query_recursive_stats_batch_with_metrics(
+        root,
+        dedupe_hardlinks,
+        require_sizes,
+        Some(&mut entries),
+    )?;
+    Some((stats, entries))
+}
+
+#[cfg(feature = "index")]
+const CHILD_STATS_QUERY: &str = "WITH subtree AS (
+    SELECT CASE WHEN d.path = ?1 THEN '' ELSE substr(d.path, length(?2) + 1) END AS relative,
+           s.allocated_size, s.files, s.dirs, s.missing_sizes, s.missing_hardlink_metadata
+    FROM dirs d LEFT JOIN dir_stats s ON s.dir_id = d.id
+    WHERE d.path = ?1 OR (d.path >= ?2 AND d.path < ?3)
+)
+SELECT CASE WHEN instr(relative, '/') = 0 THEN relative
+            ELSE substr(relative, 1, instr(relative, '/') - 1) END AS child,
+       COALESCE(SUM(allocated_size), 0), COALESCE(SUM(files), 0), COALESCE(SUM(dirs), 0),
+       COALESCE(SUM(missing_sizes), 0), COALESCE(SUM(missing_hardlink_metadata), 0)
+FROM subtree GROUP BY child";
 
 #[cfg(feature = "index")]
 fn query_recursive_stats_batch_with_metrics(
     root: &Path,
     dedupe_hardlinks: bool,
     require_sizes: bool,
+    mut top_entries: Option<&mut crate::metadata::TopLevelMetadata>,
 ) -> Option<RecursiveStatsBatch> {
     let root = std::fs::canonicalize(root).ok()?;
     let root_key = crate::path::encode_lossless_path(&root);
@@ -127,19 +158,7 @@ fn query_recursive_stats_batch_with_metrics(
         return None;
     }
 
-    let mut stmt = conn
-        .prepare(
-            "SELECT d.path,
-                    COALESCE(s.allocated_size, 0),
-                    COALESCE(s.files, 0),
-                    COALESCE(s.dirs, 0),
-                    COALESCE(s.missing_sizes, 0),
-                    COALESCE(s.missing_hardlink_metadata, 0)
-             FROM dirs d
-             LEFT JOIN dir_stats s ON s.dir_id = d.id
-             WHERE d.path = ?1 OR (d.path >= ?2 AND d.path < ?3)",
-        )
-        .ok()?;
+    let mut stmt = conn.prepare(CHILD_STATS_QUERY).ok()?;
     let rows = stmt
         .query_map(rusqlite::params![&root_key, &prefix, &prefix_end], |row| {
             Ok((
@@ -178,11 +197,11 @@ fn query_recursive_stats_batch_with_metrics(
         batch.root.dirs = batch.root.dirs.saturating_add(stats.dirs);
         missing_hardlink_metadata =
             missing_hardlink_metadata.saturating_add(missing_hardlinks as u64);
-        if path == root_key {
+        if path.is_empty() {
             saw_root = true;
             continue;
         }
-        let child_name = indexed_child_name(&path, &prefix)?;
+        let child_name = crate::path::decode_lossless_path(&path).into_os_string();
         let child = batch.children.entry(child_name).or_default();
         child.allocated_size = child.allocated_size.saturating_add(stats.allocated_size);
         child.files = child.files.saturating_add(stats.files);
@@ -200,22 +219,66 @@ fn query_recursive_stats_batch_with_metrics(
     batch.root.allocated_size = batch.root.allocated_size.saturating_add(root_size);
     batch.root.dirs = batch.root.dirs.saturating_add(1);
 
-    for entry in std::fs::read_dir(&root).ok()?.flatten() {
-        if !entry.file_type().ok()?.is_dir() {
+    for entry in std::fs::read_dir(&root).ok()? {
+        let entry = entry.ok()?;
+        let is_dir = entry.file_type().ok()?.is_dir();
+        if !is_dir && top_entries.is_none() {
             continue;
         }
         let metadata = std::fs::symlink_metadata(entry.path()).ok()?;
-        let child = batch.children.entry(entry.file_name()).or_default();
-        child.allocated_size = child
-            .allocated_size
-            .saturating_add(crate::metadata::allocated_size(&metadata));
-        child.dirs = child.dirs.saturating_add(1);
+        if is_dir {
+            let child = batch.children.entry(entry.file_name()).or_default();
+            child.allocated_size = child
+                .allocated_size
+                .saturating_add(crate::metadata::allocated_size(&metadata));
+            child.dirs = child.dirs.saturating_add(1);
+        }
+        if let Some(entries) = top_entries.as_deref_mut() {
+            entries.push((entry.file_name(), metadata));
+        }
     }
 
     if require_sizes && dedupe_hardlinks {
         deduct_duplicate_hardlinks(&conn, &root_key, &prefix, &prefix_end, &mut batch)?;
     }
     Some(batch)
+}
+
+#[cfg(feature = "index")]
+const HARDLINK_QUERY: &str = "SELECT d.path, e.device, e.inode, e.allocated_size
+    FROM dirs d
+    CROSS JOIN entries e INDEXED BY idx_entries_hardlink_candidates ON e.dir_id = d.id
+    WHERE e.link_count > 1 AND e.kind <> 1
+      AND (d.path = ?1 OR (d.path >= ?2 AND d.path < ?3))";
+
+#[cfg(feature = "index")]
+const CANDIDATE_FIRST_HARDLINK_QUERY: &str = "SELECT d.path, e.device, e.inode, e.allocated_size
+    FROM entries e INDEXED BY idx_entries_hardlink_candidates
+    CROSS JOIN dirs d ON d.id = e.dir_id
+    WHERE e.link_count > 1 AND e.kind <> 1
+      AND (d.path = ?1 OR (d.path >= ?2 AND d.path < ?3))";
+
+#[cfg(feature = "index")]
+fn hardlink_query(conn: &rusqlite::Connection, root: &str, directories: u64) -> &'static str {
+    if root == "/" {
+        return CANDIDATE_FIRST_HARDLINK_QUERY;
+    }
+    if directories >= 256 {
+        // Broad listings can contain millions of directories but only a few
+        // hardlinks. A bounded probe avoids replacing a cheap candidate walk
+        // with a lookup for every directory. Small subtrees need no probe.
+        let bound = directories.min(4096);
+        let candidates: rusqlite::Result<u64> = conn.query_row(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM entries INDEXED BY idx_entries_hardlink_candidates
+             WHERE link_count > 1 AND kind <> 1 LIMIT ?1)",
+            [bound + 1],
+            |row| row.get(0),
+        );
+        if candidates.is_ok_and(|count| count <= bound) {
+            return CANDIDATE_FIRST_HARDLINK_QUERY;
+        }
+    }
+    HARDLINK_QUERY
 }
 
 #[cfg(feature = "index")]
@@ -227,13 +290,7 @@ fn deduct_duplicate_hardlinks(
     batch: &mut RecursiveStatsBatch,
 ) -> Option<()> {
     let mut stmt = conn
-        .prepare(
-            "SELECT d.path, e.device, e.inode, e.allocated_size
-             FROM entries e INDEXED BY idx_entries_hardlink_candidates
-             CROSS JOIN dirs d ON d.id = e.dir_id
-             WHERE e.link_count > 1 AND e.kind <> 1
-               AND (d.path = ?1 OR (d.path >= ?2 AND d.path < ?3))",
-        )
+        .prepare(hardlink_query(conn, root, batch.root.dirs))
         .ok()?;
     let rows = stmt
         .query_map(rusqlite::params![root, prefix, prefix_end], |row| {
@@ -403,10 +460,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn grouped_stats_return_one_row_per_child_and_preserve_missing_metadata() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE dirs(id INTEGER PRIMARY KEY, path TEXT UNIQUE);
+            CREATE TABLE dir_stats(dir_id INTEGER PRIMARY KEY, allocated_size INTEGER, files INTEGER,
+            dirs INTEGER, missing_sizes INTEGER, missing_hardlink_metadata INTEGER);
+            INSERT INTO dirs VALUES(1, '/r'), (2, '/r/a'), (3, '/r/a/deep'), (4, '/r/ab'), (5, '/rr');
+            INSERT INTO dir_stats VALUES(1, 10, 1, 2, 0, 0), (2, 20, 2, 1, 0, 0),
+            (3, 30, 3, 0, 1, 2), (4, 40, 4, 0, 0, 0), (5, 999, 99, 99, 0, 0);").unwrap();
+        let mut statement = conn.prepare(CHILD_STATS_QUERY).unwrap();
+        let rows: Vec<_> = statement
+            .query_map(["/r", "/r/", "/r0"], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, u64>(2)?,
+                    row.get::<_, u64>(3)?,
+                    row.get::<_, u64>(4)?,
+                    row.get::<_, u64>(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("".into(), 10, 1, 2, 0, 0),
+                ("a".into(), 50, 5, 1, 1, 2),
+                ("ab".into(), 40, 4, 0, 0, 0)
+            ]
+        );
+    }
+
+    #[test]
     fn hardlinks_are_deduped_globally_and_per_child() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE dirs(id INTEGER PRIMARY KEY, path TEXT NOT NULL);
+            "CREATE TABLE dirs(id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
              CREATE TABLE entries(
                  dir_id INTEGER NOT NULL,
                  kind INTEGER NOT NULL,
@@ -428,6 +519,36 @@ mod tests {
                  (3, 0, 100, 8, 42, 3);",
         )
         .unwrap();
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {HARDLINK_QUERY}"))
+            .unwrap()
+            .query_map(["/root", "/root/", "/root0"], |row| row.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("SEARCH e") && step.contains("dir_id=?")),
+            "{plan:?}"
+        );
+        assert!(!plan.iter().any(|step| step.contains("SCAN e")), "{plan:?}");
+        assert_eq!(hardlink_query(&conn, "/root/a", 1), HARDLINK_QUERY);
+        assert_eq!(
+            hardlink_query(&conn, "/root", 1024),
+            CANDIDATE_FIRST_HARDLINK_QUERY
+        );
+        assert_eq!(
+            hardlink_query(&conn, "/", 1),
+            CANDIDATE_FIRST_HARDLINK_QUERY
+        );
+        let candidate_paths: Vec<String> = conn
+            .prepare(CANDIDATE_FIRST_HARDLINK_QUERY)
+            .unwrap()
+            .query_map(["/root", "/root/", "/root0"], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(candidate_paths, ["/root/a", "/root/a", "/root/b"]);
         let mut batch = RecursiveStatsBatch {
             root: RecursiveStats {
                 allocated_size: 300,

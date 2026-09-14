@@ -3,6 +3,7 @@ use std::time::Duration;
 #[cfg(feature = "watcher")]
 mod watcher;
 
+mod aggregate;
 mod cli;
 mod filesystem;
 #[cfg(feature = "index")]

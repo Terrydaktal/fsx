@@ -32,3 +32,6 @@ ntfs = "0.4.0"
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 memmap2 = "0.9"
 libc = { version = "0.2", optional = true }
+
+[dev-dependencies]
+tempfile = "3"

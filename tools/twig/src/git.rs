@@ -4,30 +4,15 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::process::{Command, Output};
+use std::time::Duration;
+
+mod output;
 
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 
-fn command_output_timeout(mut command: Command) -> std::io::Result<Output> {
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command.spawn()?;
-    let deadline = Instant::now() + GIT_COMMAND_TIMEOUT;
-    loop {
-        if child.try_wait()?.is_some() {
-            return child.wait_with_output();
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "git command timed out",
-            ));
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
+fn command_output_timeout(command: Command) -> std::io::Result<Output> {
+    output::capture(command, GIT_COMMAND_TIMEOUT)
 }
 
 pub(crate) fn populate_git_columns(

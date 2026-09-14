@@ -59,6 +59,37 @@ def find_backups(parent, base_name):
 
 
 class CopyCliIntegrationTests(unittest.TestCase):
+    def test_create_destination_directory_keeps_source_basename(self):
+        for move in (False, True):
+            with self.subTest(move=move), tempfile.TemporaryDirectory() as td:
+                src = Path(td) / "original"
+                dst = Path(td) / "missing" / "container"
+                write_file(src / "data", "contents")
+                args = ["--create-destination-directory", str(src), str(dst)]
+                if move:
+                    args.insert(0, "--move")
+                rc, out, _ = run_copy(args, confirm=True)
+                self.assertEqual(rc, 0, out)
+                self.assertEqual((dst / "original" / "data").read_text(), "contents")
+                self.assertEqual(src.exists(), not move)
+
+    def test_create_destination_directory_preview_and_file_conflict(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "original"
+            dst = Path(td) / "container"
+            write_file(src, "contents")
+            rc, out, _ = run_copy(["--create-destination-directory", "--preview", str(src), str(dst)])
+            self.assertEqual(rc, 0, out)
+            self.assertTrue(dst.is_dir())
+            self.assertFalse((dst / src.name).exists())
+            self.assertIn(src.name, out)
+            conflict = Path(td) / "conflict"
+            write_file(conflict, "keep")
+            rc, out, _ = run_copy(["--create-destination-directory", str(src), str(conflict)], confirm=True)
+            self.assertNotEqual(rc, 0, out)
+            self.assertEqual(conflict.read_text(), "keep")
+            self.assertTrue(src.exists())
+
     def test_help_includes_expected_aliases(self):
         rc, out, _ = run_copy(["--help"])
         self.assertEqual(rc, 0)
@@ -241,7 +272,10 @@ class CopyCliIntegrationTests(unittest.TestCase):
             dst = Path(td) / "dst"
             dst.mkdir(parents=True, exist_ok=True)
             vfs = os.statvfs(dst)
-            required_bytes = (vfs.f_bavail * vfs.f_frsize) + 1
+            # A single byte above *current* free space races with unrelated
+            # deletion/writeback. Above total capacity is deterministically
+            # insufficient while still cheap to represent as a sparse file.
+            required_bytes = (vfs.f_blocks * vfs.f_frsize) + 1
             with src.open("wb") as fh:
                 try:
                     fh.truncate(required_bytes)
@@ -954,6 +988,50 @@ class CopyCliIntegrationTests(unittest.TestCase):
             self.assertIn("Fast-path rename on same filesystem", out)
             self.assertFalse(src.exists(), out)
             self.assertTrue((dst / "a.txt").exists(), out)
+
+    def test_move_renames_directory_with_unreadable_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "old"
+            dst = Path(td) / "tasks" / "renamed"
+            dst.parent.mkdir()
+            locked = src / "capture.data"
+            write_file(locked, "preserved capture\n")
+            inode = locked.stat().st_ino
+            locked.chmod(0)
+            try:
+                rc, out, _ = run_copy(["--move", str(src), str(dst)], confirm=True)
+                self.assertEqual(rc, 0, out)
+                self.assertIn("Fast-path rename on same filesystem", out)
+                self.assertFalse(src.exists())
+                self.assertEqual((dst / locked.name).stat().st_ino, inode)
+                self.assertEqual((dst / locked.name).stat().st_mode & 0o777, 0)
+            finally:
+                for path in (locked, dst / locked.name):
+                    if path.exists():
+                        path.chmod(0o600)
+            self.assertEqual((dst / locked.name).read_text(), "preserved capture\n")
+
+    def test_move_merge_rejects_unreadable_file_before_mutation(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src"
+            dst = Path(td) / "dest"
+            write_file(src / "locked", "source")
+            write_file(src / "new", "new")
+            write_file(dst / "src" / "locked", "destination")
+            locked = src / "locked"
+            locked.chmod(0)
+            try:
+                if os.access(locked, os.R_OK):
+                    self.skipTest("requires enforced file permissions")
+                rc, out, _ = run_copy(["--move", str(src), str(dst)], confirm=True)
+                self.assertEqual(rc, 1, out)
+                self.assertIn("Source-read preflight failed", out)
+                self.assertNotIn("Proceed with move?", out)
+                self.assertTrue((src / "new").exists())
+                self.assertFalse((dst / "src" / "new").exists())
+                self.assertEqual((dst / "src" / "locked").read_text(), "destination")
+            finally:
+                locked.chmod(0o600)
 
     def test_move_empty_directory_rename_uses_fastpath_not_cleanup_only(self):
         with tempfile.TemporaryDirectory() as td:

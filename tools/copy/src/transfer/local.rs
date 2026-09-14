@@ -3,7 +3,7 @@
 
 use super::content::regular_file_contents_equal;
 use super::copy_engine::{
-    copy_file_preserve_atomic_with_progress_buf, copy_file_preserve_with_progress_buf,
+    copy_file_preserve_atomic_with_progress_buffer, copy_file_preserve_with_progress_buffer,
     copy_hardlink_atomic, copy_symlink_atomic, ensure_directory_target, interrupted,
     preserve_directory_times_tree, verify_regular_file_pair,
 };
@@ -21,8 +21,8 @@ use crate::plan::{
     regular_file_relation_change, rel_matches_prefix,
 };
 use crate::runtime::{
-    acquire_file_write_permit, copy_chunk_bytes_for_media, inflight_max_bytes_for_media,
-    symlink_targets_equal, transfer_profile_key,
+    acquire_file_write_permit, inflight_max_bytes_for_media, symlink_targets_equal,
+    transfer_profile_key,
 };
 use jwalk::WalkDir;
 use rayon::prelude::*;
@@ -68,7 +68,7 @@ pub(crate) fn run_rust_transfer(
     super::copy_engine::install_interrupt_handler();
     let done = Arc::new(AtomicU64::new(0));
     let transfer_errors = Arc::new(Mutex::new(None::<String>));
-    let copy_buf_bytes = copy_chunk_bytes_for_media(media);
+    let mut copy_buffer = Vec::new();
     let inflight_limiter = inflight_max_bytes_for_media(media)
         .map(InflightWriteLimiter::new)
         .map(Arc::new);
@@ -346,15 +346,21 @@ pub(crate) fn run_rust_transfer(
                 let _permit =
                     acquire_file_write_permit(inflight_limiter.as_ref(), src_meta.len(), media);
                 let copy_result = if dst_is_symlink && !replace_dest_symlink {
-                    copy_file_preserve_with_progress_buf(src, dst, copy_buf_bytes, |n| {
-                        done.fetch_add(n, Ordering::Relaxed);
-                    })
-                } else {
-                    copy_file_preserve_atomic_with_progress_buf(
+                    copy_file_preserve_with_progress_buffer(
                         src,
                         dst,
                         media,
-                        copy_buf_bytes,
+                        &mut copy_buffer,
+                        |n| {
+                            done.fetch_add(n, Ordering::Relaxed);
+                        },
+                    )
+                } else {
+                    copy_file_preserve_atomic_with_progress_buffer(
+                        src,
+                        dst,
+                        media,
+                        &mut copy_buffer,
                         |n| {
                             done.fetch_add(n, Ordering::Relaxed);
                         },
@@ -449,7 +455,7 @@ pub(crate) fn run_rust_transfer(
                     .copy_files
                     .par_iter()
                     .enumerate()
-                    .map(|(file_index, entry)| {
+                    .map_init(Vec::new, |buffer, (file_index, entry)| {
                         let src_file = entry.source_path.clone().unwrap_or_else(|| {
                             entry
                                 .relative_path
@@ -651,21 +657,22 @@ pub(crate) fn run_rust_transfer(
                                 media,
                             );
                             let result = if sync_mode || replace_dest_symlink || !dst_is_symlink {
-                                copy_file_preserve_atomic_with_progress_buf(
+                                copy_file_preserve_atomic_with_progress_buffer(
                                     &src_file,
                                     &dst_item,
                                     media,
-                                    copy_buf_bytes,
+                                    buffer,
                                     |n| {
                                         done.fetch_add(n, Ordering::Relaxed);
                                     },
                                 )
                                 .map(|_| ())
                             } else {
-                                copy_file_preserve_with_progress_buf(
+                                copy_file_preserve_with_progress_buffer(
                                     &src_file,
                                     &dst_item,
-                                    copy_buf_bytes,
+                                    media,
+                                    buffer,
                                     |n| {
                                         done.fetch_add(n, Ordering::Relaxed);
                                     },
@@ -839,20 +846,21 @@ pub(crate) fn run_rust_transfer(
                         let _permit =
                             acquire_file_write_permit(inflight_limiter.as_ref(), md.len(), media);
                         let copy_result = if dst_is_symlink && !replace_dest_symlink {
-                            copy_file_preserve_with_progress_buf(
+                            copy_file_preserve_with_progress_buffer(
                                 &p,
                                 &dst_item,
-                                copy_buf_bytes,
+                                media,
+                                &mut copy_buffer,
                                 |n| {
                                     done.fetch_add(n, Ordering::Relaxed);
                                 },
                             )
                         } else {
-                            copy_file_preserve_atomic_with_progress_buf(
+                            copy_file_preserve_atomic_with_progress_buffer(
                                 &p,
                                 &dst_item,
                                 media,
-                                copy_buf_bytes,
+                                &mut copy_buffer,
                                 |n| {
                                     done.fetch_add(n, Ordering::Relaxed);
                                 },

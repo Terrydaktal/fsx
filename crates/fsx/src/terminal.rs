@@ -48,19 +48,22 @@ pub fn dim_text(text: &str, enabled: bool) -> String {
 
 pub fn encode_file_uri_path(path: &std::path::Path) -> Option<String> {
     let absolute = if path.is_absolute() {
-        path.to_path_buf()
+        Cow::Borrowed(path)
     } else {
-        crate::path::full_path(path)
+        Cow::Owned(crate::path::full_path(path))
     };
     #[cfg(unix)]
     use std::os::unix::ffi::OsStrExt;
     #[cfg(unix)]
-    let bytes = absolute.as_os_str().as_bytes().to_vec();
+    let bytes = absolute.as_os_str().as_bytes();
     #[cfg(not(unix))]
-    let bytes = absolute.to_string_lossy().as_bytes().to_vec();
-    let mut uri = String::from("file://");
+    let text = absolute.to_string_lossy();
+    #[cfg(not(unix))]
+    let bytes = text.as_bytes();
+    let mut uri = String::with_capacity(7 + bytes.len());
+    uri.push_str("file://");
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    for byte in bytes {
+    for &byte in bytes {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
                 uri.push(byte as char)
@@ -77,9 +80,10 @@ pub fn encode_file_uri_path(path: &std::path::Path) -> Option<String> {
 
 #[derive(Default)]
 pub struct HyperlinkCache {
-    encoded_paths: HashMap<PathBuf, String>,
     encoded_parent_paths: HashMap<PathBuf, String>,
 }
+
+const MAX_CACHED_PARENTS: usize = 256;
 
 impl HyperlinkCache {
     /// Link a visible entry directly to itself. Directory links must remain
@@ -160,6 +164,11 @@ impl HyperlinkCache {
             uri.clone()
         } else {
             let uri = encode_file_uri_path(parent)?;
+            // Leaf paths are generally rendered once. Only retain reusable
+            // parents, with a fixed bound even for a streamed whole-disk search.
+            if self.encoded_parent_paths.len() >= MAX_CACHED_PARENTS {
+                self.encoded_parent_paths.clear();
+            }
             self.encoded_parent_paths
                 .insert(parent.to_path_buf(), uri.clone());
             uri
@@ -171,17 +180,7 @@ impl HyperlinkCache {
     }
 
     fn encoded_path(&mut self, path: &Path) -> Option<String> {
-        if let Some(uri) = self.encoded_paths.get(path) {
-            return Some(uri.clone());
-        }
-        let uri = encode_file_uri_path(path)?;
-        self.encoded_paths.insert(path.to_path_buf(), uri.clone());
-        if let Some(parent) = path.parent() {
-            self.encoded_parent_paths
-                .entry(parent.to_path_buf())
-                .or_insert_with(|| encode_file_uri_path(parent).unwrap_or_default());
-        }
-        Some(uri)
+        encode_file_uri_path(path)
     }
 }
 
@@ -212,6 +211,18 @@ fn osc8_wrap_close() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unique_links_do_not_accumulate_leaf_paths_or_unbounded_parents() {
+        let mut cache = HyperlinkCache::default();
+        for i in 0..10_000 {
+            let path = PathBuf::from(format!("/tmp/parent-{i}/file #"));
+            let direct = cache.direct_link(&path, "file");
+            assert!(direct.contains("/file%20%23"));
+            cache.select_link(&path, "file");
+            assert!(cache.encoded_parent_paths.len() <= MAX_CACHED_PARENTS);
+        }
+    }
 
     #[test]
     fn direct_directory_link_targets_the_directory_itself() {

@@ -123,7 +123,6 @@ pub(crate) enum DestinationKind {
 #[derive(Clone)]
 pub(crate) struct DestinationEntry {
     pub(crate) relative_path: PathBuf,
-    pub(crate) display_rel: String,
     pub(crate) kind: DestinationKind,
     pub(crate) size: u64,
     pub(crate) dev: u64,
@@ -183,7 +182,6 @@ pub(crate) fn build_destination_index(destination_root: &Path) -> DestinationInd
             continue;
         }
         let rel = lossless_rel(&relative_path);
-        let display_rel = display_rel_path(&relative_path);
 
         let fty = ent.file_type();
         if fty.is_file() {
@@ -200,7 +198,6 @@ pub(crate) fn build_destination_index(destination_root: &Path) -> DestinationInd
                 rel,
                 DestinationEntry {
                     relative_path,
-                    display_rel,
                     kind: DestinationKind::Regular,
                     size,
                     dev: metadata.dev(),
@@ -221,7 +218,6 @@ pub(crate) fn build_destination_index(destination_root: &Path) -> DestinationInd
                 rel,
                 DestinationEntry {
                     relative_path,
-                    display_rel,
                     kind: DestinationKind::Directory,
                     size: 0,
                     dev: metadata.dev(),
@@ -242,7 +238,6 @@ pub(crate) fn build_destination_index(destination_root: &Path) -> DestinationInd
                 rel,
                 DestinationEntry {
                     relative_path,
-                    display_rel,
                     kind: DestinationKind::Symlink,
                     size: 0,
                     dev: 0,
@@ -934,16 +929,10 @@ pub(crate) fn pre_scan_directory(
         }
         out.source_display_paths = source_display_paths;
     }
-    let source_rel_dirs: FxHashSet<String> = dirs
-        .iter()
-        .map(|entry| entry.identity_rel.clone())
-        .collect();
-    let source_display_dirs: FxHashSet<String> =
-        dirs.iter().map(|entry| entry.rel.clone()).collect();
-    let source_rel_files: FxHashSet<String> = if sync_mode {
+    let source_rel_files: FxHashSet<Arc<str>> = if sync_mode {
         files
             .iter()
-            .map(|entry| entry.identity_rel.to_string())
+            .map(|entry| Arc::clone(&entry.identity_rel))
             .collect()
     } else {
         FxHashSet::default()
@@ -974,6 +963,12 @@ pub(crate) fn pre_scan_directory(
             entry.identity_rel.clone(),
         )
     });
+    let source_rel_dirs: FxHashSet<&str> = dirs
+        .iter()
+        .map(|entry| entry.identity_rel.as_str())
+        .collect();
+    let source_display_dirs: FxHashSet<&str> =
+        dirs.iter().map(|entry| entry.rel.as_str()).collect();
 
     for entry in &dirs {
         let identity_rel = &entry.identity_rel;
@@ -1010,15 +1005,6 @@ pub(crate) fn pre_scan_directory(
     }
 
     let source_dir_count = dirs.len();
-    let mut manifest_dirs = if build_manifest {
-        Some(
-            dirs.iter()
-                .map(|entry| entry.identity_rel.clone())
-                .collect(),
-        )
-    } else {
-        None
-    };
 
     type FileReduce = (
         u64,
@@ -1043,7 +1029,7 @@ pub(crate) fn pre_scan_directory(
         planned_change_count,
         file_relation_breakdown,
     ): FileReduce = files
-        .par_iter()
+        .into_par_iter()
         .fold(
             || {
                 (
@@ -1235,9 +1221,9 @@ pub(crate) fn pre_scan_directory(
                     }
                     if build_manifest {
                         acc.4.push(ManifestFileEntry {
-                            rel: rel.clone(),
-                            source_path: src_file.clone(),
-                            relative_path: Some(entry.relative_path.clone()),
+                            rel: entry.rel,
+                            source_path: entry.source_path,
+                            relative_path: Some(entry.relative_path),
                             size,
                             dev: entry.dev,
                             ino: entry.ino,
@@ -1248,9 +1234,9 @@ pub(crate) fn pre_scan_directory(
                     }
                 } else if build_manifest && retain_identical_manifest {
                     acc.5.push(ManifestFileEntry {
-                        rel: rel.clone(),
-                        source_path: src_file.clone(),
-                        relative_path: Some(entry.relative_path.clone()),
+                        rel: entry.rel,
+                        source_path: entry.source_path,
+                        relative_path: Some(entry.relative_path),
                         size,
                         dev: entry.dev,
                         ino: entry.ino,
@@ -1366,11 +1352,12 @@ pub(crate) fn pre_scan_directory(
         if let Some(idx) = destination_index.as_ref() {
             for (rel, entry) in &idx.entries {
                 if entry.kind == DestinationKind::Regular
-                    && !source_rel_files.contains(rel)
-                    && !source_rel_dirs.contains(rel)
+                    && !source_rel_files.contains(rel.as_str())
+                    && !source_rel_dirs.contains(rel.as_str())
                 {
+                    let entry_display = display_rel_path(&entry.relative_path);
                     sync_delete_files.push(ManifestDeleteEntry {
-                        rel: Arc::from(entry.display_rel.as_str()),
+                        rel: Arc::from(entry_display.as_str()),
                         relative_path: entry.relative_path.clone(),
                         size: entry.size,
                         dev: entry.dev,
@@ -1380,7 +1367,7 @@ pub(crate) fn pre_scan_directory(
                         link_target: entry.link_target.clone(),
                     });
                     let display_rel =
-                        map_display_rel(include_root, &src_base_display, &entry.display_rel);
+                        map_display_rel(include_root, &src_base_display, &entry_display);
                     insert_preview_change(
                         &mut directory_preview_changes,
                         display_rel,
@@ -1391,11 +1378,12 @@ pub(crate) fn pre_scan_directory(
             }
             for (rel, entry) in &idx.entries {
                 if entry.kind == DestinationKind::Symlink
-                    && !source_rel_files.contains(rel)
-                    && !source_rel_dirs.contains(rel)
+                    && !source_rel_files.contains(rel.as_str())
+                    && !source_rel_dirs.contains(rel.as_str())
                 {
+                    let entry_display = display_rel_path(&entry.relative_path);
                     sync_delete_files.push(ManifestDeleteEntry {
-                        rel: Arc::from(entry.display_rel.as_str()),
+                        rel: Arc::from(entry_display.as_str()),
                         relative_path: entry.relative_path.clone(),
                         size: 0,
                         dev: 0,
@@ -1405,7 +1393,7 @@ pub(crate) fn pre_scan_directory(
                         link_target: entry.link_target.clone(),
                     });
                     let display_rel =
-                        map_display_rel(include_root, &src_base_display, &entry.display_rel);
+                        map_display_rel(include_root, &src_base_display, &entry_display);
                     insert_preview_change(
                         &mut directory_preview_changes,
                         display_rel,
@@ -1416,18 +1404,19 @@ pub(crate) fn pre_scan_directory(
             }
             for (rel, entry) in &idx.entries {
                 if entry.kind == DestinationKind::Directory
-                    && !source_rel_dirs.contains(rel)
-                    && !source_rel_files.contains(rel)
+                    && !source_rel_dirs.contains(rel.as_str())
+                    && !source_rel_files.contains(rel.as_str())
                 {
+                    let entry_display = display_rel_path(&entry.relative_path);
                     sync_delete_dirs.push(ManifestDeleteDirEntry {
-                        rel: entry.display_rel.clone(),
+                        rel: entry_display.clone(),
                         relative_path: entry.relative_path.clone(),
                         dev: entry.dev,
                         ino: entry.ino,
                     });
                     let display_rel = format!(
                         "{}/",
-                        map_display_rel(include_root, &src_base_display, &entry.display_rel)
+                        map_display_rel(include_root, &src_base_display, &entry_display)
                             .trim_end_matches('/')
                     );
                     insert_preview_change(
@@ -1468,26 +1457,25 @@ pub(crate) fn pre_scan_directory(
     out.file_relation_breakdown = file_relation_breakdown;
 
     if build_manifest {
-        if let Some(d) = manifest_dirs.take() {
-            manifest_copy_files.sort_by(|a, b| a.rel.cmp(&b.rel));
-            if retain_identical_manifest {
-                manifest_identical_files.sort_by(|a, b| a.rel.cmp(&b.rel));
-            }
-            dir_times.sort_by_cached_key(|entry| {
-                (
-                    std::cmp::Reverse(entry.rel.bytes().filter(|byte| *byte == b'/').count()),
-                    entry.rel.clone(),
-                )
-            });
-            out.transfer_manifest = Some(TransferManifest {
-                dirs: d,
-                dir_times,
-                copy_files: manifest_copy_files,
-                identical_files: manifest_identical_files,
-                sync_delete_files,
-                sync_delete_dirs,
-            });
+        let manifest_dirs = dirs.into_iter().map(|entry| entry.identity_rel).collect();
+        manifest_copy_files.sort_by(|a, b| a.rel.cmp(&b.rel));
+        if retain_identical_manifest {
+            manifest_identical_files.sort_by(|a, b| a.rel.cmp(&b.rel));
         }
+        dir_times.sort_by_cached_key(|entry| {
+            (
+                std::cmp::Reverse(entry.rel.bytes().filter(|byte| *byte == b'/').count()),
+                entry.rel.clone(),
+            )
+        });
+        out.transfer_manifest = Some(TransferManifest {
+            dirs: manifest_dirs,
+            dir_times,
+            copy_files: manifest_copy_files,
+            identical_files: manifest_identical_files,
+            sync_delete_files,
+            sync_delete_dirs,
+        });
     }
 
     out

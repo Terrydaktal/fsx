@@ -37,6 +37,9 @@ pub struct HardlinkKey {
     pub inode: u64,
 }
 
+/// Live metadata retained only for immediate children of a listing root.
+pub type TopLevelMetadata = Vec<(std::ffi::OsString, std::fs::Metadata)>;
+
 #[derive(Clone, Debug)]
 pub struct MetadataSnapshot {
     pub kind: EntryKind,

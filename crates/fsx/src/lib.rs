@@ -13,6 +13,7 @@ pub mod error;
 pub mod format;
 #[cfg(feature = "git")]
 pub mod git;
+pub mod hierarchy;
 #[cfg(feature = "ignore")]
 pub mod ignore;
 #[cfg(feature = "index")]

@@ -15,3 +15,5 @@ __pycache__/
 .DS_Store
 *.swp
 *.swo
+# Runtime trash is user data, not repository content.
+/trash/

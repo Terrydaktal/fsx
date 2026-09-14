@@ -17,15 +17,15 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use jwalk::{Parallelism, WalkDir};
+use jwalk::WalkDir;
 use rayon::prelude::*;
-use rayon::ThreadPoolBuilder;
 
 mod protocol;
 mod query;
 mod refresh;
 mod snapshot;
 mod storage;
+mod workers;
 
 pub(crate) use protocol::*;
 pub(crate) use query::*;

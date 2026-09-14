@@ -785,6 +785,7 @@ fn collect_recursive_stats_legacy(
             dedupe_hardlinks,
             need_sizes,
             need_counts,
+            &mut None,
         )
     {
         report_recursive_stats_overflow(&indexed);
@@ -1047,17 +1048,16 @@ fn collect_recursive_stats_from_index(
     dedupe_hardlinks: bool,
     need_sizes: bool,
     need_counts: bool,
+    top_entries: &mut Option<fsx::scan::TopLevelMetadata>,
 ) -> Option<(
     HashMap<OsString, u64>,
     HashMap<OsString, (u64, u64)>,
     Option<u64>,
     Option<(u64, u64)>,
 )> {
-    let batch = if need_sizes {
-        fsx::index::query_recursive_stats_batch(base_path, dedupe_hardlinks)?
-    } else {
-        fsx::index::query_recursive_counts_batch(base_path, false)?
-    };
+    let (batch, entries) =
+        fsx::index::query_recursive_listing(base_path, dedupe_hardlinks, need_sizes)?;
+    *top_entries = Some(entries);
     let root = batch.root;
     let mut sizes = HashMap::new();
     let mut counts = HashMap::new();
@@ -1083,6 +1083,7 @@ fn collect_recursive_stats_from_index(
     _dedupe_hardlinks: bool,
     _need_sizes: bool,
     _need_counts: bool,
+    _top_entries: &mut Option<fsx::scan::TopLevelMetadata>,
 ) -> Option<(
     HashMap<OsString, u64>,
     HashMap<OsString, (u64, u64)>,

@@ -6,7 +6,7 @@ use jwalk::WalkDir;
 use lscolors::LsColors;
 use rustc_hash::FxBuildHasher;
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::Metadata;
 use std::io::{self, Write};
@@ -1193,6 +1193,8 @@ fn perform_shallow_size_scan(
     }
 }
 
+mod aggregation;
+
 fn perform_unified_scan(
     root: &Path,
     args: &Args,
@@ -1204,19 +1206,7 @@ fn perform_unified_scan(
 ) -> ScanResult {
     let dir_children = Arc::new(DashMap::with_hasher(FxBuildHasher::default()));
     let collect_recursive_sizes = args.sizes;
-    let collect_recursive_file_counts = args.counts;
-    let collect_recursive_dir_counts = args.counts;
-    let dir_local_sizes = if collect_recursive_sizes {
-        Some(Arc::new(DashMap::with_hasher(FxBuildHasher::default())))
-    } else {
-        None
-    };
-    let dir_local_file_counts = if collect_recursive_file_counts {
-        Some(Arc::new(DashMap::with_hasher(FxBuildHasher::default())))
-    } else {
-        None
-    };
-    let dir_local_dir_counts = if collect_recursive_dir_counts {
+    let dir_totals = if args.sizes || args.counts {
         Some(Arc::new(DashMap::with_hasher(FxBuildHasher::default())))
     } else {
         None
@@ -1246,27 +1236,20 @@ fn perform_unified_scan(
     // does not retain an inode for every ordinary file.
     let visible_inode_sets: VisibleInodeSets = Arc::new(DashMap::new());
 
-    // Seed root size and file-count accumulation.
-    if collect_recursive_sizes {
-        if let Ok(m) = root.symlink_metadata() {
-            let root_size = fsx::metadata::allocated_size(&m);
-            if let Some(ref ds) = dir_local_sizes {
-                ds.insert(root.to_path_buf(), root_size);
-            }
-        }
-    }
-    if let Some(ref dfc) = dir_local_file_counts {
-        dfc.insert(root.to_path_buf(), 0);
-    }
-    if let Some(ref ddc) = dir_local_dir_counts {
-        ddc.insert(root.to_path_buf(), 0);
+    if let Some(totals) = &dir_totals {
+        let root_size = if args.sizes {
+            root.symlink_metadata()
+                .map(|m| fsx::metadata::allocated_size(&m))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        totals.insert(root.to_path_buf(), [root_size, 0, 0]);
     }
 
     let dc = Arc::clone(&dir_children);
-    let ds = dir_local_sizes.as_ref().map(Arc::clone);
+    let totals = dir_totals.as_ref().map(Arc::clone);
     let hardlinks = hardlink_sizes.as_ref().map(Arc::clone);
-    let dfc = dir_local_file_counts.as_ref().map(Arc::clone);
-    let ddc = dir_local_dir_counts.as_ref().map(Arc::clone);
     let classify_files = args.classify;
     let aggregate_requested = args.sizes || args.counts;
     let sdi = seen_dir_inodes.as_ref().map(Arc::clone);
@@ -1423,24 +1406,23 @@ fn perform_unified_scan(
                     dc.insert(current_path.clone(), stubs_vec);
                 }
             }
-            // Track every scanned directory so upward aggregation can propagate
-            // through directories that have 0 local blocks but non-zero descendants.
-            if let Some(ref ds_map) = ds {
-                let mut slot = ds_map.entry(current_path.clone()).or_insert(0);
-                if fsx::overflow::checked_add_u64(&mut slot, local_sum) {
-                    overflow.store(true, AtomicOrdering::Relaxed);
-                }
-            }
-            if let Some(ref dfc_map) = dfc {
-                let mut slot = dfc_map.entry(current_path.clone()).or_insert(0u64);
-                if fsx::overflow::checked_add_u64(&mut slot, local_file_count) {
-                    overflow.store(true, AtomicOrdering::Relaxed);
-                }
-            }
-            if let Some(ref ddc_map) = ddc {
-                let mut slot = ddc_map.entry(current_path).or_insert(0u64);
-                if fsx::overflow::checked_add_u64(&mut slot, local_dir_count) {
-                    overflow.store(true, AtomicOrdering::Relaxed);
+            if let Some(ref totals) = totals {
+                // Descendants below the display depth feed the last visible
+                // ancestor directly; do not retain a path-keyed row for each.
+                let bucket = current_path
+                    .ancestors()
+                    .nth(depth.saturating_sub(render_max_depth))
+                    .unwrap_or(&scan_root)
+                    .to_path_buf();
+                let mut slots = totals.entry(bucket).or_insert([0u64; 3]);
+                for (slot, value) in
+                    slots
+                        .iter_mut()
+                        .zip([local_sum, local_file_count, local_dir_count])
+                {
+                    if fsx::overflow::checked_add_u64(slot, value) {
+                        overflow.store(true, AtomicOrdering::Relaxed);
+                    }
                 }
             }
         })
@@ -1455,77 +1437,27 @@ fn perform_unified_scan(
             }
         });
 
-    let mut true_sizes: HashMap<PathBuf, u64, FxBuildHasher> = if let Some(ds) = dir_local_sizes {
-        match Arc::try_unwrap(ds) {
+    let mut true_sizes = HashMap::with_hasher(FxBuildHasher::default());
+    let mut true_file_counts = HashMap::with_hasher(FxBuildHasher::default());
+    let mut true_dir_counts = HashMap::with_hasher(FxBuildHasher::default());
+    let mut aggregate_overflowed = aggregate_overflow.load(AtomicOrdering::Relaxed);
+    if let Some(totals) = dir_totals {
+        let entries = match Arc::try_unwrap(totals) {
             Ok(map) => map.into_iter().collect(),
             Err(map) => map
                 .iter()
                 .map(|entry| (entry.key().clone(), *entry.value()))
                 .collect(),
-        }
-    } else {
-        HashMap::with_hasher(FxBuildHasher::default())
-    };
-    let mut true_file_counts: HashMap<PathBuf, u64, FxBuildHasher> =
-        if let Some(dfc) = dir_local_file_counts {
-            match Arc::try_unwrap(dfc) {
-                Ok(map) => map.into_iter().collect(),
-                Err(map) => map
-                    .iter()
-                    .map(|entry| (entry.key().clone(), *entry.value()))
-                    .collect(),
-            }
-        } else {
-            HashMap::with_hasher(FxBuildHasher::default())
         };
-    let mut true_dir_counts: HashMap<PathBuf, u64, FxBuildHasher> =
-        if let Some(ddc) = dir_local_dir_counts {
-            match Arc::try_unwrap(ddc) {
-                Ok(map) => map.into_iter().collect(),
-                Err(map) => map
-                    .iter()
-                    .map(|entry| (entry.key().clone(), *entry.value()))
-                    .collect(),
+        let (entries, overflowed) = aggregation::fold(entries);
+        aggregate_overflowed |= overflowed;
+        for (path, [size, files, dirs]) in entries {
+            if args.sizes {
+                true_sizes.insert(path.clone(), size);
             }
-        } else {
-            HashMap::with_hasher(FxBuildHasher::default())
-        };
-
-    let mut aggregate_overflowed = aggregate_overflow.load(AtomicOrdering::Relaxed);
-    let mut path_set: HashSet<PathBuf, FxBuildHasher> =
-        HashSet::with_hasher(FxBuildHasher::default());
-    path_set.extend(true_sizes.keys().cloned());
-    path_set.extend(true_file_counts.keys().cloned());
-    path_set.extend(true_dir_counts.keys().cloned());
-    let mut paths: Vec<PathBuf> = path_set.into_iter().collect();
-    paths.sort_unstable_by_key(|p| std::cmp::Reverse(p.components().count()));
-
-    for path in paths {
-        if path == root {
-            continue;
-        }
-        if let Some(parent) = path.parent() {
-            if !(parent.starts_with(root) || parent == root) {
-                continue;
-            }
-            let parent_path = parent.to_path_buf();
-            if let Some(value) = true_sizes.get(&path).copied() {
-                let slot = true_sizes.entry(parent_path.clone()).or_insert(0);
-                if fsx::overflow::checked_add_u64(slot, value) {
-                    aggregate_overflowed = true;
-                }
-            }
-            if let Some(value) = true_file_counts.get(&path).copied() {
-                let slot = true_file_counts.entry(parent_path.clone()).or_insert(0);
-                if fsx::overflow::checked_add_u64(slot, value) {
-                    aggregate_overflowed = true;
-                }
-            }
-            if let Some(value) = true_dir_counts.get(&path).copied() {
-                let slot = true_dir_counts.entry(parent_path).or_insert(0);
-                if fsx::overflow::checked_add_u64(slot, value) {
-                    aggregate_overflowed = true;
-                }
+            if args.counts {
+                true_file_counts.insert(path.clone(), files);
+                true_dir_counts.insert(path, dirs);
             }
         }
     }
@@ -1642,8 +1574,13 @@ fn build_tree_from_cache(
                     }
                 });
 
+            let limit = if depth == 0 {
+                entries.len()
+            } else {
+                entries.len().min(args.trunc)
+            };
             if let Some((field, order)) = sort_config {
-                entries.sort_by(|a, b| {
+                aggregation::sort_prefix(&mut entries, limit, |a, b| {
                     let res = match field.as_str() {
                         "size" => {
                             let a_size = if args.sizes && a.file_type.is_dir() {
@@ -1707,7 +1644,7 @@ fn build_tree_from_cache(
             } else {
                 // Plain default: type grouping (directories first), then
                 // alphabetical by name within each group.
-                entries.sort_by(|a, b| {
+                aggregation::sort_prefix(&mut entries, limit, |a, b| {
                     b.file_type
                         .is_dir()
                         .cmp(&a.file_type.is_dir())
@@ -1720,11 +1657,6 @@ fn build_tree_from_cache(
                 stubs.len().saturating_sub(entries.len())
             } else {
                 0
-            };
-            let limit = if depth == 0 {
-                entries.len()
-            } else {
-                entries.len().min(args.trunc)
             };
             let omitted_dirs_from_trunc = entries
                 .iter()

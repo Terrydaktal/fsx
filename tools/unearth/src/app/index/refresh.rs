@@ -20,7 +20,6 @@ pub(crate) struct PendingIndexEntry {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ScannedIndexEntry {
     pub(crate) path: String,
-    pub(crate) raw_path: PathBuf,
     pub(crate) kind: i64,
     pub(crate) mtime: Option<i64>,
     pub(crate) size: Option<i64>,
@@ -76,7 +75,7 @@ pub(crate) fn scan_index_root_cancellable(
 ) -> Result<Vec<ScannedIndexEntry>, String> {
     let mut entries: Vec<ScannedIndexEntry> = WalkDir::new(root)
         .skip_hidden(false)
-        .parallelism(Parallelism::RayonNewPool(threads))
+        .parallelism(super::workers::parallelism(threads))
         .process_read_dir({
             let root_key = root_key.to_string();
             move |_depth, _path, _state, children| {
@@ -129,7 +128,6 @@ pub(crate) fn scan_index_root_cancellable(
             };
             Some(Ok(ScannedIndexEntry {
                 path,
-                raw_path: entry.path().to_path_buf(),
                 kind,
                 mtime: None,
                 size: None,
@@ -158,7 +156,12 @@ pub(crate) fn populate_scanned_index_metadata_cancellable(
         if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
             return;
         }
-        let metadata = fs::symlink_metadata(&entry.raw_path).ok();
+        let path = if entry.path.contains('%') {
+            Cow::Owned(fsx::decode_lossless_path(&entry.path))
+        } else {
+            Cow::Borrowed(Path::new(&entry.path))
+        };
+        let metadata = fs::symlink_metadata(path).ok();
         entry.mtime = metadata.as_ref().and_then(metadata_mtime_nanos);
         entry.size = metadata.as_ref().and_then(metadata_size_i64);
         entry.allocated_size = metadata
@@ -186,7 +189,7 @@ pub(crate) fn populate_scanned_index_metadata_cancellable(
     };
     if threads == 1 {
         entries.iter_mut().for_each(populate);
-    } else if let Ok(pool) = ThreadPoolBuilder::new().num_threads(threads).build() {
+    } else if let Some(pool) = super::workers::pool(threads) {
         pool.install(|| entries.par_iter_mut().for_each(populate));
     } else {
         entries.iter_mut().for_each(populate);
